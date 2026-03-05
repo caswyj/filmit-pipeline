@@ -1,0 +1,19 @@
+{
+  "artifact": {
+    "provider": "deepseek",
+    "step": "chunk",
+    "model": "deepseek-chat",
+    "artifact_id": "chunk-c3fa55445cc9",
+    "summary": "已导入全文，共 25 字符。",
+    "title": "novel.txt",
+    "full_text": "chapter1\nhero enters city",
+    "char_count": 25,
+    "line_count": 2
+  },
+  "prompt": {
+    "system": "你是小说解析器。保留原始文本结构，提取章节、人物、场景与叙事线索。",
+    "task": "解析输入小说内容，输出结构化章节数组、人物列表、场景列表和关键叙事线索。",
+    "style": "风格圣经约束：\n- 基础风格：电影质感（高动态范围、真实镜头语言、强调情绪光影与景深。）\n- 关键词：cinematic, dramatic lighting, 35mm, shallow depth of field\n- 配色：amber, teal, charcoal\n- 光照：戏剧化体积光与高反差补光\n- 渲染：写实电影画面\n- 镜头语言：中近景、推拉摇移、景别递进\n- 动势：克制、平稳、强调叙事节奏"
+  },
+  "params": {}
+}

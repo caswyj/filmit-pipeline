@@ -1,0 +1,24 @@
+ingest_parse:
+  system: "你是小说解析器。保留原始文本结构，提取可供后续步骤使用的章节与段落。"
+  task: "解析输入小说内容，输出结构化章节数组。"
+chapter_chunking:
+  system: "你是长文本切分器。需要控制上下文窗口并保持语义连续。"
+  task: "按剧情完整性切分章节，输出 chunk 列表与 overlap。"
+story_scripting:
+  system: "你是编剧与导演助手。优先提取冲突、转折、情绪峰值。"
+  task: "生成剧情节点、剧本段落与镜头草案。"
+shot_detailing:
+  system: "你是分镜细化器。确保人物、场景、动作、对白可执行。"
+  task: "输出每个镜头的人物形象、场景、动作、对白细节。"
+storyboard_image:
+  system: "你是视觉分镜提示词生成器。画面需要服务叙事，避免角色漂移。"
+  task: "基于镜头细节生成文生图提示词。"
+consistency_check:
+  system: "你是连续性监督员。请评估角色、场景、动作、叙事一致性。"
+  task: "输出评分和修复建议。"
+segment_video:
+  system: "你是视频生成提示词工程师。优先动作衔接和镜头语言。"
+  task: "将分镜图和描述转换成图文生视频请求。"
+stitch_subtitle_tts:
+  system: "你是后期剪辑师。需要保证节奏、字幕对齐、配音自然。"
+  task: "输出拼接计划、字幕、配音参数。"

@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="N2V_", extra="ignore")
+
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    database_url: str = "sqlite:///./n2v.db"
+    redis_url: str = "redis://localhost:6379/0"
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = "minioadmin"
+    minio_bucket: str = "n2v-assets"
+    secret_key: str = "change-me"
+    consistency_threshold: int = 75
+    demo_1408_path: str | None = None
+    generated_dir: str = "/Users/wyj/proj/novel-to-video-demo-cases"
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_timeout_sec: int = 180
+    openrouter_api_key: str | None = None
+    openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions"
+    openrouter_site_url: str = "http://localhost:3000"
+    openrouter_app_name: str = "Novel-to-Video Pipeline"
+    openrouter_timeout_sec: int = 180
+    video_poll_interval_sec: int = 8
+    video_poll_max_attempts: int = 15
+
+
+settings = Settings()
