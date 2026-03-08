@@ -22,7 +22,7 @@ class OpenRouterProviderAdapter(ProviderAdapter):
             "https://openrouter.ai/api/v1/chat/completions",
         ).strip()
         self._referer = os.getenv("N2V_OPENROUTER_SITE_URL", "http://localhost:3000").strip()
-        self._title = os.getenv("N2V_OPENROUTER_APP_NAME", "Novel-to-Video Pipeline").strip()
+        self._title = os.getenv("N2V_OPENROUTER_APP_NAME", "FilmIt Pipeline").strip()
         self._timeout = float(os.getenv("N2V_OPENROUTER_TIMEOUT_SEC", "180"))
 
     def name(self) -> str:

@@ -1,4 +1,4 @@
-# Novel-to-Video Pipeline 技术架构文档 v1.0.0
+# FilmIt Pipeline 技术架构文档 v1.0.0
 
 - 文档版本: `1.0.0`
 - 生效日期: `2026-03-01`
@@ -392,7 +392,7 @@ step_model_pool:
 ## 15. 推荐目录结构（仓库）
 
 ```text
-novel-to-video-pipeline/
+filmit-pipeline/
   apps/
     web/                # Next.js 前端
     api/                # FastAPI 后端

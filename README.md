@@ -1,4 +1,4 @@
-# Novel-to-Video Pipeline
+# FilmIt Pipeline
 
 本项目实现 `docs/architecture-v1.0.0.md` 定义的 `v1.0.0` 技术架构基线：
 
@@ -202,7 +202,7 @@ N2V_VIDEO_POLL_MAX_ATTEMPTS=15
 N2V_OPENROUTER_API_KEY=...
 N2V_OPENROUTER_API_URL=https://openrouter.ai/api/v1/chat/completions
 N2V_OPENROUTER_SITE_URL=http://localhost:3000
-N2V_OPENROUTER_APP_NAME=Novel-to-Video Pipeline
+N2V_OPENROUTER_APP_NAME=FilmIt Pipeline
 N2V_OPENROUTER_TIMEOUT_SEC=180
 ```
 

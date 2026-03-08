@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions"
     openrouter_site_url: str = "http://localhost:3000"
-    openrouter_app_name: str = "Novel-to-Video Pipeline"
+    openrouter_app_name: str = "FilmIt Pipeline"
     openrouter_timeout_sec: int = 180
     video_poll_interval_sec: int = 8
     video_poll_max_attempts: int = 15
