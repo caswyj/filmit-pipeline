@@ -137,7 +137,8 @@ class OpenAIProviderAdapter(ProviderAdapter):
         return response.content, response.headers.get("content-type", "video/mp4")
 
     async def _invoke_tts(self, req: ProviderRequest) -> ProviderResponse:
-        text = self._build_prompt(req)
+        direct_text = req.params.get("tts_text") or req.input.get("tts_text")
+        text = str(direct_text).strip() if isinstance(direct_text, str) and str(direct_text).strip() else self._build_prompt(req)
         payload = {
             "model": req.model,
             "voice": req.params.get("voice", "alloy"),

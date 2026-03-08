@@ -295,6 +295,24 @@ async def run_step_for_all_chapters(
     return BatchStepRunResponse.model_validate(result)
 
 
+@router.post("/projects/{project_id}/steps/{step_name}/run-failed-chapters", response_model=BatchStepRunResponse)
+async def run_step_for_failed_chapters(
+    project_id: str,
+    step_name: str,
+    payload: BatchStepRunPayload,
+    db: Session = Depends(get_db),
+    svc: PipelineService = Depends(get_service),
+) -> BatchStepRunResponse:
+    project = _get_project_or_404(db, project_id)
+    try:
+        result = await svc.run_step_for_failed_chapters(project, step_name, force=payload.force, params=payload.params)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    current_step = result.get("current_step")
+    result["current_step"] = StepRead.model_validate(current_step) if current_step else None
+    return BatchStepRunResponse.model_validate(result)
+
+
 @router.get("/projects/{project_id}/steps", response_model=list[StepRead])
 def get_steps(project_id: str, db: Session = Depends(get_db), svc: PipelineService = Depends(get_service)) -> list[StepRead]:
     _get_project_or_404(db, project_id)
@@ -343,6 +361,78 @@ async def approve_all_chapters(
     project = _get_project_or_404(db, project_id)
     try:
         result = await svc.approve_step_for_all_chapters(project, step_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    current_step = result.get("current_step")
+    result["current_step"] = StepRead.model_validate(current_step) if current_step else None
+    return BatchStepRunResponse.model_validate(result)
+
+
+@router.post("/projects/{project_id}/steps/{step_id}/approve-review-required-chapters", response_model=BatchStepRunResponse)
+async def approve_review_required_consistency_chapters(
+    project_id: str,
+    step_id: str,
+    payload: ApprovePayload,
+    db: Session = Depends(get_db),
+    svc: PipelineService = Depends(get_service),
+) -> BatchStepRunResponse:
+    project = _get_project_or_404(db, project_id)
+    try:
+        result = await svc.approve_review_required_consistency_chapters(project, step_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    current_step = result.get("current_step")
+    result["current_step"] = StepRead.model_validate(current_step) if current_step else None
+    return BatchStepRunResponse.model_validate(result)
+
+
+@router.post("/projects/{project_id}/steps/{step_id}/approve-failed-chapters", response_model=BatchStepRunResponse)
+async def approve_failed_chapters(
+    project_id: str,
+    step_id: str,
+    payload: ApprovePayload,
+    db: Session = Depends(get_db),
+    svc: PipelineService = Depends(get_service),
+) -> BatchStepRunResponse:
+    project = _get_project_or_404(db, project_id)
+    try:
+        result = await svc.approve_failed_step_for_all_chapters(project, step_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    current_step = result.get("current_step")
+    result["current_step"] = StepRead.model_validate(current_step) if current_step else None
+    return BatchStepRunResponse.model_validate(result)
+
+
+@router.post("/projects/{project_id}/steps/{step_id}/rerun-pending-chapters", response_model=BatchStepRunResponse)
+async def rerun_pending_chapters(
+    project_id: str,
+    step_id: str,
+    payload: ApprovePayload,
+    db: Session = Depends(get_db),
+    svc: PipelineService = Depends(get_service),
+) -> BatchStepRunResponse:
+    project = _get_project_or_404(db, project_id)
+    try:
+        result = await svc.rerun_pending_step_for_all_chapters(project, step_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    current_step = result.get("current_step")
+    result["current_step"] = StepRead.model_validate(current_step) if current_step else None
+    return BatchStepRunResponse.model_validate(result)
+
+
+@router.post("/projects/{project_id}/steps/{step_id}/rework-regenerate-rescore-chapters", response_model=BatchStepRunResponse)
+async def rework_regenerate_rescore_chapters(
+    project_id: str,
+    step_id: str,
+    payload: ApprovePayload,
+    db: Session = Depends(get_db),
+    svc: PipelineService = Depends(get_service),
+) -> BatchStepRunResponse:
+    project = _get_project_or_404(db, project_id)
+    try:
+        result = await svc.regenerate_rework_requested_consistency_chapters(project, step_id, payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     current_step = result.get("current_step")
@@ -504,6 +594,16 @@ async def render_final(project_id: str, db: Session = Depends(get_db), svc: Pipe
     project = _get_project_or_404(db, project_id)
     try:
         export_job = await svc.render_final(project)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return ExportRead.model_validate(export_job)
+
+
+@router.post("/projects/{project_id}/final-cut", response_model=ExportRead)
+async def generate_final_cut(project_id: str, db: Session = Depends(get_db), svc: PipelineService = Depends(get_service)) -> ExportRead:
+    project = _get_project_or_404(db, project_id)
+    try:
+        export_job = await svc.generate_final_cut(project, force=True)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return ExportRead.model_validate(export_job)

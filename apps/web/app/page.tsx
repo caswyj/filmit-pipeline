@@ -144,8 +144,8 @@ export default function HomePage() {
   }, []);
 
   return (
-    <main className="shell">
-      <section className="card showcase">
+    <main className="shell" data-testid="home-page">
+      <section className="card showcase" data-testid="home-demo-section">
         <div className="showcaseGrid">
           <div>
             <p className="eyebrow">One-Click Demo</p>
@@ -158,10 +158,11 @@ export default function HomePage() {
                 className="primary"
                 onClick={importDemoProject}
                 disabled={busyAction !== null || demoLoading || !demoCase?.available}
+                data-testid="home-import-demo-button"
               >
                 {busyAction === "import" ? "导入中..." : "一键导入 1408 Demo"}
               </button>
-              <span className="pill">
+              <span className="pill" data-testid="home-demo-status-pill">
                 {demoLoading
                   ? "正在检查本机演示素材"
                   : demoCase?.available
@@ -171,7 +172,7 @@ export default function HomePage() {
             </div>
           </div>
 
-          <article className="demoCard">
+          <article className="demoCard" data-testid="home-demo-card">
             <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start" }}>
               <div>
                 <h2 style={{ marginBottom: 6 }}>{demoCase?.title ?? "1408"}</h2>
@@ -202,26 +203,37 @@ export default function HomePage() {
         </div>
       </section>
 
-      <section className="card">
+      <section className="card" data-testid="home-create-project-section">
         <h2>手动创建项目</h2>
         <p className="muted">也可以继续手动创建空项目，再自行上传 PDF/TXT 文本。</p>
         <div className="row">
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="项目名称" />
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="项目名称"
+            data-testid="home-project-name-input"
+          />
           <input
             type="number"
             min={15}
             max={7200}
             value={duration}
             onChange={(e) => setDuration(Number(e.target.value))}
+            data-testid="home-project-duration-input"
           />
-          <select value={presetId} onChange={(e) => setPresetId(e.target.value)}>
+          <select value={presetId} onChange={(e) => setPresetId(e.target.value)} data-testid="home-style-preset-select">
             {stylePresets.map((preset) => (
               <option key={preset.id} value={preset.id}>
                 {preset.label}
               </option>
             ))}
           </select>
-          <button className="primary" onClick={createProject} disabled={busyAction !== null}>
+          <button
+            className="primary"
+            onClick={createProject}
+            disabled={busyAction !== null}
+            data-testid="home-create-project-button"
+          >
             {busyAction === "create" ? "创建中..." : "创建项目"}
           </button>
         </div>
@@ -231,6 +243,7 @@ export default function HomePage() {
           onChange={(e) => setCustomStyle(e.target.value)}
           placeholder="可选：自定义风格名，例如“废土宗教机械感”"
           style={{ width: "100%", marginTop: 10 }}
+          data-testid="home-custom-style-input"
         />
         <textarea
           rows={3}
@@ -238,16 +251,22 @@ export default function HomePage() {
           onChange={(e) => setCustomDirectives(e.target.value)}
           placeholder="可选：补充风格约束，例如镜头语言、配色、材质、光线、动势"
           style={{ width: "100%", marginTop: 10 }}
+          data-testid="home-custom-directives-input"
         />
-        {error ? <p className="muted">{error}</p> : null}
+        {error ? <p className="muted" data-testid="home-error-message">{error}</p> : null}
       </section>
 
-      <section className="card">
+      <section className="card" data-testid="home-project-list">
         <h2>项目列表</h2>
         {sortedProjects.length === 0 ? <p className="muted">暂无项目</p> : null}
         {sortedProjects.map((project) => (
-          <div key={project.id} className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-            <Link href={`/projects/${project.id}`}>
+          <div
+            key={project.id}
+            className="row"
+            style={{ justifyContent: "space-between", marginBottom: 8 }}
+            data-testid={`home-project-row-${project.id}`}
+          >
+            <Link href={`/projects/${project.id}`} data-testid={`home-project-link-${project.id}`}>
               <strong>{project.name}</strong>
             </Link>
             <span className="pill">{project.status}</span>

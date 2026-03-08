@@ -10,10 +10,14 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 node_modules/
+.npm-cache/
+.playwright-browsers/
+.playwright-cli/
 .next/
 dist/
 build/
 coverage/
+output/
 *.log
 minio-data/
 postgres-data/
@@ -21,3 +25,5 @@ redis-data/
 tmp/
 demo_data/
 demo_runs/
+apps/api/generated/
+*.egg-info/

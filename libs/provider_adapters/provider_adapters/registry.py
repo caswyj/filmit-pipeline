@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
-import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.request import Request, urlopen
 
 from .base import ProviderAdapter, ProviderRequest, ProviderResponse, StepType
+from .edge_tts_adapter import EdgeTTSProviderAdapter
 from .openai_adapter import OpenAIProviderAdapter
+from .openrouter_catalog import build_openrouter_pricing_map, fetch_openrouter_models
 from .openrouter_adapter import OpenRouterProviderAdapter
 
 
@@ -78,10 +76,6 @@ class MockProviderAdapter(ProviderAdapter):
 
 
 class ProviderRegistry:
-    _OPENROUTER_MODELS_CACHE: list[dict[str, Any]] | None = None
-    _OPENROUTER_MODELS_CACHE_TS: float = 0.0
-    _OPENROUTER_MODELS_CACHE_TTL_SEC: int = 600
-
     _SUPPORTED: dict[str, dict[StepType, list[str]]] = {
         "openrouter": {
             "chunk": [
@@ -156,6 +150,16 @@ class ProviderRegistry:
         "elevenlabs": {
             "tts": ["elevenlabs-multilingual-v2"],
         },
+        "edge_tts": {
+            "tts": [
+                "zh-CN-XiaoxiaoNeural",
+                "zh-CN-YunxiNeural",
+                "zh-CN-YunjianNeural",
+                "zh-CN-XiaoyiNeural",
+                "zh-CN-liaoning-XiaobeiNeural",
+                "zh-CN-shaanxi-XiaoniNeural",
+            ],
+        },
     }
 
     def __init__(self) -> None:
@@ -167,6 +171,10 @@ class ProviderRegistry:
                 continue
             if provider == "openai":
                 adapter = OpenAIProviderAdapter(supported)
+                self._adapters[provider] = adapter if adapter.is_configured() else MockProviderAdapter(provider, supported)
+                continue
+            if provider == "edge_tts":
+                adapter = EdgeTTSProviderAdapter(supported)
                 self._adapters[provider] = adapter if adapter.is_configured() else MockProviderAdapter(provider, supported)
                 continue
             self._adapters[provider] = MockProviderAdapter(provider, supported)
@@ -195,10 +203,22 @@ class ProviderRegistry:
                 if item.step == step and item.models:
                     if step in {"chunk", "script", "shot_detail", "consistency"}:
                         for preferred in (
-                            "openrouter/auto",
+                            "google/gemini-2.5-flash",
                             "google/gemini-2.5-pro",
                             "anthropic/claude-sonnet-4",
                             "openai/gpt-5",
+                            "openrouter/auto",
+                        ):
+                            if preferred in item.models:
+                                return item.provider, preferred
+                    if step == "image":
+                        for preferred in (
+                            "openai/gpt-5-image-mini",
+                            "openai/gpt-5-image",
+                            "google/gemini-3.1-flash-image-preview",
+                            "google/gemini-3-pro-image-preview",
+                            "google/gemini-2.5-flash-image",
+                            "openrouter/auto",
                         ):
                             if preferred in item.models:
                                 return item.provider, preferred
@@ -208,40 +228,36 @@ class ProviderRegistry:
         elif step == "image":
             preferred_order = ["openrouter", "openai", "google", "runway", "anthropic", "deepseek", "azure", "elevenlabs"]
         else:
-            preferred_order = ["openai", "runway", "google", "openrouter", "anthropic", "deepseek", "azure", "elevenlabs"]
-        for provider in preferred_order:
-            step_map = self._SUPPORTED.get(provider, {})
-            models = step_map.get(step, [])
-            if models:
-                return provider, models[0]
+            preferred_order = ["openai", "edge_tts", "runway", "google", "openrouter", "anthropic", "deepseek", "azure", "elevenlabs"]
+        for pass_index in range(2):
+            for provider in preferred_order:
+                adapter = self._adapters.get(provider)
+                if pass_index == 0 and isinstance(adapter, MockProviderAdapter):
+                    continue
+                step_map = self._SUPPORTED.get(provider, {})
+                models = step_map.get(step, [])
+                if models:
+                    return provider, models[0]
         raise ValueError(f"No model configured for step: {step}")
 
     def _load_openrouter_catalog(self) -> list[ProviderCatalog]:
         adapter = self._adapters.get("openrouter")
         if not isinstance(adapter, OpenRouterProviderAdapter) or not adapter.is_configured():
             return []
-        models = self._fetch_openrouter_models()
+        models = fetch_openrouter_models()
         if not models:
             return []
 
         text_models: list[str] = []
         image_models: list[str] = []
         audio_models: list[str] = []
-        pricing_map: dict[str, dict[str, Any]] = {}
+        pricing_map = build_openrouter_pricing_map(models)
         for model in models:
             model_id = str(model.get("id") or "").strip()
             if not model_id:
                 continue
             architecture = model.get("architecture") or {}
             output_modalities = {str(item) for item in architecture.get("output_modalities") or []}
-            pricing = model.get("pricing") or {}
-            if isinstance(pricing, dict):
-                pricing_map[model_id] = {
-                    "input": pricing.get("prompt"),
-                    "output": pricing.get("completion"),
-                    "request": pricing.get("request"),
-                    "image": pricing.get("image"),
-                }
             if "text" in output_modalities:
                 text_models.append(model_id)
             if "image" in output_modalities:
@@ -260,37 +276,3 @@ class ProviderRegistry:
             ProviderCatalog(provider="openrouter", step="image", models=image_models, model_pricing=pricing_map),
             ProviderCatalog(provider="openrouter", step="tts", models=audio_models, model_pricing=pricing_map),
         ]
-
-    def _fetch_openrouter_models(self) -> list[dict[str, Any]]:
-        now = time.time()
-        if (
-            self.__class__._OPENROUTER_MODELS_CACHE is not None
-            and now - self.__class__._OPENROUTER_MODELS_CACHE_TS < self.__class__._OPENROUTER_MODELS_CACHE_TTL_SEC
-        ):
-            return self.__class__._OPENROUTER_MODELS_CACHE or []
-
-        try:
-            api_key = os.getenv("N2V_OPENROUTER_API_KEY", "").strip()
-            payload = None
-            if api_key:
-                req = Request(
-                    "https://openrouter.ai/api/v1/models/user",
-                    headers={
-                        "User-Agent": "n2v-provider-registry/1.0",
-                        "Authorization": f"Bearer {api_key}",
-                    },
-                )
-                with urlopen(req, timeout=20) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-            if payload is None:
-                req = Request("https://openrouter.ai/api/v1/models", headers={"User-Agent": "n2v-provider-registry/1.0"})
-                with urlopen(req, timeout=20) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-            models = payload.get("data") or []
-            if isinstance(models, list):
-                self.__class__._OPENROUTER_MODELS_CACHE = models
-                self.__class__._OPENROUTER_MODELS_CACHE_TS = now
-                return models
-        except Exception:  # noqa: BLE001
-            return []
-        return []

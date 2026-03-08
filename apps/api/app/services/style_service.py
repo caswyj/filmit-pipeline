@@ -197,7 +197,7 @@ def build_style_prompt(style_profile: dict[str, Any] | None) -> str:
         lines.append(f"- 用户附加约束：{visual_style['custom_directives']}")
     characters = story_bible.get("characters")
     if isinstance(characters, list) and characters:
-        lines.append("- 核心人物锚点：")
+        lines.append("- 核心人物身份肖像锚点：")
         for item in characters[:5]:
             if not isinstance(item, dict):
                 continue
@@ -205,9 +205,14 @@ def build_style_prompt(style_profile: dict[str, Any] | None) -> str:
             desc = item.get("description") or item.get("visual_anchor")
             if name:
                 lines.append(f"  - {name}: {desc}")
-                ref = item.get("reference_storage_key") or item.get("reference_image_url")
+                ref = (
+                    item.get("identity_reference_storage_key")
+                    or item.get("identity_reference_image_url")
+                    or item.get("reference_storage_key")
+                    or item.get("reference_image_url")
+                )
                 if ref:
-                    lines.append(f"  - {name} 参考图: {ref}")
+                    lines.append(f"  - {name} 身份肖像参考图: {ref}")
     scenes = story_bible.get("scenes")
     if isinstance(scenes, list) and scenes:
         lines.append("- 核心场景锚点：")
@@ -218,7 +223,12 @@ def build_style_prompt(style_profile: dict[str, Any] | None) -> str:
             desc = item.get("description") or item.get("visual_anchor")
             if name:
                 lines.append(f"  - {name}: {desc}")
-                ref = item.get("reference_storage_key") or item.get("reference_image_url")
+                ref = (
+                    item.get("scene_reference_storage_key")
+                    or item.get("scene_reference_image_url")
+                    or item.get("reference_storage_key")
+                    or item.get("reference_image_url")
+                )
                 if ref:
-                    lines.append(f"  - {name} 参考图: {ref}")
+                    lines.append(f"  - {name} 场景参考图: {ref}")
     return "\n".join(lines)

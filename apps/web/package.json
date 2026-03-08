@@ -6,7 +6,11 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "playwright:install": "PLAYWRIGHT_BROWSERS_PATH=../../.playwright-browsers npx playwright install chromium",
+    "playwright:test": "PLAYWRIGHT_BROWSERS_PATH=../../.playwright-browsers npx playwright test",
+    "playwright:test:headed": "PLAYWRIGHT_BROWSERS_PATH=../../.playwright-browsers npx playwright test --headed",
+    "playwright:demo-workflow": "PLAYWRIGHT_BROWSERS_PATH=../../.playwright-browsers node scripts/automate_demo_workflow.mjs"
   },
   "dependencies": {
     "next": "15.1.7",
@@ -14,9 +18,11 @@
     "react-dom": "19.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/node": "22.13.1",
     "@types/react": "19.0.8",
     "@types/react-dom": "19.0.3",
+    "playwright": "1.58.2",
     "typescript": "5.7.3"
   }
 }

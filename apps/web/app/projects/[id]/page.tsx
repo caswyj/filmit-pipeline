@@ -122,6 +122,10 @@ type StoryBibleEntity = {
   visual_anchor?: string;
   reference_image_url?: string;
   reference_storage_key?: string;
+  identity_reference_image_url?: string;
+  identity_reference_storage_key?: string;
+  scene_reference_image_url?: string;
+  scene_reference_storage_key?: string;
 };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
@@ -245,6 +249,27 @@ function resolveDownloadUrl(url: string): string {
   return resolved;
 }
 
+function resolveGeneratedPathUrl(pathOrUrl: string): string {
+  if (!pathOrUrl) return "";
+  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://") || pathOrUrl.startsWith("data:")) {
+    return pathOrUrl;
+  }
+  if (pathOrUrl.includes("/api/v1/local-files/")) return resolveMediaUrl(pathOrUrl);
+  const knownRoots = [
+    "/Users/wyj/proj/novel-to-video-demo-cases/",
+    "/Users/wyj/proj/novel-to-video-pipeline/output/generated/",
+  ];
+  const matchedRoot = knownRoots.find((root) => pathOrUrl.startsWith(root));
+  if (!matchedRoot) return resolveMediaUrl(pathOrUrl);
+  const relative = pathOrUrl
+    .slice(matchedRoot.length)
+    .replace(/^\/+/, "")
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `${apiBase}/api/v1/local-files/${relative}`;
+}
+
 function modelPricingLabel(
   provider: string,
   model: string,
@@ -281,6 +306,23 @@ function modelPricingLabel(
   return segments.length > 0 ? `${model} (${segments.join(" / ")})` : model;
 }
 
+function executionCostLabel(stats: Record<string, unknown>): string {
+  const rawUsage = asRecord(stats.raw_usage);
+  if (Number.isFinite(Number(rawUsage.cost))) return "实际成本";
+  const source = asString(stats.cost_source, "");
+  if (source === "provider_reported") return "实际成本";
+  if (source === "openrouter_catalog_estimated") return "估算成本";
+  if (source === "local") return "本地成本";
+  return "估算成本";
+}
+
+function executionCostValue(stats: Record<string, unknown>): number {
+  const rawUsage = asRecord(stats.raw_usage);
+  const providerCost = Number(rawUsage.cost);
+  if (Number.isFinite(providerCost) && providerCost >= 0) return providerCost;
+  return asNumber(stats.estimated_cost, 0);
+}
+
 function extractStoryboardGallery(output: Record<string, unknown>): Record<string, unknown> {
   const gallery = asRecord(output.storyboard_gallery);
   if (Object.keys(gallery).length > 0) return gallery;
@@ -311,6 +353,13 @@ function chapterStageOutput(chapter: Chapter | null, stepName: string | undefine
   return asRecord(stage.output);
 }
 
+function chapterStageRecord(chapter: Chapter | null, stepName: string | undefined): Record<string, unknown> {
+  if (!chapter || !stepName) return {};
+  const meta = asRecord(chapter.meta);
+  const stages = asRecord(meta.stages);
+  return asRecord(stages[stepName]);
+}
+
 function stepExecutionStats(step: Step, chapter: Chapter | null): Record<string, unknown> {
   if (chapterScopedSteps.has(step.step_name)) {
     return asRecord(chapterStageOutput(chapter, step.step_name).execution_stats);
@@ -328,6 +377,10 @@ function asStoryBibleEntityList(value: unknown): StoryBibleEntity[] {
       visual_anchor: asString(item.visual_anchor, ""),
       reference_image_url: asString(item.reference_image_url, ""),
       reference_storage_key: asString(item.reference_storage_key, ""),
+      identity_reference_image_url: asString(item.identity_reference_image_url, ""),
+      identity_reference_storage_key: asString(item.identity_reference_storage_key, ""),
+      scene_reference_image_url: asString(item.scene_reference_image_url, ""),
+      scene_reference_storage_key: asString(item.scene_reference_storage_key, ""),
     }));
 }
 
@@ -337,6 +390,7 @@ export default function ProjectPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [steps, setSteps] = useState<Step[]>([]);
   const [chapters, setChapters] = useState<Chapter[]>([]);
+  const [chaptersLoading, setChaptersLoading] = useState(false);
   const [docs, setDocs] = useState<SourceDocument[]>([]);
   const [catalog, setCatalog] = useState<ProviderCatalog[]>([]);
   const [stylePresets, setStylePresets] = useState<StylePreset[]>([]);
@@ -389,6 +443,7 @@ export default function ProjectPage() {
     [storyboardVersions]
   );
   const selectedArtifact = useMemo(() => asRecord(selectedOutput.artifact), [selectedOutput]);
+  const finalCutSummary = useMemo(() => asRecord(selectedOutput.final_cut), [selectedOutput]);
   const selectedStoryboardGallery = useMemo(() => extractStoryboardGallery(selectedOutput), [selectedOutput]);
   const selectedStoryboardFrames = useMemo(() => extractStoryboardFrames(selectedOutput), [selectedOutput]);
   const consistencyPayload = useMemo(() => asRecord(selectedOutput.consistency), [selectedOutput]);
@@ -419,6 +474,101 @@ export default function ProjectPage() {
     [selectedOutput]
   );
   const executionStats = useMemo(() => asRecord(selectedOutput.execution_stats), [selectedOutput]);
+  const finalCutManifest = useMemo(
+    () => asList(selectedArtifact.segment_manifest).map((item) => asRecord(item)),
+    [selectedArtifact]
+  );
+  const finalCutSubtitleEntries = useMemo(
+    () => asList(selectedArtifact.subtitle_entries).map((item) => asRecord(item)),
+    [selectedArtifact]
+  );
+  const finalCutAudioUrl = useMemo(
+    () => asString(selectedArtifact.audio_url, asString(selectedArtifact.export_url, "")),
+    [selectedArtifact]
+  );
+  const finalCutSubtitleUrl = useMemo(
+    () => asString(selectedArtifact.subtitle_url, asString(selectedArtifact.subtitle_export_url, "")),
+    [selectedArtifact]
+  );
+  const latestExportUrl = useMemo(
+    () => resolveGeneratedPathUrl(asString(latestExport?.output_key, asString(project?.output_path, ""))),
+    [latestExport?.output_key, project?.output_path]
+  );
+  const failedChapterItems = useMemo(() => {
+    if (!selected || !chapterScopedSteps.has(selected.step_name)) return [];
+    return chapters
+      .map((chapter) => {
+        const stage = chapterStageRecord(chapter, selected.step_name);
+        const status = asString(stage.status, chapter.stage_map[selected.step_name] ?? "");
+        const output = asRecord(stage.output);
+        const detail = asString(output.error_message, asString(stage.error_message, ""));
+        return {
+          id: chapter.id,
+          title: chapter.title,
+          status,
+          detail,
+        };
+      })
+      .filter((item) => item.status === "FAILED");
+  }, [chapters, selected]);
+  const reviewRequiredChapterItems = useMemo(() => {
+    if (!selected || selected.step_name !== "consistency_check") return [];
+    return chapters
+      .map((chapter) => {
+        const stage = chapterStageRecord(chapter, selected.step_name);
+        const status = asString(stage.status, chapter.stage_map[selected.step_name] ?? "");
+        return {
+          id: chapter.id,
+          title: chapter.title,
+          status,
+        };
+      })
+      .filter((item) => item.status === "REVIEW_REQUIRED");
+  }, [chapters, selected]);
+  const reworkRequestedChapterItems = useMemo(() => {
+    if (!selected || selected.step_name !== "consistency_check") return [];
+    return chapters
+      .map((chapter) => {
+        const stage = chapterStageRecord(chapter, selected.step_name);
+        const status = asString(stage.status, chapter.stage_map[selected.step_name] ?? "");
+        const output = asRecord(stage.output);
+        const consistency = asRecord(output.consistency);
+        const details = asRecord(consistency.details);
+        const lowFrames = asList(details.low_frames)
+          .map((item) => asRecord(item))
+          .slice(0, 3)
+          .map((item) => `镜头${asString(item.shot_index, "?")}:${asString(item.reason, "需修正连续性")}`)
+          .join("；");
+        return {
+          id: chapter.id,
+          title: chapter.title,
+          status,
+          detail: lowFrames,
+        };
+      })
+      .filter((item) => item.status === "REWORK_REQUESTED");
+  }, [chapters, selected]);
+  const pendingConsistencyChapterItems = useMemo(() => {
+    if (!selected || selected.step_name !== "consistency_check") return [];
+    return chapters
+      .map((chapter) => {
+        const stage = chapterStageRecord(chapter, selected.step_name);
+        const status = asString(stage.status, chapter.stage_map[selected.step_name] ?? "");
+        const storyboardStage = chapterStageRecord(chapter, "storyboard_image");
+        const storyboardStatus = asString(storyboardStage.status, chapter.stage_map.storyboard_image ?? "");
+        return {
+          id: chapter.id,
+          title: chapter.title,
+          status,
+          storyboardStatus,
+        };
+      })
+      .filter(
+        (item) =>
+          item.status === "PENDING" &&
+          (item.storyboardStatus === "APPROVED" || item.storyboardStatus === "REVIEW_REQUIRED")
+      );
+  }, [chapters, selected]);
 
   const stepModelOptions = useMemo(() => {
     if (!selected) return [];
@@ -498,12 +648,17 @@ export default function ProjectPage() {
 
   async function loadChapters() {
     if (!projectId) return;
-    const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/chapters`, { cache: "no-store" });
-    if (!res.ok) throw new Error("加载章节失败");
-    const data = (await res.json()) as Chapter[];
-    setChapters(data);
-    if (!selectedChapterId && data.length > 0) {
-      setSelectedChapterId(data[0].id);
+    setChaptersLoading(true);
+    try {
+      const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/chapters`, { cache: "no-store" });
+      if (!res.ok) throw new Error("加载章节失败");
+      const data = (await res.json()) as Chapter[];
+      setChapters(data);
+      if (!selectedChapterId && data.length > 0) {
+        setSelectedChapterId(data[0].id);
+      }
+    } finally {
+      setChaptersLoading(false);
     }
   }
 
@@ -542,8 +697,19 @@ export default function ProjectPage() {
     setStoryboardVersions(data);
   }
 
-  async function refreshAll() {
-    await Promise.all([loadProject(), loadSteps(), loadChapters(), loadDocuments(), loadCatalog(), loadStylePresets(), loadPromptTemplates()]);
+  async function refreshWorkflowData(targetStep: Step | null = selected, includeDocuments = true) {
+    const tasks = [loadProject(), loadSteps(), loadChapters()];
+    if (includeDocuments) {
+      tasks.push(loadDocuments());
+    }
+    await Promise.all(tasks);
+    if (targetStep?.step_name === "storyboard_image") {
+      await loadStoryboardVersions(targetStep);
+    }
+  }
+
+  async function loadStaticData() {
+    await Promise.all([loadCatalog(), loadStylePresets(), loadPromptTemplates()]);
   }
 
   function syncSelectionFromResponse(data: unknown) {
@@ -557,6 +723,86 @@ export default function ProjectPage() {
     if (currentStep && typeof currentStep === "object" && typeof (currentStep as Record<string, unknown>).id === "string") {
       setSelectedStepId((currentStep as Record<string, unknown>).id as string);
     }
+  }
+
+  function applyUpdatedStep(updatedStep: Step, chapterId: string | null = null) {
+    setSteps((current) => {
+      const exists = current.some((step) => step.id === updatedStep.id);
+      if (!exists) {
+        return [...current, updatedStep];
+      }
+      return current.map((step) => (step.id === updatedStep.id ? updatedStep : step));
+    });
+    if (!chapterId || !chapterScopedSteps.has(updatedStep.step_name)) {
+      return;
+    }
+    setChapters((current) =>
+      current.map((chapter) => {
+        if (chapter.id !== chapterId) return chapter;
+        const meta = asRecord(chapter.meta);
+        const stages = asRecord(meta.stages);
+        const stage = asRecord(stages[updatedStep.step_name]);
+        return {
+          ...chapter,
+          stage_map: {
+            ...chapter.stage_map,
+            [updatedStep.step_name]: updatedStep.status,
+          },
+          meta: {
+            ...meta,
+            stages: {
+              ...stages,
+              [updatedStep.step_name]: {
+                ...stage,
+                status: updatedStep.status,
+                output: updatedStep.output_ref,
+                error_code: null,
+                error_message: null,
+                provider: updatedStep.model_provider,
+                model: updatedStep.model_name,
+              },
+            },
+          },
+        };
+      })
+    );
+  }
+
+  function applyBatchChapterStatuses(stepName: string, items: BatchStepRunResponse["chapter_results"], stepMeta: Step | null) {
+    const statusMap = new Map(
+      items
+        .filter((item) => item.status !== "SKIPPED")
+        .map((item) => [item.chapter_id, item.status])
+    );
+    if (statusMap.size === 0) return;
+    setChapters((current) =>
+      current.map((chapter) => {
+        const nextStatus = statusMap.get(chapter.id);
+        if (!nextStatus) return chapter;
+        const meta = asRecord(chapter.meta);
+        const stages = asRecord(meta.stages);
+        const stage = asRecord(stages[stepName]);
+        return {
+          ...chapter,
+          stage_map: {
+            ...chapter.stage_map,
+            [stepName]: nextStatus,
+          },
+          meta: {
+            ...meta,
+            stages: {
+              ...stages,
+              [stepName]: {
+                ...stage,
+                status: nextStatus,
+                provider: stepMeta?.model_provider ?? asString(stage.provider, ""),
+                model: stepMeta?.model_name ?? asString(stage.model, ""),
+              },
+            },
+          },
+        };
+      })
+    );
   }
 
   async function runProject() {
@@ -586,7 +832,7 @@ export default function ProjectPage() {
       }
       const data = await res.json();
       syncSelectionFromResponse(data);
-      await refreshAll();
+      await refreshWorkflowData();
       setActionProgress(100);
       setActionMessage(`已完成：${data.step_display_name ?? selected.step_display_name}`);
     } catch (err) {
@@ -616,7 +862,7 @@ export default function ProjectPage() {
       }
       const data = (await res.json()) as BatchStepRunResponse;
       syncSelectionFromResponse(data);
-      await refreshAll();
+      await refreshWorkflowData(selected);
       setActionProgress(100);
       setActionMessage(
         `批量运行完成：成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。`
@@ -624,6 +870,38 @@ export default function ProjectPage() {
     } catch (err) {
       setActionProgress(0);
       setError(err instanceof Error ? err.message : "批量运行失败");
+    } finally {
+      setPendingAction(null);
+      setBusy(false);
+    }
+  }
+
+  async function runCurrentStepForFailedChapters() {
+    if (!projectId || !selected || !chapterScopedSteps.has(selected.step_name)) return;
+    setPendingAction(`正在重跑失败章节：${selected.step_display_name}`);
+    setBusy(true);
+    setError(null);
+    setActionMessage(null);
+    try {
+      const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/steps/${selected.step_name}/run-failed-chapters`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: true, params: {} }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "失败章节批量重跑失败");
+      }
+      const data = (await res.json()) as BatchStepRunResponse;
+      syncSelectionFromResponse(data);
+      await refreshWorkflowData(selected);
+      setActionProgress(100);
+      setActionMessage(
+        `失败章节重跑完成：成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。`
+      );
+    } catch (err) {
+      setActionProgress(0);
+      setError(err instanceof Error ? err.message : "失败章节批量重跑失败");
     } finally {
       setPendingAction(null);
       setBusy(false);
@@ -648,7 +926,7 @@ export default function ProjectPage() {
         throw new Error(text || "上传失败");
       }
       setUploadFile(null);
-      await refreshAll();
+      await refreshWorkflowData();
       setActionProgress(100);
       setActionMessage("源文件已上传并登记");
     } catch (err) {
@@ -681,7 +959,7 @@ export default function ProjectPage() {
         const text = await res.text();
         throw new Error(text || "绑定失败");
       }
-      await refreshAll();
+      await refreshWorkflowData(selected, false);
       setActionProgress(100);
       setActionMessage(`已绑定模型：${provider}/${modelName}`);
     } catch (err) {
@@ -713,7 +991,7 @@ export default function ProjectPage() {
         const text = await res.text();
         throw new Error(text || "保存风格失败");
       }
-      await refreshAll();
+      await refreshWorkflowData(selected, false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存风格失败");
     } finally {
@@ -735,7 +1013,7 @@ export default function ProjectPage() {
         const text = await res.text();
         throw new Error(text || "重建 Story Bible 失败");
       }
-      await refreshAll();
+      await refreshWorkflowData(selected, false);
       setActionProgress(100);
       setActionMessage("已重建 Story Bible 人物/场景参考图。");
     } catch (err) {
@@ -774,7 +1052,7 @@ export default function ProjectPage() {
       }
       const data = await res.json();
       syncSelectionFromResponse(data);
-      await refreshAll();
+      await refreshWorkflowData();
       setActionProgress(100);
       if (path.includes("/approve") || path.includes("/edit-continue")) {
         const nextStep = (data as ProjectRunResponse).current_step;
@@ -801,7 +1079,23 @@ export default function ProjectPage() {
 
   async function postBatchAction(path: string, body: Record<string, unknown>, successMessage: string) {
     if (!selected || !projectId) return;
-    setPendingAction("正在批量处理当前章节动作...");
+    const lightweightApproval =
+      path.includes("/approve-review-required-chapters") ||
+      path.includes("/approve-all-chapters") ||
+      path.includes("/approve-failed-chapters");
+    const actionLabel =
+      path.includes("/rework-regenerate-rescore-chapters") ? "正在自动修正返工章节并重新校核..." :
+      path.includes("/rerun-pending-chapters") ? "正在重新评分待校核章节..." :
+      path.includes("/approve-review-required-chapters") ? "正在批量通过已完成校核章节..." :
+      path.includes("/approve-failed-chapters") ? "正在批量通过失败章节..." :
+      path.includes("/approve-all-chapters") ? "正在批量通过当前所有章节..." :
+      path.includes("/edit-continue-all-chapters") ? "正在批量保存人工编辑..." :
+      path.includes("/edit-prompt-regenerate-all-chapters") ? "正在批量按新提示词重生成..." :
+      path.includes("/switch-model-rerun-all-chapters") ? "正在批量切换模型重跑..." :
+      path.includes("/run-failed-chapters") ? "正在批量重跑失败章节..." :
+      path.includes("/run-all-chapters") ? "正在批量运行当前阶段..." :
+      "正在批量处理当前章节动作...";
+    setPendingAction(actionLabel);
     setBusy(true);
     setError(null);
     setActionMessage(null);
@@ -817,9 +1111,19 @@ export default function ProjectPage() {
       }
       const data = (await res.json()) as BatchStepRunResponse;
       syncSelectionFromResponse(data);
-      await refreshAll();
+      if (data.current_step && typeof data.current_step === "object") {
+        applyUpdatedStep(data.current_step as Step);
+      }
+      applyBatchChapterStatuses(selected.step_name, data.chapter_results, data.current_step as Step | null);
       setActionProgress(100);
       setActionMessage(`${successMessage} 成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。`);
+      if (lightweightApproval) {
+        void refreshWorkflowData(selected, false).catch((err) =>
+          setError(err instanceof Error ? err.message : "刷新流程数据失败")
+        );
+      } else {
+        await refreshWorkflowData(selected, false);
+      }
     } catch (err) {
       setActionProgress(0);
       setError(err instanceof Error ? err.message : "批量动作执行失败");
@@ -829,26 +1133,26 @@ export default function ProjectPage() {
     }
   }
 
-  async function renderFinal() {
+  async function generateFinalCut() {
     if (!projectId) return;
-    setPendingAction("正在导出成片...");
+    setPendingAction("正在生成最终成片...");
     setBusy(true);
     setError(null);
     setActionMessage(null);
     try {
-      const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/render/final`, { method: "POST" });
+      const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/final-cut`, { method: "POST" });
       if (!res.ok) {
         const text = await res.text();
-        throw new Error(text || "导出失败");
+        throw new Error(text || "生成成片失败");
       }
       const data = (await res.json()) as ExportRead;
       setLatestExport(data);
-      await refreshAll();
+      await refreshWorkflowData(selected, false);
       setActionProgress(100);
-      setActionMessage("成片导出任务已创建");
+      setActionMessage("已完成成片合成，可直接预览或导出。");
     } catch (err) {
       setActionProgress(0);
-      setError(err instanceof Error ? err.message : "导出失败");
+      setError(err instanceof Error ? err.message : "生成成片失败");
     } finally {
       setPendingAction(null);
       setBusy(false);
@@ -857,6 +1161,10 @@ export default function ProjectPage() {
 
   async function selectStoryboardVersion(versionId: string) {
     if (!projectId || !selected) return;
+    if (activeStoryboardVersion?.id === versionId) {
+      setActionMessage("当前已经在使用这个分镜版本");
+      return;
+    }
     setPendingAction("正在切换分镜版本...");
     setBusy(true);
     setError(null);
@@ -878,11 +1186,20 @@ export default function ProjectPage() {
         const text = await res.text();
         throw new Error(text || "选用分镜版本失败");
       }
-      const data = await res.json();
+      const data = (await res.json()) as Step;
       syncSelectionFromResponse(data);
-      await refreshAll();
+      applyUpdatedStep(data, selectedChapter?.id ?? null);
+      setStoryboardVersions((current) =>
+        current.map((version) => ({
+          ...version,
+          is_active: version.id === versionId,
+        }))
+      );
       setActionProgress(100);
       setActionMessage("已切换到所选分镜版本");
+      void refreshWorkflowData(data).catch((err) =>
+        setError(err instanceof Error ? err.message : "刷新分镜版本失败")
+      );
     } catch (err) {
       setActionProgress(0);
       setError(err instanceof Error ? err.message : "选用分镜版本失败");
@@ -894,7 +1211,9 @@ export default function ProjectPage() {
 
   useEffect(() => {
     if (!projectId) return;
-    refreshAll().catch((err) => setError(err instanceof Error ? err.message : "加载失败"));
+    Promise.all([refreshWorkflowData(null), loadStaticData()]).catch((err) =>
+      setError(err instanceof Error ? err.message : "加载失败")
+    );
   }, [projectId]);
 
   useEffect(() => {
@@ -1013,6 +1332,8 @@ export default function ProjectPage() {
   function renderExecutionStatsBlock() {
     if (Object.keys(executionStats).length === 0) return null;
     const tokenUsage = asRecord(executionStats.token_usage);
+    const costLabel = executionCostLabel(executionStats);
+    const costValue = executionCostValue(executionStats);
     return (
       <section className="card" style={{ marginTop: 12 }}>
         <div className="mediaSectionHeader">
@@ -1039,8 +1360,8 @@ export default function ProjectPage() {
             <strong>{asNumber(tokenUsage.total_tokens, 0)}</strong>
           </div>
           <div className="metric">
-            <span className="metricLabel">估算成本</span>
-            <strong>{asNumber(executionStats.estimated_cost, 0).toFixed(6)}</strong>
+            <span className="metricLabel">{costLabel}</span>
+            <strong>{costValue.toFixed(6)}</strong>
           </div>
         </div>
       </section>
@@ -1311,9 +1632,118 @@ export default function ProjectPage() {
       );
     }
 
+    if (selected.step_name === "stitch_subtitle_tts") {
+      return (
+        <div className="mediaWorkspace">
+          <section className="mediaHeroCard">
+            <div className="mediaHeroHeader">
+              <div>
+                <p className="eyebrow">成片总装</p>
+                <h3>将所有章节片段合并为完整成片</h3>
+              </div>
+              <div className="actionsRow">
+                {latestExportUrl ? (
+                  <a className="downloadLink" href={resolveDownloadUrl(latestExportUrl)}>
+                    导出最新成片
+                  </a>
+                ) : null}
+                {finalCutAudioUrl ? (
+                  <a className="downloadLink" href={resolveDownloadUrl(finalCutAudioUrl)}>
+                    导出旁白音轨
+                  </a>
+                ) : null}
+                {finalCutSubtitleUrl ? (
+                  <a className="downloadLink" href={resolveDownloadUrl(finalCutSubtitleUrl)}>
+                    导出字幕文件
+                  </a>
+                ) : null}
+              </div>
+            </div>
+            {latestExportUrl ? (
+              <video className="chapterVideoPlayer" controls preload="metadata" src={resolveMediaUrl(latestExportUrl)} />
+            ) : (
+              <div className="mediaHeroImage mediaHeroEmpty">尚未生成最终成片，点击右侧“一键生成成片”后将在此处预览。</div>
+            )}
+            <div className="metricRow">
+              <div className="metric">
+                <span className="metricLabel">章节片段数</span>
+                <strong>{asNumber(finalCutSummary.segment_count, finalCutManifest.length)}</strong>
+              </div>
+              <div className="metric">
+                <span className="metricLabel">字幕条数</span>
+                <strong>{asNumber(finalCutSummary.subtitle_count, finalCutSubtitleEntries.length)}</strong>
+              </div>
+              <div className="metric">
+                <span className="metricLabel">旁白音轨</span>
+                <strong style={{ fontSize: 16 }}>{finalCutAudioUrl ? "已生成" : "未生成"}</strong>
+              </div>
+              <div className="metric">
+                <span className="metricLabel">当前模型</span>
+                <strong style={{ fontSize: 16 }}>{selected.model_provider}/{selected.model_name}</strong>
+              </div>
+            </div>
+            {asString(finalCutSummary.narration_writer_model, "") ? (
+              <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
+                旁白脚本：{asString(finalCutSummary.narration_generation_mode, "model")} · {asString(finalCutSummary.narration_writer_provider, "-")}/{asString(finalCutSummary.narration_writer_model, "-")}
+              </p>
+            ) : null}
+            <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
+              一键生成会自动执行本阶段，整理旁白脚本与字幕，然后把全部章节视频片段合成为最终 MP4。
+            </p>
+          </section>
+          <section className="card mediaGalleryCard">
+            <div className="mediaSectionHeader">
+              <div>
+                <p className="eyebrow">章节片段清单</p>
+                <h4>参与成片合并的视频段落</h4>
+              </div>
+              <span className="pill">共 {finalCutManifest.length} 段</span>
+            </div>
+            {finalCutManifest.length === 0 ? (
+              <p className="muted">当前还没有可合成的章节视频片段。</p>
+            ) : (
+              <div className="diffList">
+                {finalCutManifest.map((item, index) => (
+                  <div key={`${asString(item.chapter_id, String(index))}-${index}`} className="diffItem">
+                    {asString(item.title, `片段 ${index + 1}`)} · {asNumber(item.duration_sec, 0).toFixed(1)}s
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+          <section className="card mediaGalleryCard">
+            <div className="mediaSectionHeader">
+              <div>
+                <p className="eyebrow">旁白与字幕预览</p>
+                <h4>生成前可快速核对的后期文案</h4>
+              </div>
+              <span className="pill">{finalCutSubtitleEntries.length} 条字幕</span>
+            </div>
+            <textarea
+              readOnly
+              rows={8}
+              value={asString(selectedArtifact.narration_text, "")}
+              style={{ width: "100%", marginBottom: 12 }}
+            />
+            <div className="diffList">
+              {finalCutSubtitleEntries.slice(0, 8).map((item, index) => (
+                <div key={`${asString(item.index, String(index))}-${index}`} className="diffItem">
+                  {asNumber(item.start_sec, 0).toFixed(1)}s - {asNumber(item.end_sec, 0).toFixed(1)}s：{asString(item.text, "")}
+                </div>
+              ))}
+            </div>
+            {finalCutSubtitleEntries.length > 8 ? (
+              <p className="muted" style={{ marginBottom: 0 }}>仅预览前 8 条字幕，完整内容可导出 `.srt` 查看。</p>
+            ) : null}
+          </section>
+          {renderExecutionStatsBlock()}
+        </div>
+      );
+    }
+
     return (
       <>
-        {selectedChapter ? (
+        {selectedChapter && chapterScopedSteps.has(selected.step_name) ? (
           <div className="demoCard" style={{ marginBottom: 12 }}>
             <p className="eyebrow">当前章节</p>
             <h4 style={{ marginTop: 0 }}>{selectedChapter.title}</h4>
@@ -1349,16 +1779,16 @@ export default function ProjectPage() {
   }
 
   return (
-    <main className="shell">
-      <section className="card row" style={{ justifyContent: "space-between" }}>
+    <main className="shell" data-testid="project-page">
+      <section className="card row" style={{ justifyContent: "space-between" }} data-testid="project-header">
         <div>
-          <h1>{project?.name ?? "项目审核台"}</h1>
+          <h1 data-testid="project-title">{project?.name ?? "项目审核台"}</h1>
           <p className="muted">状态: {project?.status ?? "-"} | 目标时长: {project?.target_duration_sec ?? "-"}s</p>
         </div>
         <div className="row">
           <Link href="/">返回项目列表</Link>
-          <button onClick={renderFinal} disabled={busy}>
-            导出成片
+          <button onClick={generateFinalCut} disabled={busy} data-testid="render-final-button">
+            一键生成成片
           </button>
         </div>
       </section>
@@ -1380,21 +1810,27 @@ export default function ProjectPage() {
         </div>
       </section>
 
-      <section className="card">
+      <section className="card" data-testid="source-documents-section">
         <h3>输入源文件（PDF/TXT）</h3>
         <div className="row">
           <input
             type="file"
             accept=".pdf,.txt"
             onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)}
+            data-testid="source-document-file-input"
           />
-          <button onClick={uploadSourceDocument} disabled={busy || !uploadFile}>
+          <button onClick={uploadSourceDocument} disabled={busy || !uploadFile} data-testid="source-document-upload-button">
             上传并登记
           </button>
         </div>
         {docs.length === 0 ? <p className="muted">暂无源文件</p> : null}
         {docs.map((doc) => (
-          <div key={doc.id} className="row" style={{ justifyContent: "space-between", marginTop: 8 }}>
+          <div
+            key={doc.id}
+            className="row"
+            style={{ justifyContent: "space-between", marginTop: 8 }}
+            data-testid={`source-document-row-${doc.id}`}
+          >
             <span>{doc.file_name}</span>
             <span className="pill">{doc.file_type.toUpperCase()}</span>
             <span className="pill">{doc.parse_status}</span>
@@ -1402,9 +1838,9 @@ export default function ProjectPage() {
         ))}
       </section>
 
-      {error ? <section className="card muted">{error}</section> : null}
+      {error ? <section className="card muted" data-testid="workflow-error-message">{error}</section> : null}
       {(pendingAction || actionProgress > 0) ? (
-        <section className="card muted">
+        <section className="card muted" data-testid="workflow-pending-action">
           <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
             <strong>{pendingAction ?? "执行完成"}</strong>
             <span>{Math.round(actionProgress)}%</span>
@@ -1421,12 +1857,20 @@ export default function ProjectPage() {
           </div>
         </section>
       ) : null}
-      {actionMessage ? <section className="card">{actionMessage}</section> : null}
-      {latestExport ? (
-        <section className="card">
+      {actionMessage ? <section className="card" data-testid="workflow-action-message">{actionMessage}</section> : null}
+      {latestExport || project?.output_path ? (
+        <section className="card" data-testid="latest-export-section">
           <h3>最新导出</h3>
-          <p>状态: {latestExport.status}</p>
-          <p className="muted">输出: {latestExport.output_key ?? "-"}</p>
+          <p>状态: {latestExport?.status ?? (project?.status === "COMPLETED" ? "COMPLETED" : "-")}</p>
+          <p className="muted">输出: {latestExport?.output_key ?? project?.output_path ?? "-"}</p>
+          {latestExportUrl ? (
+            <div style={{ marginTop: 12 }}>
+              <video className="chapterVideoPlayer" controls preload="metadata" src={resolveMediaUrl(latestExportUrl)} />
+              <div className="row" style={{ marginTop: 8 }}>
+                <a className="downloadLink" href={resolveDownloadUrl(latestExportUrl)}>导出成片文件</a>
+              </div>
+            </div>
+          ) : null}
         </section>
       ) : null}
 
@@ -1469,27 +1913,37 @@ export default function ProjectPage() {
             <div className="mediaSectionHeader">
               <div>
                 <p className="eyebrow">全局锚点</p>
-                <h4>人物与场景参考图</h4>
+                <h4>人物身份肖像与场景参考图</h4>
               </div>
             </div>
             {storyBibleCharacters.length > 0 ? (
               <div style={{ marginBottom: 16 }}>
-                <p className="eyebrow">角色锚点</p>
+                <p className="eyebrow">角色身份肖像锚点</p>
                 <div className="storyboardGrid">
                   {storyBibleCharacters.map((item) => (
                     <article key={`character-${item.name}`} className="frameCard">
-                      {item.reference_image_url ? (
-                        <img src={resolveMediaUrl(item.reference_image_url)} alt={item.name} className="framePreview" />
+                      {(item.identity_reference_image_url || item.reference_image_url) ? (
+                        <img
+                          src={resolveMediaUrl(item.identity_reference_image_url || item.reference_image_url || "")}
+                          alt={item.name}
+                          className="framePreview"
+                        />
                       ) : (
                         <div className="framePreview framePreviewEmpty">暂无参考图</div>
                       )}
                       <div className="frameMeta">
                         <p><strong>{item.name}</strong></p>
+                        <p className="eyebrow" style={{ margin: "4px 0" }}>身份肖像参考</p>
                         <p>{asString(item.description, item.visual_anchor ?? "暂无描述")}</p>
                       </div>
-                      {item.reference_image_url ? (
+                      {(item.identity_reference_image_url || item.reference_image_url) ? (
                         <div className="frameCardFooter">
-                          <a className="downloadLink" href={resolveDownloadUrl(item.reference_image_url)}>导出参考图</a>
+                          <a
+                            className="downloadLink"
+                            href={resolveDownloadUrl(item.identity_reference_image_url || item.reference_image_url || "")}
+                          >
+                            导出身份肖像参考图
+                          </a>
                         </div>
                       ) : null}
                     </article>
@@ -1503,18 +1957,28 @@ export default function ProjectPage() {
                 <div className="storyboardGrid">
                   {storyBibleScenes.map((item) => (
                     <article key={`scene-${item.name}`} className="frameCard">
-                      {item.reference_image_url ? (
-                        <img src={resolveMediaUrl(item.reference_image_url)} alt={item.name} className="framePreview" />
+                      {(item.scene_reference_image_url || item.reference_image_url) ? (
+                        <img
+                          src={resolveMediaUrl(item.scene_reference_image_url || item.reference_image_url || "")}
+                          alt={item.name}
+                          className="framePreview"
+                        />
                       ) : (
                         <div className="framePreview framePreviewEmpty">暂无参考图</div>
                       )}
                       <div className="frameMeta">
                         <p><strong>{item.name}</strong></p>
+                        <p className="eyebrow" style={{ margin: "4px 0" }}>场景参考</p>
                         <p>{asString(item.description, item.visual_anchor ?? "暂无描述")}</p>
                       </div>
-                      {item.reference_image_url ? (
+                      {(item.scene_reference_image_url || item.reference_image_url) ? (
                         <div className="frameCardFooter">
-                          <a className="downloadLink" href={resolveDownloadUrl(item.reference_image_url)}>导出参考图</a>
+                          <a
+                            className="downloadLink"
+                            href={resolveDownloadUrl(item.scene_reference_image_url || item.reference_image_url || "")}
+                          >
+                            导出场景参考图
+                          </a>
                         </div>
                       ) : null}
                     </article>
@@ -1526,7 +1990,7 @@ export default function ProjectPage() {
         ) : null}
       </section>
 
-      <section className="card">
+      <section className="card" data-testid="step-selection">
         <h3>阶段选择</h3>
         <div className="row">
           {steps.map((step) => {
@@ -1539,6 +2003,10 @@ export default function ProjectPage() {
               <button
                 key={step.id}
                 onClick={() => setSelectedStepId(step.id)}
+                data-testid={`step-button-${step.step_name}`}
+                data-step-name={step.step_name}
+                data-step-status={step.status}
+                data-selected={selected?.id === step.id ? "true" : "false"}
                 style={{
                   borderColor: isRunning ? "#f3a84a" : selected?.id === step.id ? "#d95f23" : undefined,
                   background: isRunning ? "rgba(243,168,74,0.16)" : undefined,
@@ -1553,9 +2021,10 @@ export default function ProjectPage() {
         </div>
       </section>
 
-      <section className="card">
+      <section className="card" data-testid="chapter-status-section">
         <h3>章节状态</h3>
-        {chapters.length === 0 ? <p className="muted">完成“章节切分”后会生成章节列表。</p> : null}
+        {chaptersLoading ? <p className="muted">章节加载中...</p> : null}
+        {!chaptersLoading && chapters.length === 0 ? <p className="muted">完成“章节切分”后会生成章节列表。</p> : null}
         <div className="row">
           {chapters.map((chapter) => (
             <div key={chapter.id} className="pill">
@@ -1576,13 +2045,17 @@ export default function ProjectPage() {
       </section>
 
       <section className="grid">
-        <aside className="card">
+        <aside className="card" data-testid="chapter-list">
           <h3>章节列表</h3>
-          {chapters.length === 0 ? <p className="muted">暂无章节</p> : null}
+          {chaptersLoading ? <p className="muted">章节加载中...</p> : null}
+          {!chaptersLoading && chapters.length === 0 ? <p className="muted">暂无章节</p> : null}
           {chapters.map((chapter) => (
             <button
               key={chapter.id}
               onClick={() => setSelectedChapterId(chapter.id)}
+              data-testid={`chapter-button-${chapter.id}`}
+              data-chapter-id={chapter.id}
+              data-selected={selectedChapter?.id === chapter.id ? "true" : "false"}
               style={{
                 width: "100%",
                 textAlign: "left",
@@ -1604,25 +2077,84 @@ export default function ProjectPage() {
           ))}
         </aside>
 
-        <section className={`card ${selected && mediaFocusedSteps.has(selected.step_name) ? "mediaReviewCard" : ""}`}>
+        <section
+          className={`card ${selected && mediaFocusedSteps.has(selected.step_name) ? "mediaReviewCard" : ""}`}
+          data-testid="artifact-preview"
+        >
           <h3>产物预览</h3>
           {renderMediaPreview()}
         </section>
 
-        <section className="card">
+        <section className="card" data-testid="workflow-action-panel">
           <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
             <h3 style={{ margin: 0 }}>人工闭环动作</h3>
             <div className="row">
               {selected && chapterScopedSteps.has(selected.step_name) ? (
-                <button onClick={runCurrentStepForAllChapters} disabled={busy || !selected}>
+                <button
+                  onClick={runCurrentStepForAllChapters}
+                  disabled={busy || !selected}
+                  data-testid="run-current-step-all-chapters-button"
+                >
                   {busy && pendingAction?.includes("批量运行") ? "批量运行中..." : "对当前所有章节运行当前阶段"}
                 </button>
               ) : null}
-              <button onClick={() => runCurrentStep(true)} disabled={busy || !selected}>
-                {busy && pendingAction?.includes("正在运行") ? pendingAction : "运行当前阶段"}
-              </button>
+              {selected && chapterScopedSteps.has(selected.step_name) && failedChapterItems.length > 0 ? (
+                <button
+                  onClick={runCurrentStepForFailedChapters}
+                  disabled={busy || !selected}
+                  data-testid="run-current-step-failed-chapters-button"
+                >
+                  {busy && pendingAction?.includes("失败章节") ? "重跑中..." : `对失败章节运行当前阶段（${failedChapterItems.length}）`}
+                </button>
+              ) : null}
+              {selected?.step_name === "stitch_subtitle_tts" ? (
+                <button onClick={generateFinalCut} disabled={busy || !selected} data-testid="run-current-step-button">
+                  {busy && pendingAction?.includes("成片") ? pendingAction : "一键生成成片"}
+                </button>
+              ) : (
+                <button onClick={() => runCurrentStep(true)} disabled={busy || !selected} data-testid="run-current-step-button">
+                  {busy && pendingAction?.includes("正在运行") ? pendingAction : "运行当前阶段"}
+                </button>
+              )}
             </div>
           </div>
+          {selected && chapterScopedSteps.has(selected.step_name) && failedChapterItems.length > 0 ? (
+            <div className="card" style={{ padding: 12, marginBottom: 12 }}>
+              <strong>当前阶段有 {failedChapterItems.length} 个失败章节</strong>
+              <div className="diffList" style={{ marginTop: 10 }}>
+                {failedChapterItems.slice(0, 6).map((item) => (
+                  <div key={item.id} className="diffItem">
+                    {item.title}：{clipText(item.detail || "暂无失败详情", 120)}
+                  </div>
+                ))}
+              </div>
+              {failedChapterItems.length > 6 ? (
+                <p className="muted" style={{ marginBottom: 0 }}>
+                  仅展示前 6 个失败章节，其余可在章节列表中继续查看。
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          {selected?.step_name === "consistency_check" &&
+          (reviewRequiredChapterItems.length > 0 || reworkRequestedChapterItems.length > 0 || pendingConsistencyChapterItems.length > 0) ? (
+            <div className="card" style={{ padding: 12, marginBottom: 12 }}>
+              <strong>分镜校核批量处理概览</strong>
+              <div className="diffList" style={{ marginTop: 10 }}>
+                <div className="diffItem">已完成校核待通过：{reviewRequiredChapterItems.length} 章</div>
+                <div className="diffItem">需返工自动修正：{reworkRequestedChapterItems.length} 章</div>
+                <div className="diffItem">待重新评分：{pendingConsistencyChapterItems.length} 章</div>
+              </div>
+              {reworkRequestedChapterItems.length > 0 ? (
+                <div className="diffList" style={{ marginTop: 10 }}>
+                  {reworkRequestedChapterItems.slice(0, 4).map((item) => (
+                    <div key={item.id} className="diffItem">
+                      {item.title}：{clipText(item.detail || "将自动根据低分镜头原因补充修正提示词。", 120)}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <label>当前步骤模型绑定</label>
           {selected && localOnlySteps.has(selected.step_name) ? (
             <div className="card" style={{ padding: 12, marginBottom: 12 }}>
@@ -1683,6 +2215,7 @@ export default function ProjectPage() {
                 })
               }
               disabled={busy || !selected}
+              data-testid="approve-current-step-button"
             >
               {busy && pendingAction?.includes("审批通过") ? "审批中..." : "通过"}
             </button>
@@ -1691,17 +2224,77 @@ export default function ProjectPage() {
                 onClick={() =>
                   selected &&
                   postBatchAction(
-                    `/api/v1/projects/${projectId}/steps/${selected.id}/approve-all-chapters`,
+                    `/api/v1/projects/${projectId}/steps/${selected.id}/${selected.step_name === "consistency_check" ? "approve-review-required-chapters" : "approve-all-chapters"}`,
                     {
                       scope_type: "chapter",
                       created_by: "ui-reviewer",
                     },
-                    "已批量通过当前阶段。"
+                    selected.step_name === "consistency_check" ? "已批量通过所有已完成校核章节。" : "已批量通过当前阶段。"
                   )
                 }
                 disabled={busy || !selected}
+                data-testid="approve-current-step-all-chapters-button"
               >
-                对当前所有章节通过
+                {selected.step_name === "consistency_check"
+                  ? `对已完成校核章节通过（${reviewRequiredChapterItems.length}）`
+                  : "对当前所有章节通过"}
+              </button>
+            ) : null}
+            {selected && chapterScopedSteps.has(selected.step_name) && failedChapterItems.length > 0 ? (
+              <button
+                onClick={() =>
+                  selected &&
+                  postBatchAction(
+                    `/api/v1/projects/${projectId}/steps/${selected.id}/approve-failed-chapters`,
+                    {
+                      scope_type: "chapter",
+                      created_by: "ui-reviewer",
+                    },
+                    "已批量通过失败章节。"
+                  )
+                }
+                disabled={busy || !selected}
+                data-testid="approve-current-step-failed-chapters-button"
+              >
+                对失败章节通过
+              </button>
+            ) : null}
+            {selected?.step_name === "consistency_check" ? (
+              <button
+                onClick={() =>
+                  selected &&
+                  postBatchAction(
+                    `/api/v1/projects/${projectId}/steps/${selected.id}/rework-regenerate-rescore-chapters`,
+                    {
+                      scope_type: "chapter",
+                      created_by: "ui-reviewer",
+                    },
+                    "已完成返工章节自动修正、重新出图与重新校核。"
+                  )
+                }
+                disabled={busy || !selected || reworkRequestedChapterItems.length === 0}
+                data-testid="consistency-rework-regenerate-rescore-button"
+              >
+                对返工章节自动修正重跑（{reworkRequestedChapterItems.length}）
+              </button>
+            ) : null}
+            {selected?.step_name === "consistency_check" ? (
+              <button
+                onClick={() =>
+                  selected &&
+                  postBatchAction(
+                    `/api/v1/projects/${projectId}/steps/${selected.id}/rerun-pending-chapters`,
+                    {
+                      scope_type: "chapter",
+                      created_by: "ui-reviewer",
+                    },
+                    "已重新对待评分章节执行分镜校核。"
+                  )
+                }
+                disabled={busy || !selected || pendingConsistencyChapterItems.length === 0}
+                data-testid="consistency-rerun-pending-chapters-button"
+              >
+                对待评分章节重新打分（{pendingConsistencyChapterItems.length}）
               </button>
             ) : null}
             {selected && textEditableSteps.has(selected.step_name) ? (
@@ -1946,8 +2539,8 @@ export default function ProjectPage() {
                       {JSON.stringify(version.output_snapshot, null, 2)}
                     </pre>
                   </details>
-                  <button onClick={() => selectStoryboardVersion(version.id)} disabled={busy}>
-                    选用该版本
+                  <button onClick={() => selectStoryboardVersion(version.id)} disabled={busy || version.is_active}>
+                    {version.is_active ? "当前使用" : "选用该版本"}
                   </button>
                       </>
                     );

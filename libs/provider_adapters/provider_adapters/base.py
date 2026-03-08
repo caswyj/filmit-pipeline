@@ -51,7 +51,11 @@ class ProviderAdapter(ABC):
     async def download_video(self, job_id: str) -> tuple[bytes, str]:
         raise NotImplementedError
 
-    async def estimate_cost(self, req: ProviderRequest) -> float:
+    async def estimate_cost(self, req: ProviderRequest, usage: dict[str, Any] | None = None) -> float:
+        if isinstance(usage, dict):
+            provider_cost = usage.get("cost")
+            if isinstance(provider_cost, (int, float)):
+                return round(float(provider_cost), 6)
         token_hint = float(len(str(req.input)) + len(req.prompt or ""))
         return round(token_hint / 2000.0, 4)
 

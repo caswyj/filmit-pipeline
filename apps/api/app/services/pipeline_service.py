@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
+import io
 import json
 import math
 import re
+import tempfile
 import subprocess
 import textwrap
 import zipfile
 from copy import deepcopy
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +25,7 @@ from workflow_engine import PIPELINE_STEPS, ProjectStatus, StepStatus
 from workflow_engine.pipeline import next_step_name
 
 from app.core.config import settings
+from app.db.session import SessionLocal
 from app.db.models import (
     Asset,
     ChapterChunk,
@@ -49,6 +53,52 @@ LOCAL_STEP_MODELS = {
     "chapter_chunking": ("local", "builtin-chunker"),
 }
 LOCAL_CHAPTER_MAX_CHARS = 12_000
+REFERENCE_IMAGE_MAX_EDGE = 640
+REFERENCE_IMAGE_JPEG_QUALITY = 78
+REFERENCE_IMAGE_INLINE_BYTES = 250_000
+STORYBOARD_REFERENCE_IMAGE_LIMIT = 3
+STORYBOARD_IMAGE_FALLBACK_LIMIT = 3
+CONSISTENCY_REFERENCE_CHARACTER_LIMIT = 3
+CONSISTENCY_REFERENCE_SCENE_LIMIT = 2
+CONSISTENCY_CURRENT_FRAME_LIMIT = 4
+CONSISTENCY_NEIGHBOR_FRAME_LIMIT = 2
+CONSISTENCY_BATCH_CONCURRENCY = 3
+STORYBOARD_IMAGE_SEXUAL_RISK_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"乳罩|胸罩|bra|lingerie",
+        r"内衣|内裤|underwear|pant(?:y|ies)",
+        r"半透明|透视|see[- ]?through|sheer",
+        r"别的什么都没穿|什么都没穿|一丝不挂|未着寸缕",
+        r"裸体|裸露|赤裸|裸身|nude|nudity|topless|bottomless",
+        r"性|性爱|性交|sex|sexual",
+    )
+]
+CONSISTENCY_HARD_IDENTITY_PATTERNS = (
+    "脸型",
+    "面部特征",
+    "身份",
+    "发型",
+    "年龄感",
+    "看起来更年轻",
+    "看起来更老",
+    "不一致",
+    "人物形象",
+)
+CONSISTENCY_SOFT_MISMATCH_PATTERNS = (
+    "服装",
+    "外套",
+    "夹克",
+    "毛衣",
+    "背景",
+    "光影",
+    "氛围",
+    "建筑风格",
+    "网球场",
+    "走廊",
+    "书房",
+    "办公室",
+)
 TEXT_EDITABLE_STEPS = {"ingest_parse", "chapter_chunking", "story_scripting", "shot_detailing"}
 CHAPTER_SCOPED_STEPS = {
     "story_scripting",
@@ -71,6 +121,80 @@ CHAPTER_DEPENDENCIES = {
     "consistency_check": "storyboard_image",
     "segment_video": "consistency_check",
 }
+
+
+@lru_cache(maxsize=512)
+def _cached_reference_image_data_url(path_str: str) -> str | None:
+    path = Path(path_str)
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_bytes()
+        suffix = path.suffix.lower()
+        if len(raw) <= REFERENCE_IMAGE_INLINE_BYTES:
+            mime_type = "image/png" if suffix == ".png" else "image/jpeg"
+            return f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}"
+
+        from PIL import Image, ImageOps
+
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+            if image.mode in {"RGBA", "LA"}:
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                background.paste(image, mask=image.getchannel("A"))
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            image.thumbnail((REFERENCE_IMAGE_MAX_EDGE, REFERENCE_IMAGE_MAX_EDGE), resampling)
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=REFERENCE_IMAGE_JPEG_QUALITY, optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception:
+        try:
+            raw = path.read_bytes()
+        except Exception:
+            return None
+        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        return f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}"
+
+@lru_cache(maxsize=512)
+def _cached_reference_image_variant_data_url(path_str: str, variant: str) -> str | None:
+    if variant == "full":
+        return _cached_reference_image_data_url(path_str)
+    path = Path(path_str)
+    if not path.exists():
+        return None
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+            if image.mode in {"RGBA", "LA"}:
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                background.paste(image, mask=image.getchannel("A"))
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            if variant == "portrait":
+                width, height = image.size
+                crop_w = max(1, int(width * 0.62))
+                crop_h = max(1, int(height * 0.74))
+                left = max(0, (width - crop_w) // 2)
+                top = max(0, int(height * 0.06))
+                right = min(width, left + crop_w)
+                bottom = min(height, top + crop_h)
+                image = image.crop((left, top, right, bottom))
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            image.thumbnail((REFERENCE_IMAGE_MAX_EDGE, REFERENCE_IMAGE_MAX_EDGE), resampling)
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=REFERENCE_IMAGE_JPEG_QUALITY, optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception:
+        return _cached_reference_image_data_url(path_str)
 
 
 class PipelineService:
@@ -181,16 +305,127 @@ class PipelineService:
         chapters = self._list_project_chapters(project.id)
         if not chapters:
             raise ValueError("no chapters available")
+        step = self.db.scalar(select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == step_name))
+        if not step:
+            raise ValueError(f"step not found: {step_name}")
 
+        eligible_chapters = [
+            chapter
+            for chapter in chapters
+            if not self._should_skip_chapter_for_batch_step(chapter, step_name)
+            and self._chapter_dependency_satisfied(project.id, chapter, step_name)
+            and (force or self._chapter_step_status(chapter, step_name) != StepStatus.APPROVED.value)
+        ]
+        run_results = await self._run_step_for_chapter_batch(
+            project,
+            step_name,
+            chapters,
+            eligible_chapters,
+            force=force,
+            params=params,
+            skipped_detail="当前章节该阶段已通过，已跳过。",
+            rerun_detail="当前章节已运行完成。",
+            fatal_skip_detail="检测到 provider 余额/鉴权级致命错误，批量运行已中止。",
+        )
+        current_step = self._sync_global_chapter_scoped_step(project, step)
+
+        return {
+            "project_id": project.id,
+            "step_name": step_name,
+            "total": len(chapters),
+            "succeeded": run_results["succeeded"],
+            "failed": run_results["failed"],
+            "skipped": run_results["skipped"],
+            "chapter_results": run_results["results"],
+            "current_step": run_results["last_step"] or current_step,
+        }
+
+    async def run_step_for_failed_chapters(
+        self,
+        project: Project,
+        step_name: str,
+        *,
+        force: bool = True,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if step_name not in CHAPTER_SCOPED_STEPS:
+            raise ValueError("run-failed-chapters is only allowed on chapter-scoped steps")
+        params = params or {}
+        chapters = self._list_project_chapters(project.id)
+        if not chapters:
+            raise ValueError("no chapters available")
+        step = self.db.scalar(select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == step_name))
+        if not step:
+            raise ValueError(f"step not found: {step_name}")
+
+        eligible_chapters = [
+            chapter
+            for chapter in chapters
+            if not self._should_skip_chapter_for_batch_step(chapter, step_name)
+            and self._chapter_step_status(chapter, step_name) == StepStatus.FAILED.value
+            and self._chapter_dependency_satisfied(project.id, chapter, step_name)
+        ]
+        run_results = await self._run_step_for_chapter_batch(
+            project,
+            step_name,
+            chapters,
+            eligible_chapters,
+            force=force,
+            params=params,
+            skipped_detail_template="当前状态为 {status}，不是失败章节，已跳过。",
+            rerun_detail="失败章节已重新运行。",
+            fatal_skip_detail="检测到 provider 余额/鉴权级致命错误，失败章节批量重跑已中止。",
+            failed_only=True,
+        )
+        current_step = self._sync_global_chapter_scoped_step(project, step)
+        return {
+            "project_id": project.id,
+            "step_name": step_name,
+            "total": len(chapters),
+            "succeeded": run_results["succeeded"],
+            "failed": run_results["failed"],
+            "skipped": run_results["skipped"],
+            "chapter_results": run_results["results"],
+            "current_step": run_results["last_step"] or current_step,
+        }
+
+    async def _run_step_for_chapter_batch(
+        self,
+        project: Project,
+        step_name: str,
+        chapters: list[ChapterChunk],
+        eligible_chapters: list[ChapterChunk],
+        *,
+        force: bool,
+        params: dict[str, Any],
+        rerun_detail: str,
+        fatal_skip_detail: str,
+        skipped_detail: str | None = None,
+        skipped_detail_template: str | None = None,
+        failed_only: bool = False,
+    ) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         succeeded = 0
         failed = 0
         skipped = 0
         last_step: PipelineStep | None = None
+        concurrency = self._batch_step_concurrency(step_name)
+        eligible_ids = {chapter.id for chapter in eligible_chapters}
+        fatal_error = False
 
         for chapter in chapters:
             title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
-            chapter_status = self._chapter_step_status(chapter, step_name)
+            if self._should_skip_chapter_for_batch_step(chapter, step_name):
+                skipped += 1
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": "该章节属于前置/附录元内容，当前阶段已自动跳过。",
+                    }
+                )
+                continue
             if not self._chapter_dependency_satisfied(project.id, chapter, step_name):
                 skipped += 1
                 results.append(
@@ -202,56 +437,148 @@ class PipelineService:
                     }
                 )
                 continue
-            if not force and chapter_status == StepStatus.APPROVED.value:
+            chapter_status = self._chapter_step_status(chapter, step_name)
+            if failed_only and chapter_status != StepStatus.FAILED.value:
                 skipped += 1
                 results.append(
                     {
                         "chapter_id": chapter.id,
                         "chapter_title": title,
                         "status": "SKIPPED",
-                        "detail": "当前章节该阶段已通过，已跳过。",
+                        "detail": str(skipped_detail_template or "当前状态为 {status}，不是失败章节，已跳过。").format(
+                            status=chapter_status
+                        ),
                     }
                 )
                 continue
-            try:
-                last_step = await self.run_specific_step(
-                    project,
-                    step_name,
-                    force=force,
-                    params={**params, "chapter_id": chapter.id},
-                )
-                succeeded += 1
+            if not failed_only and not force and chapter_status == StepStatus.APPROVED.value:
+                skipped += 1
                 results.append(
                     {
                         "chapter_id": chapter.id,
                         "chapter_title": title,
-                        "status": last_step.status,
-                        "detail": "当前章节已运行完成。",
+                        "status": "SKIPPED",
+                        "detail": skipped_detail or "当前章节该阶段已通过，已跳过。",
                     }
                 )
-            except Exception as exc:  # noqa: BLE001
-                failed += 1
+                continue
+            if chapter.id not in eligible_ids:
+                skipped += 1
                 results.append(
                     {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": skipped_detail or "当前章节该阶段已通过，已跳过。",
+                    }
+                )
+                continue
+            if fatal_error:
+                skipped += 1
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": fatal_skip_detail,
+                    }
+                )
+                continue
+
+        pending_chapters = [chapter for chapter in chapters if chapter.id in eligible_ids]
+        for index in range(0, len(pending_chapters), concurrency):
+            if fatal_error:
+                break
+            window = pending_chapters[index : index + concurrency]
+            task_results = await asyncio.gather(
+                *[
+                    self._run_chapter_step_in_isolated_session(
+                        project.id,
+                        step_name,
+                        chapter.id,
+                        force=force,
+                        params=params,
+                    )
+                    for chapter in window
+                ],
+                return_exceptions=True,
+            )
+            result_map = {item["chapter_id"]: item for item in results}
+            for chapter, task_result in zip(window, task_results):
+                title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+                if isinstance(task_result, Exception):
+                    failed += 1
+                    detail = str(task_result)
+                    result_map[chapter.id] = {
                         "chapter_id": chapter.id,
                         "chapter_title": title,
                         "status": "FAILED",
-                        "detail": str(exc),
+                        "detail": detail,
+                    }
+                    if self._is_fatal_batch_error(task_result):
+                        fatal_error = True
+                else:
+                    last_step = self._get_step(project.id, task_result["step_id"])
+                    succeeded += 1
+                    result_map[chapter.id] = {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": task_result["status"],
+                        "detail": rerun_detail,
+                    }
+            results = [result_map[item.id] for item in chapters if item.id in result_map]
+
+        if fatal_error:
+            executed_ids = {item["chapter_id"] for item in results if item["status"] != "SKIPPED"}
+            for chapter in chapters:
+                if chapter.id in executed_ids or chapter.id not in eligible_ids:
+                    continue
+                title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+                skipped += 1
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": fatal_skip_detail,
                     }
                 )
 
         return {
-            "project_id": project.id,
-            "step_name": step_name,
-            "total": len(chapters),
+            "results": results,
             "succeeded": succeeded,
             "failed": failed,
             "skipped": skipped,
-            "chapter_results": results,
-            "current_step": last_step or self.db.scalar(
-                select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == step_name)
-            ),
+            "last_step": last_step,
         }
+
+    def _batch_step_concurrency(self, step_name: str) -> int:
+        if step_name == "consistency_check":
+            return CONSISTENCY_BATCH_CONCURRENCY
+        return 1
+
+    async def _run_chapter_step_in_isolated_session(
+        self,
+        project_id: str,
+        step_name: str,
+        chapter_id: str,
+        *,
+        force: bool,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        db = SessionLocal()
+        try:
+            svc = PipelineService(db)
+            project = svc._get_project(project_id)
+            step = await svc.run_specific_step(
+                project,
+                step_name,
+                force=force,
+                params={**params, "chapter_id": chapter_id},
+            )
+            return {"chapter_id": chapter_id, "step_id": step.id, "status": step.status}
+        finally:
+            db.close()
 
     def _sync_global_chapter_scoped_step(self, project: Project, step: PipelineStep) -> PipelineStep:
         chapters = self._list_project_chapters(project.id)
@@ -287,8 +614,12 @@ class PipelineService:
         results: list[dict[str, Any]],
         current_step: PipelineStep | None,
     ) -> dict[str, Any]:
-        succeeded = sum(1 for item in results if item["status"] == StepStatus.APPROVED.value or item["status"] == StepStatus.REVIEW_REQUIRED.value)
-        failed = sum(1 for item in results if item["status"] == "FAILED")
+        succeeded = sum(
+            1
+            for item in results
+            if item["status"] in {StepStatus.APPROVED.value, StepStatus.REVIEW_REQUIRED.value}
+        )
+        failed = sum(1 for item in results if item["status"] in {"FAILED", StepStatus.REWORK_REQUESTED.value})
         skipped = sum(1 for item in results if item["status"] == "SKIPPED")
         return {
             "project_id": project_id,
@@ -440,6 +771,291 @@ class PipelineService:
         synced = self._sync_global_chapter_scoped_step(project, step)
         return self._batch_action_response(project.id, step.step_name, results, synced)
 
+    async def approve_review_required_consistency_chapters(
+        self,
+        project: Project,
+        step_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        step = self._get_step(project.id, step_id)
+        if step.step_name != "consistency_check":
+            raise ValueError("approve-review-required-consistency-chapters is only allowed on consistency_check")
+        chapters = self._list_project_chapters(project.id)
+        approved_results: list[dict[str, Any]] = []
+        approved_ids: list[str] = []
+        for chapter in chapters:
+            if self._chapter_step_status(chapter, step.step_name) != StepStatus.REVIEW_REQUIRED.value:
+                continue
+            title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+            stage_output = self._chapter_stage_chain(chapter).get(step.step_name, {})
+            self._set_chapter_stage_state(
+                chapter,
+                step.step_name,
+                status=StepStatus.APPROVED.value,
+                output=self._build_chapter_stage_output(stage_output, payload.get("comment")),
+                attempt=step.attempt,
+                provider=step.model_provider,
+                model=step.model_name,
+            )
+            approved_ids.append(chapter.id)
+            approved_results.append(
+                {
+                    "chapter_id": chapter.id,
+                    "chapter_title": title,
+                    "status": StepStatus.APPROVED.value,
+                    "detail": "当前章节已批量通过。",
+                }
+            )
+        if approved_ids:
+            self._record_review(
+                project.id,
+                step.id,
+                "batch",
+                "approve_review_required_consistency",
+                {
+                    **payload,
+                    "chapter_ids": approved_ids,
+                    "chapter_count": len(approved_ids),
+                },
+                payload["created_by"],
+            )
+        synced = self._sync_global_chapter_scoped_step(project, step)
+        return {
+            "project_id": project.id,
+            "step_name": step.step_name,
+            "total": len(chapters),
+            "succeeded": len(approved_ids),
+            "failed": 0,
+            "skipped": max(0, len(chapters) - len(approved_ids)),
+            "chapter_results": approved_results,
+            "current_step": synced,
+        }
+
+    async def approve_failed_step_for_all_chapters(self, project: Project, step_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        step = self._get_step(project.id, step_id)
+        if step.step_name not in CHAPTER_SCOPED_STEPS:
+            raise ValueError("approve-failed-chapters is only allowed on chapter-scoped steps")
+        results: list[dict[str, Any]] = []
+        for chapter in self._list_project_chapters(project.id):
+            title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+            chapter_status = self._chapter_step_status(chapter, step.step_name)
+            if chapter_status != StepStatus.FAILED.value:
+                results.append({"chapter_id": chapter.id, "chapter_title": title, "status": "SKIPPED", "detail": f"当前状态为 {chapter_status}，不是失败章节，已跳过。"})
+                continue
+            stage_output = deepcopy(self._chapter_stage_chain(chapter).get(step.step_name, {}))
+            stage_output["manual_failure_override"] = True
+            self._set_chapter_stage_state(
+                chapter,
+                step.step_name,
+                status=StepStatus.APPROVED.value,
+                output=self._build_chapter_stage_output(stage_output, payload.get("comment")),
+                attempt=step.attempt,
+                provider=step.model_provider,
+                model=step.model_name,
+            )
+            self._record_review(project.id, step.id, "chapter", "approve_failed", {**payload, "chapter_id": chapter.id}, payload["created_by"])
+            results.append({"chapter_id": chapter.id, "chapter_title": title, "status": StepStatus.APPROVED.value, "detail": "失败章节已人工强制通过。"})
+        synced = self._sync_global_chapter_scoped_step(project, step)
+        return self._batch_action_response(project.id, step.step_name, results, synced)
+
+    async def rerun_pending_step_for_all_chapters(
+        self,
+        project: Project,
+        step_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        step = self._get_step(project.id, step_id)
+        if step.step_name not in CHAPTER_SCOPED_STEPS:
+            raise ValueError("rerun-pending-chapters is only allowed on chapter-scoped steps")
+        results: list[dict[str, Any]] = []
+        last_step: PipelineStep | None = None
+
+        for index, chapter in enumerate(self._list_project_chapters(project.id)):
+            title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+            if self._should_skip_chapter_for_batch_step(chapter, step.step_name):
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": "该章节不参与当前阶段，已自动跳过。",
+                    }
+                )
+                continue
+            if not self._chapter_dependency_satisfied(project.id, chapter, step.step_name):
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": "前置阶段尚未通过，已跳过。",
+                    }
+                )
+                continue
+            chapter_status = self._chapter_step_status(chapter, step.step_name)
+            if chapter_status != StepStatus.PENDING.value:
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": f"当前状态为 {chapter_status}，不是待重新评分章节，已跳过。",
+                    }
+                )
+                continue
+            try:
+                last_step = await self.run_specific_step(
+                    project,
+                    step.step_name,
+                    force=True,
+                    params={"chapter_id": chapter.id, **payload.get("params", {})},
+                )
+                current_chapter = self._get_chapter(project.id, chapter.id)
+                final_status = self._chapter_step_status(current_chapter, step.step_name)
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": final_status,
+                        "detail": "已重新执行当前章节的分镜校核评分。",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "FAILED",
+                        "detail": str(exc),
+                    }
+                )
+                if self._is_fatal_batch_error(exc):
+                    for remaining in self._list_project_chapters(project.id)[index + 1 :]:
+                        results.append(
+                            {
+                                "chapter_id": remaining.id,
+                                "chapter_title": str((remaining.meta or {}).get("title") or f"章节 {remaining.chapter_index + 1}"),
+                                "status": "SKIPPED",
+                                "detail": "检测到 provider 余额/鉴权级致命错误，批量重新评分已中止。",
+                            }
+                        )
+                    break
+
+        synced = self._sync_global_chapter_scoped_step(project, step)
+        return self._batch_action_response(project.id, step.step_name, results, last_step or synced)
+
+    async def regenerate_rework_requested_consistency_chapters(
+        self,
+        project: Project,
+        step_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        step = self._get_step(project.id, step_id)
+        if step.step_name != "consistency_check":
+            raise ValueError("rework-regenerate-rescore is only allowed on consistency_check")
+        storyboard_step = self._get_storyboard_step(project.id)
+        results: list[dict[str, Any]] = []
+        last_step: PipelineStep | None = None
+        chapters = self._list_project_chapters(project.id)
+
+        for index, chapter in enumerate(chapters):
+            title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+            if not self._chapter_participates_in_step(chapter, "consistency_check"):
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": "该章节作为片头/片尾画面，不参与分镜校核。",
+                    }
+                )
+                continue
+            chapter_status = self._chapter_step_status(chapter, "consistency_check")
+            if chapter_status != StepStatus.REWORK_REQUESTED.value:
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": f"当前状态为 {chapter_status}，不是待修正章节，已跳过。",
+                    }
+                )
+                continue
+            try:
+                auto_revision_prompt = self._build_consistency_revision_prompt(chapter)
+                target_shot_indexes = self._consistency_rework_target_shots(chapter)
+                rerun_params = {
+                    **payload.get("params", {}),
+                    "chapter_id": chapter.id,
+                    "auto_revision_prompt": auto_revision_prompt,
+                    "target_shot_indexes": target_shot_indexes,
+                }
+                storyboard_result = await self._execute_step(project, storyboard_step, params=rerun_params)
+                regenerated_chapter = self._get_chapter(project.id, chapter.id)
+                regenerated_output = deepcopy(self._chapter_stage_chain(regenerated_chapter).get("storyboard_image") or {})
+                regenerated_output["auto_regenerated_for_consistency"] = True
+                self._set_chapter_stage_state(
+                    regenerated_chapter,
+                    "storyboard_image",
+                    status=StepStatus.APPROVED.value,
+                    output=self._build_chapter_stage_output(regenerated_output),
+                    attempt=storyboard_result.attempt,
+                    provider=storyboard_result.model_provider,
+                    model=storyboard_result.model_name,
+                )
+                last_step = await self.run_specific_step(project, "consistency_check", force=True, params=rerun_params)
+                current_chapter = self._get_chapter(project.id, chapter.id)
+                final_status = self._chapter_step_status(current_chapter, "consistency_check")
+                detail = "已根据低分镜头原因补充修正提示词，重生成分镜并重新完成分镜校核。"
+                if final_status == StepStatus.REWORK_REQUESTED.value:
+                    detail = "已自动补充修正提示词并重跑，但当前章节仍需继续返工。"
+                self._record_review(
+                    project.id,
+                    step.id,
+                    "chapter",
+                    "consistency_rework_regenerate_rescore",
+                    {
+                        **payload,
+                        "chapter_id": chapter.id,
+                        "auto_revision_prompt": auto_revision_prompt,
+                        "target_shot_indexes": target_shot_indexes,
+                    },
+                    payload["created_by"],
+                )
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": final_status,
+                        "detail": detail,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "FAILED",
+                        "detail": str(exc),
+                    }
+                )
+                if self._is_fatal_batch_error(exc):
+                    for remaining in chapters[index + 1 :]:
+                        remaining_title = str((remaining.meta or {}).get("title") or f"章节 {remaining.chapter_index + 1}")
+                        results.append(
+                            {
+                                "chapter_id": remaining.id,
+                                "chapter_title": remaining_title,
+                                "status": "SKIPPED",
+                                "detail": "检测到 provider 余额/鉴权级致命错误，自动修正流程已中止。",
+                            }
+                        )
+                    break
+
+        self.db.commit()
+        synced = self._sync_global_chapter_scoped_step(project, step)
+        return self._batch_action_response(project.id, step.step_name, results, last_step or synced)
+
     async def edit_continue_for_all_chapters(self, project: Project, step_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         step = self._get_step(project.id, step_id)
         if step.step_name not in TEXT_EDITABLE_STEPS or step.step_name not in CHAPTER_SCOPED_STEPS:
@@ -574,7 +1190,13 @@ class PipelineService:
         if payload.get("comment"):
             restored_output["selection_comment"] = payload["comment"]
 
-        step.output_ref = restored_output
+        step_output = deepcopy(step.output_ref or {})
+        step_output["selected_storyboard_version_id"] = version.id
+        step_output["selected_storyboard_version_chapter_id"] = self._storyboard_version_chapter_id(version)
+        step_output["selection_source"] = "history_version"
+        if payload.get("comment"):
+            step_output["selection_comment"] = payload["comment"]
+        step.output_ref = step_output
         step.model_provider = version.model_provider or step.model_provider
         step.model_name = version.model_name or step.model_name
         step.status = StepStatus.REVIEW_REQUIRED.value
@@ -633,9 +1255,12 @@ class PipelineService:
         self.db.refresh(export_job)
         try:
             output_path = self._render_final_video(project, export_job.id)
+            if not self._is_playable_video(output_path):
+                raise ValueError(f"final export is not playable: {output_path}")
             export_job.status = "COMPLETED"
             export_job.output_key = str(output_path)
             export_job.finished_at = datetime.now(timezone.utc)
+            project.output_path = str(output_path)
             project.status = ProjectStatus.COMPLETED.value
             self.db.add_all([export_job, project])
             self.db.add(
@@ -659,20 +1284,51 @@ class PipelineService:
             self.db.commit()
             raise
 
+    async def generate_final_cut(self, project: Project, *, force: bool = True) -> ExportJob:
+        self.ensure_pipeline_steps(project)
+        steps = {item.step_name: item for item in self._list_steps(project.id)}
+        final_step = steps.get("stitch_subtitle_tts")
+        if final_step is None:
+            raise ValueError("final cut step not found")
+
+        if final_step.status != StepStatus.APPROVED.value or force:
+            rerun_step = await self._execute_step(project, final_step, params={"force_final_cut": force})
+            if rerun_step.status == StepStatus.REVIEW_REQUIRED.value:
+                await self.approve_step(
+                    project,
+                    rerun_step.id,
+                    {
+                        "scope_type": "step",
+                        "created_by": "system-final-cut",
+                        "comment": "一键生成成片时自动通过成片合成方案。",
+                    },
+                )
+            elif rerun_step.status != StepStatus.APPROVED.value:
+                raise ValueError(f"final cut preparation failed in status {rerun_step.status}")
+
+        refreshed = self._get_project(project.id)
+        return await self.render_final(refreshed)
+
     def _project_ready_for_final_render(self, project_id: str, steps: list[PipelineStep]) -> bool:
+        chapter_chunking_approved = any(
+            step.step_name == "chapter_chunking" and step.status == StepStatus.APPROVED.value
+            for step in steps
+        )
         for step in steps:
             if step.step_name in CHAPTER_SCOPED_STEPS:
+                continue
+            if step.step_name == "ingest_parse" and chapter_chunking_approved:
                 continue
             if step.status != StepStatus.APPROVED.value:
                 return False
         chapters = self._list_project_chapters(project_id)
         if not chapters:
             return False
+        approved_segments = 0
         for chapter in chapters:
-            for step_name in CHAPTER_STEP_SEQUENCE:
-                if self._chapter_step_status(chapter, step_name) != StepStatus.APPROVED.value:
-                    return False
-        return True
+            if self._chapter_step_status(chapter, "segment_video") == StepStatus.APPROVED.value:
+                approved_segments += 1
+        return approved_segments > 0
 
     def get_export(self, project_id: str, export_id: str) -> ExportJob:
         export = self.db.scalar(
@@ -754,6 +1410,12 @@ class PipelineService:
         step.started_at = datetime.now(timezone.utc)
         if step.step_name in LOCAL_ONLY_STEPS:
             step.model_provider, step.model_name = LOCAL_STEP_MODELS[step.step_name]
+        else:
+            step.model_provider, step.model_name = self._resolve_binding(
+                project,
+                step.step_name,
+                self.step_def_map[step.step_name].step_type,
+            )
         self.db.add(step)
         self.db.commit()
         self.db.refresh(step)
@@ -766,8 +1428,39 @@ class PipelineService:
             step_input = self._build_step_input(project, step, chapter)
             step.input_ref = step_input
             adapter = None
+            execution_provider = provider
+            execution_model = model
+            consistency_report = None
+            consistency_skip_approved = False
             if step.step_name in LOCAL_ONLY_STEPS:
                 response = self._invoke_local_step(step, step_input)
+                estimated_cost = 0.0
+            elif step.step_name == "consistency_check" and chapter is not None and not self._chapter_participates_in_step(chapter, step.step_name):
+                consistency_skip_approved = True
+                details = {
+                    "scoring_mode": "meta_chapter_skip",
+                    "summary": "前置内容/后记作为片头片尾画面，不参与主剧情分镜校核。",
+                    "excluded_from_consistency": True,
+                }
+                consistency_report = score_consistency({"frames": [{"shot_index": 1}]}, threshold=settings.consistency_threshold)
+                consistency_report = type(consistency_report)(
+                    score=100,
+                    dimensions={
+                        "chapter_internal_character": 100,
+                        "chapter_internal_scene": 100,
+                        "reference_adherence": 100,
+                        "cross_chapter_style": 100,
+                    },
+                    should_rework=False,
+                    details=details,
+                )
+                response = ProviderResponse(
+                    output={"summary": details["summary"], "scoring_mode": "meta_chapter_skip"},
+                    usage={},
+                    raw={"meta_chapter_skip": True},
+                )
+                execution_provider = "local"
+                execution_model = "meta-chapter-skip"
                 estimated_cost = 0.0
             else:
                 adapter = self.registry.resolve(provider)
@@ -799,6 +1492,31 @@ class PipelineService:
                         style_directive,
                         params,
                     )
+                elif step.step_name == "stitch_subtitle_tts":
+                    response, estimated_cost = await self._invoke_stitch_subtitle_tts_step(
+                        project,
+                        step,
+                        adapter,
+                        provider,
+                        model,
+                        system_prompt,
+                        task_prompt,
+                        style_directive,
+                        params,
+                    )
+                elif step.step_name == "consistency_check":
+                    consistency_context = self._build_storyboard_consistency_context(project, chapter)
+                    consistency_run = await self._score_storyboard_consistency_with_model(
+                        project,
+                        step,
+                        consistency_context,
+                        threshold=settings.consistency_threshold,
+                    )
+                    response = consistency_run["response"]
+                    estimated_cost = float(consistency_run["estimated_cost"])
+                    execution_provider = str(consistency_run["provider"] or provider)
+                    execution_model = str(consistency_run["model"] or model)
+                    consistency_report = consistency_run["report"]
                 else:
                     req = ProviderRequest(
                         step=self.step_def_map[step.step_name].step_type,
@@ -808,7 +1526,7 @@ class PipelineService:
                         params=params,
                     )
                     response = await adapter.invoke(req)
-                    estimated_cost = await adapter.estimate_cost(req)
+                    estimated_cost = await adapter.estimate_cost(req, response.usage)
 
             output = {
                 "artifact": response.output,
@@ -826,13 +1544,15 @@ class PipelineService:
                 output["video_consistency"] = self._build_video_consistency_report(project.id, chapter, output)
             output["execution_stats"] = self._build_execution_stats(
                 step=step,
-                provider=provider,
-                model=model,
+                provider=execution_provider,
+                model=execution_model,
                 usage=response.usage,
                 estimated_cost=estimated_cost,
                 execution_mode="local" if step.step_name in LOCAL_ONLY_STEPS else "provider",
             )
             output = self._materialize_step_output(project, step, output, chapter)
+            if step.step_name == "stitch_subtitle_tts":
+                output["final_cut"] = self._build_final_cut_summary(project, output)
             step.output_ref = output
             step.finished_at = datetime.now(timezone.utc)
             storyboard_version: StoryboardVersion | None = None
@@ -852,13 +1572,9 @@ class PipelineService:
                 self.db.add(storyboard_version)
 
             if step.step_name == "consistency_check":
-                consistency_context = self._build_storyboard_consistency_context(project, chapter)
-                consistency = await self._score_storyboard_consistency_with_model(
-                    project,
-                    step,
-                    consistency_context,
-                    threshold=settings.consistency_threshold,
-                )
+                if consistency_report is None:
+                    raise ValueError("consistency_check did not produce a consistency report")
+                consistency = consistency_report
                 chapter_scores = self._project_chapter_consistency_scores(
                     project,
                     current_chapter_id=chapter.id if chapter else None,
@@ -880,7 +1596,10 @@ class PipelineService:
                     consistency.should_rework,
                     chapter_id=chapter.id if chapter else None,
                 )
-                step.status = StepStatus.REWORK_REQUESTED.value if consistency.should_rework else StepStatus.REVIEW_REQUIRED.value
+                if consistency_skip_approved:
+                    step.status = StepStatus.APPROVED.value
+                else:
+                    step.status = StepStatus.REWORK_REQUESTED.value if consistency.should_rework else StepStatus.REVIEW_REQUIRED.value
             else:
                 step.status = StepStatus.REVIEW_REQUIRED.value
 
@@ -892,8 +1611,8 @@ class PipelineService:
                     status=chapter_stage_status,
                     output=self._build_chapter_stage_output(output),
                     attempt=step.attempt,
-                    provider=provider,
-                    model=model,
+                    provider=execution_provider,
+                    model=execution_model,
                 )
 
             self.db.add(step)
@@ -903,8 +1622,8 @@ class PipelineService:
                     project_id=project.id,
                     step_id=step.id,
                     step_name=step.step_name,
-                    provider=provider,
-                    model_name=model,
+                    provider=execution_provider,
+                    model_name=execution_model,
                     request_summary={
                         "prompt": task_prompt,
                         "params": params,
@@ -1021,6 +1740,32 @@ class PipelineService:
             )
             if audio:
                 artifact.update(audio)
+                storage_key = audio.get("storage_key")
+                if isinstance(storage_key, str) and storage_key:
+                    target_duration = 0.0
+                    try:
+                        target_duration = float(artifact.get("target_duration_sec") or 0.0)
+                    except (TypeError, ValueError):
+                        target_duration = 0.0
+                    audio_path = Path(storage_key)
+                    spoken_duration = self._probe_media_duration(audio_path)
+                    if spoken_duration:
+                        artifact["spoken_audio_duration_sec"] = round(spoken_duration, 3)
+                        if isinstance(artifact.get("subtitle_entries"), list):
+                            artifact["subtitle_entries"] = self._retime_subtitle_entries_to_total_duration(
+                                artifact["subtitle_entries"],
+                                spoken_duration,
+                            )
+                    fitted_duration = self._fit_audio_file_duration(
+                        audio_path,
+                        target_duration,
+                        mime_type=str(artifact.get("mime_type") or "audio/mpeg"),
+                    ) if target_duration > 0 else spoken_duration
+                    if fitted_duration:
+                        artifact["audio_duration_sec"] = round(fitted_duration, 3)
+            subtitle = self._materialize_subtitle_artifact(project.id, step, artifact)
+            if subtitle:
+                artifact.update(subtitle)
         elif step.step_name == "segment_video":
             artifact = self._materialize_segment_preview(project, chapter, step, artifact)
             if chapter is not None:
@@ -1208,6 +1953,26 @@ class PipelineService:
             "storage_key": str(file_path),
         }
 
+    def _materialize_subtitle_artifact(
+        self,
+        project_id: str,
+        step: PipelineStep,
+        artifact: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        entries = artifact.get("subtitle_entries")
+        if not isinstance(entries, list) or not entries:
+            return None
+        file_path = self._generated_project_dir(project_id, step.step_name) / f"subtitles-attempt-{step.attempt}.srt"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(self._subtitle_entries_to_srt(entries), encoding="utf-8")
+        local_url = self._to_local_file_url(file_path)
+        return {
+            "subtitle_url": local_url,
+            "subtitle_export_url": local_url,
+            "subtitle_storage_key": str(file_path),
+            "subtitle_count": len(entries),
+        }
+
     def _materialize_storyboard_frame_asset(
         self,
         project_id: str,
@@ -1294,21 +2059,97 @@ class PipelineService:
         shots = artifact.get("shots")
         if not isinstance(shots, list):
             return []
+        project = self._get_project(chapter.project_id)
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         normalized: list[dict[str, Any]] = []
         for index, shot in enumerate(shots):
             if not isinstance(shot, dict):
                 continue
             normalized.append(
-                {
-                    "shot_index": int(shot.get("shot_index") or index + 1),
-                    "duration_sec": float(shot.get("duration_sec") or 0),
-                    "frame_type": str(shot.get("frame_type") or "镜头"),
-                    "visual": str(shot.get("visual") or ""),
-                    "action": str(shot.get("action") or ""),
-                    "dialogue": str(shot.get("dialogue") or ""),
-                }
+                self._enrich_shot_payload(
+                    chapter,
+                    {
+                        "shot_index": int(shot.get("shot_index") or index + 1),
+                        "duration_sec": float(shot.get("duration_sec") or 0),
+                        "frame_type": str(shot.get("frame_type") or "镜头"),
+                        "visual": str(shot.get("visual") or ""),
+                        "action": str(shot.get("action") or ""),
+                        "dialogue": str(shot.get("dialogue") or ""),
+                        "characters": list(shot.get("characters") or []) if isinstance(shot.get("characters"), list) else [],
+                        "scene": str(shot.get("scene") or ""),
+                        "scene_hint": str(shot.get("scene_hint") or ""),
+                        "continuity_anchor": str(shot.get("continuity_anchor") or ""),
+                    },
+                    story_bible=story_bible,
+                )
             )
         return normalized
+
+    def _enrich_shot_payload(
+        self,
+        chapter: ChapterChunk,
+        payload: dict[str, Any],
+        *,
+        story_bible: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        enriched = deepcopy(payload)
+        if not isinstance(story_bible, dict):
+            project = self._get_project(chapter.project_id)
+            story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        matching_text = self._story_bible_matching_text(enriched)
+        if not (enriched.get("characters") or []):
+            enriched["characters"] = self._extract_shot_entities(
+                story_bible.get("characters") if isinstance(story_bible, dict) else [],
+                matching_text,
+                chapter=chapter,
+                limit=3,
+            )
+        scene_value = str(enriched.get("scene") or "").strip()
+        scene_hint = str(enriched.get("scene_hint") or "").strip()
+        if not scene_value and not scene_hint:
+            scene_candidates = self._extract_shot_entities(
+                story_bible.get("scenes") if isinstance(story_bible, dict) else [],
+                matching_text,
+                chapter=chapter,
+                limit=2,
+            )
+            if scene_candidates:
+                enriched["scene"] = scene_candidates[0]
+                enriched["scene_hint"] = " / ".join(scene_candidates)
+        if not str(enriched.get("continuity_anchor") or "").strip():
+            enriched["continuity_anchor"] = "保持同一人物外貌、服装和同一场景光线连续一致。"
+        return enriched
+
+    def _enrich_storyboard_gallery(self, chapter: ChapterChunk, gallery: dict[str, Any]) -> dict[str, Any]:
+        frames = gallery.get("frames")
+        if not isinstance(frames, list):
+            return gallery
+        shot_map = {int(shot.get("shot_index") or 0): shot for shot in self._chapter_shots(chapter) if isinstance(shot, dict)}
+        if not shot_map:
+            return gallery
+        project = self._get_project(chapter.project_id)
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        enriched_frames: list[dict[str, Any]] = []
+        for index, frame in enumerate(frames):
+            if not isinstance(frame, dict):
+                continue
+            shot_index = int(frame.get("shot_index") or index + 1)
+            source_shot = shot_map.get(shot_index, {})
+            merged = deepcopy(frame)
+            for key in ("frame_type", "duration_sec", "visual", "action", "dialogue", "continuity_anchor"):
+                if not merged.get(key) and source_shot.get(key):
+                    merged[key] = deepcopy(source_shot[key])
+            if not (merged.get("characters") or []):
+                merged["characters"] = list(source_shot.get("characters") or [])
+            if not str(merged.get("scene") or "").strip():
+                merged["scene"] = str(source_shot.get("scene") or "")
+            if not str(merged.get("scene_hint") or "").strip():
+                merged["scene_hint"] = str(source_shot.get("scene_hint") or "")
+            enriched_frames.append(self._enrich_shot_payload(chapter, merged, story_bible=story_bible))
+        result = deepcopy(gallery)
+        result["frames"] = enriched_frames
+        result["frame_count"] = len(enriched_frames)
+        return result
 
     def _normalize_storyboard_frames(
         self,
@@ -1319,6 +2160,7 @@ class PipelineService:
     ) -> list[dict[str, Any]]:
         frames_value = artifact.get("frames")
         normalized: list[dict[str, Any]] = []
+        shot_map = {int(shot.get("shot_index") or 0): shot for shot in self._chapter_shots(chapter) if isinstance(shot, dict)} if chapter else {}
         if isinstance(frames_value, list) and frames_value:
             for index, frame in enumerate(frames_value):
                 if not isinstance(frame, dict):
@@ -1334,26 +2176,33 @@ class PipelineService:
                 if not file_path.exists() or not file_path.is_file():
                     continue
                 local_url = self._to_local_file_url(file_path)
-                normalized.append(
-                    {
-                        "shot_index": int(frame.get("shot_index") or index + 1),
-                        "title": str(frame.get("title") or f"镜头 {index + 1:02d}"),
-                        "frame_type": str(frame.get("frame_type") or "镜头"),
-                        "duration_sec": float(frame.get("duration_sec") or 0),
-                        "visual": str(frame.get("visual") or frame.get("summary") or ""),
-                        "action": str(frame.get("action") or ""),
-                        "dialogue": str(frame.get("dialogue") or ""),
-                        "summary": str(frame.get("summary") or frame.get("visual") or "")[:160],
-                        "thumbnail_url": local_url,
-                        "image_url": local_url,
-                        "export_url": local_url,
-                        "storage_key": str(file_path),
-                        "prompt": frame.get("prompt"),
-                        "provider": frame.get("provider"),
-                        "model": frame.get("model"),
-                        "artifact_id": frame.get("artifact_id"),
-                    }
-                )
+                shot_index = int(frame.get("shot_index") or index + 1)
+                source_shot = shot_map.get(shot_index, {})
+                normalized_frame = {
+                    "shot_index": shot_index,
+                    "title": str(frame.get("title") or f"镜头 {index + 1:02d}"),
+                    "frame_type": str(frame.get("frame_type") or source_shot.get("frame_type") or "镜头"),
+                    "duration_sec": float(frame.get("duration_sec") or source_shot.get("duration_sec") or 0),
+                    "visual": str(frame.get("visual") or frame.get("summary") or source_shot.get("visual") or ""),
+                    "action": str(frame.get("action") or source_shot.get("action") or ""),
+                    "dialogue": str(frame.get("dialogue") or source_shot.get("dialogue") or ""),
+                    "characters": list(frame.get("characters") or source_shot.get("characters") or []) if isinstance(frame.get("characters") or source_shot.get("characters") or [], list) else [],
+                    "scene": str(frame.get("scene") or source_shot.get("scene") or ""),
+                    "scene_hint": str(frame.get("scene_hint") or source_shot.get("scene_hint") or ""),
+                    "continuity_anchor": str(frame.get("continuity_anchor") or source_shot.get("continuity_anchor") or ""),
+                    "summary": str(frame.get("summary") or frame.get("visual") or source_shot.get("visual") or "")[:160],
+                    "thumbnail_url": local_url,
+                    "image_url": local_url,
+                    "export_url": local_url,
+                    "storage_key": str(file_path),
+                    "prompt": frame.get("prompt"),
+                    "provider": frame.get("provider"),
+                    "model": frame.get("model"),
+                    "artifact_id": frame.get("artifact_id"),
+                }
+                if chapter is not None:
+                    normalized_frame = self._enrich_shot_payload(chapter, normalized_frame)
+                normalized.append(normalized_frame)
         return normalized
 
     def _gallery_payload_from_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
@@ -1373,13 +2222,28 @@ class PipelineService:
         stages = self._chapter_stages(chapter)
         stage = stages.get("storyboard_image")
         if not isinstance(stage, dict):
-            return {}
+            stage = {}
         output = deepcopy(stage.get("output") or {})
         gallery = output.get("storyboard_gallery")
         if isinstance(gallery, dict):
-            return gallery
+            return self._enrich_storyboard_gallery(chapter, gallery)
         artifact = deepcopy(output.get("artifact") or {})
-        return self._gallery_payload_from_artifact(artifact)
+        derived = self._gallery_payload_from_artifact(artifact)
+        if derived.get("frame_count"):
+            return self._enrich_storyboard_gallery(chapter, derived)
+
+        storyboard_step = self._get_storyboard_step(chapter.project_id)
+        active_version = self._get_active_storyboard_version(storyboard_step.id, chapter_id=chapter.id)
+        if active_version and isinstance(active_version.output_snapshot, dict):
+            version_output = deepcopy(active_version.output_snapshot)
+            version_gallery = version_output.get("storyboard_gallery")
+            if isinstance(version_gallery, dict) and version_gallery.get("frame_count"):
+                return self._enrich_storyboard_gallery(chapter, version_gallery)
+            version_artifact = deepcopy(version_output.get("artifact") or {})
+            version_payload = self._gallery_payload_from_artifact(version_artifact)
+            if version_payload.get("frame_count"):
+                return self._enrich_storyboard_gallery(chapter, version_payload)
+        return {}
 
     def _write_storyboard_frame_png(
         self,
@@ -1573,14 +2437,116 @@ class PipelineService:
         chapter_count = max(len(self._list_project_chapters(project.id)), 1)
         return max(8.0, project.target_duration_sec / chapter_count)
 
+    def _probe_media_duration(self, path: Path) -> float | None:
+        if not path.exists():
+            return None
+        cmd = [self._ffmpeg_executable(), "-hide_banner", "-i", str(path)]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+        match = re.search(r"Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)", output)
+        if not match:
+            return None
+        hours = int(match.group(1))
+        minutes = int(match.group(2))
+        seconds = float(match.group(3))
+        duration = hours * 3600 + minutes * 60 + seconds
+        return duration if duration > 0 else None
+
+    def _artifact_audio_bytes(self, artifact: dict[str, Any]) -> tuple[bytes | None, str]:
+        encoded = artifact.get("audio_base64")
+        if not isinstance(encoded, str) or not encoded:
+            return None, ".mp3"
+        try:
+            content = base64.b64decode(encoded)
+        except Exception:
+            return None, ".mp3"
+        mime_type = str(artifact.get("mime_type") or "audio/mpeg")
+        return content, self._suffix_for_mime_type(mime_type)
+
+    def _probe_audio_duration_from_artifact(self, artifact: dict[str, Any]) -> float | None:
+        content, suffix = self._artifact_audio_bytes(artifact)
+        if not content:
+            return None
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+            temp_path = Path(handle.name)
+            handle.write(content)
+        try:
+            return self._probe_media_duration(temp_path)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _fit_audio_file_duration(self, path: Path, target_duration_sec: float, *, mime_type: str = "audio/mpeg") -> float | None:
+        if not path.exists() or target_duration_sec <= 0:
+            return self._probe_media_duration(path)
+        current_duration = self._probe_media_duration(path)
+        if current_duration is None:
+            return None
+        if abs(current_duration - target_duration_sec) <= 1.0:
+            return current_duration
+        temp_output = path.with_name(f"{path.stem}.fitted{path.suffix}")
+        codec_args: list[str] = []
+        suffix = self._suffix_for_mime_type(mime_type)
+        if suffix == ".mp3":
+            codec_args = ["-c:a", "libmp3lame"]
+        elif suffix == ".wav":
+            codec_args = ["-c:a", "pcm_s16le"]
+        else:
+            codec_args = ["-c:a", "aac"]
+        cmd = [
+            self._ffmpeg_executable(),
+            "-y",
+            "-i",
+            str(path),
+            "-af",
+            "apad",
+            "-t",
+            f"{target_duration_sec:.3f}",
+            *codec_args,
+            str(temp_output),
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise ValueError(f"ffmpeg audio fit failed: {completed.stderr.strip()}")
+        temp_output.replace(path)
+        return self._probe_media_duration(path)
+
+    def _retime_subtitle_entries_to_total_duration(self, entries: list[dict[str, Any]], total_duration_sec: float) -> list[dict[str, Any]]:
+        if total_duration_sec <= 0 or not entries:
+            return entries
+        normalized: list[dict[str, Any]] = []
+        weights: list[int] = []
+        for entry in entries:
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                continue
+            normalized.append(deepcopy(entry))
+            weights.append(max(len(text), 1))
+        if not normalized:
+            return entries
+        total_weight = max(sum(weights), 1)
+        cursor = 0.0
+        for index, entry in enumerate(normalized):
+            remaining = max(total_duration_sec - cursor, 0.2)
+            if index == len(normalized) - 1:
+                end_sec = total_duration_sec
+            else:
+                ratio = weights[index] / total_weight
+                end_sec = min(total_duration_sec, cursor + max(0.8, total_duration_sec * ratio))
+                end_sec = max(end_sec, cursor + 0.45)
+            entry["start_sec"] = round(cursor, 3)
+            entry["end_sec"] = round(min(end_sec, cursor + remaining), 3)
+            cursor = float(entry["end_sec"])
+        normalized[-1]["end_sec"] = round(total_duration_sec, 3)
+        return normalized
+
     def _is_playable_video(self, path: Path) -> bool:
         if not path.exists() or path.suffix.lower() != ".mp4":
             return False
-        try:
-            head = path.read_bytes()[:64]
-        except OSError:
-            return False
-        return b"ftyp" in head
+        duration = self._probe_media_duration(path)
+        return bool(duration and duration > 0)
 
     def _write_text_placeholder(
         self,
@@ -1610,20 +2576,452 @@ class PipelineService:
         relative = file_path.resolve().relative_to(GENERATED_DIR.resolve()).as_posix()
         return f"/api/v1/local-files/{relative}"
 
+    def _get_step_by_name(self, project_id: str, step_name: str) -> PipelineStep | None:
+        return self.db.scalar(
+            select(PipelineStep).where(PipelineStep.project_id == project_id, PipelineStep.step_name == step_name).limit(1)
+        )
+
     def _render_final_video(self, project: Project, export_id: str) -> Path:
         export_dir = project_category_dir(project.id, project.name, "exports")
         output_path = export_dir / f"final-{export_id}.mp4"
+
+        segment_paths = self._collect_chapter_video_paths(project.id)
+        if segment_paths:
+            stitched_video = export_dir / f"final-{export_id}.segments.mp4"
+            self._concat_video_segments(segment_paths, stitched_video)
+            stitch_step = self._get_step_by_name(project.id, "stitch_subtitle_tts")
+            artifact = deepcopy(stitch_step.output_ref.get("artifact") if stitch_step and isinstance(stitch_step.output_ref, dict) else {})
+            segment_manifest = artifact.get("segment_manifest")
+            duration_limit_sec = 0.0
+            if isinstance(segment_manifest, list):
+                for item in segment_manifest:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        duration_limit_sec += float(item.get("duration_sec") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+            if duration_limit_sec <= 0:
+                duration_limit_sec = float(project.target_duration_sec or 0.0)
+            narration_path = None
+            candidate_audio = artifact.get("storage_key")
+            if isinstance(candidate_audio, str) and candidate_audio and Path(candidate_audio).exists():
+                narration_path = Path(candidate_audio)
+            subtitle_path = None
+            candidate_subtitle = artifact.get("subtitle_storage_key")
+            if isinstance(candidate_subtitle, str) and candidate_subtitle and Path(candidate_subtitle).exists():
+                subtitle_path = Path(candidate_subtitle)
+            if narration_path or subtitle_path:
+                # Keep subtitles as sidecar SRT for long-form exports; embedding subtitle streams
+                # caused unstable final mux times on multi-chapter renders.
+                self._mux_final_cut_assets(
+                    stitched_video,
+                    output_path,
+                    narration_path=narration_path,
+                    subtitle_path=None,
+                    duration_limit_sec=duration_limit_sec,
+                )
+                try:
+                    stitched_video.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return output_path
+            stitched_video.replace(output_path)
+            return output_path
+
         storyboard_paths = self._collect_storyboard_paths(project.id)
         if storyboard_paths:
             self._render_storyboard_slideshow(project, storyboard_paths, output_path)
             return output_path
 
-        segment_paths = self._collect_chapter_video_paths(project.id)
-        if segment_paths:
-            self._concat_video_segments(segment_paths, output_path)
-            return output_path
-
         raise ValueError("no chapter video segments or storyboard images available for final export")
+
+    def _mux_final_cut_assets(
+        self,
+        stitched_video: Path,
+        output_path: Path,
+        *,
+        narration_path: Path | None = None,
+        subtitle_path: Path | None = None,
+        duration_limit_sec: float | None = None,
+    ) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        av_output_path = output_path if subtitle_path is None else output_path.with_name(f"{output_path.stem}.av.mp4")
+        av_temp_path = av_output_path.with_name(f"{av_output_path.stem}.tmp{av_output_path.suffix}")
+        av_cmd = [self._ffmpeg_executable(), "-y", "-i", str(stitched_video)]
+        narration_index: int | None = None
+        if narration_path is not None:
+            av_cmd.extend(["-i", str(narration_path)])
+            narration_index = 1
+
+        av_cmd.extend(["-map", "0:v:0"])
+        if narration_index is not None:
+            av_cmd.extend(["-map", f"{narration_index}:a:0", "-c:a", "aac", "-af", "apad", "-shortest"])
+        else:
+            av_cmd.extend(["-map", "0:a?", "-c:a", "copy"])
+        if duration_limit_sec and duration_limit_sec > 0:
+            av_cmd.extend(["-t", f"{duration_limit_sec:.3f}"])
+        av_cmd.extend(["-c:v", "copy", "-movflags", "+faststart", str(av_temp_path)])
+        completed = subprocess.run(av_cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise ValueError(f"ffmpeg final audio mux failed: {completed.stderr.strip()}")
+        av_temp_path.replace(av_output_path)
+
+        if subtitle_path is None:
+            return
+
+        subtitle_temp_path = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
+        subtitle_cmd = [
+            self._ffmpeg_executable(),
+            "-y",
+            "-i",
+            str(av_output_path),
+            "-i",
+            str(subtitle_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map",
+            "1:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            "-c:s",
+            "mov_text",
+            str(subtitle_temp_path),
+        ]
+        completed = subprocess.run(subtitle_cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise ValueError(f"ffmpeg subtitle mux failed: {completed.stderr.strip()}")
+        subtitle_temp_path.replace(output_path)
+        try:
+            av_output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _build_final_cut_segment_manifest(self, project: Project) -> list[dict[str, Any]]:
+        manifest: list[dict[str, Any]] = []
+        for chapter in self._list_project_chapters(project.id):
+            stages = self._chapter_stages(chapter)
+            segment = stages.get("segment_video")
+            if not isinstance(segment, dict):
+                continue
+            output = deepcopy(segment.get("output") or {})
+            artifact = deepcopy(output.get("artifact") or {})
+            storage_key = artifact.get("storage_key")
+            if not isinstance(storage_key, str) or not storage_key or not Path(storage_key).exists():
+                continue
+            title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+            summary = str((chapter.meta or {}).get("summary") or chapter.content[:180]).strip()
+            actual_duration = self._probe_media_duration(Path(storage_key))
+            script_stage = stages.get("story_scripting")
+            if isinstance(script_stage, dict):
+                script_artifact = deepcopy((script_stage.get("output") or {}).get("artifact") or {})
+                beats = script_artifact.get("beats")
+                if isinstance(beats, list):
+                    beat_summaries = [
+                        str(as_record.get("summary") or "").strip()
+                        for as_record in [item if isinstance(item, dict) else {} for item in beats[:2]]
+                        if str(as_record.get("summary") or "").strip()
+                    ]
+                    if beat_summaries:
+                        summary = " ".join(beat_summaries)
+            manifest.append(
+                {
+                    "chapter_id": chapter.id,
+                    "chapter_index": chapter.chapter_index,
+                    "chunk_index": chapter.chunk_index,
+                    "title": title,
+                    "summary": summary,
+                    "duration_sec": round(actual_duration or self._chapter_segment_duration(project, chapter), 3),
+                    "storage_key": storage_key,
+                    "preview_url": artifact.get("preview_url"),
+                    "chapter_excerpt": self._compact_final_cut_text(self._chapter_body_text(chapter), limit=220),
+                }
+            )
+        return manifest
+
+    def _build_final_cut_narration_plan(
+        self,
+        project: Project,
+        *,
+        manifest: list[dict[str, Any]] | None = None,
+        voice: str | None = None,
+        segment_lines: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        items = manifest if manifest is not None else self._build_final_cut_segment_manifest(project)
+        if not items:
+            return {"chapter_count": 0, "segment_count": 0, "voice": voice or "alloy", "narration_text": "", "subtitle_entries": []}
+
+        line_map = {
+            str(item.get("chapter_id") or ""): str(item.get("narration") or "").strip()
+            for item in (segment_lines or [])
+            if isinstance(item, dict) and str(item.get("chapter_id") or "").strip()
+        }
+        blocks: list[str] = []
+        entries: list[dict[str, Any]] = []
+        cursor = 0.0
+        for item in items:
+            title = str(item.get("title") or "章节")
+            chapter_id = str(item.get("chapter_id") or "").strip()
+            chosen = line_map.get(chapter_id, "")
+            summary = self._compact_final_cut_text(str(item.get("summary") or ""), limit=84)
+            block_source = chosen or (f"{title}。{summary}" if summary else title)
+            block = self._compact_final_cut_text(block_source, limit=120 if chosen else 96)
+            if not block:
+                continue
+            blocks.append(block)
+            duration = max(float(item.get("duration_sec") or 0), 2.0)
+            parts = self._split_final_cut_sentences(block)
+            total_chars = max(sum(len(part) for part in parts), 1)
+            local_cursor = cursor
+            for index, part in enumerate(parts):
+                remaining = max(cursor + duration - local_cursor, 0.6)
+                if index == len(parts) - 1:
+                    end_sec = cursor + duration
+                else:
+                    ratio = max(len(part), 1) / total_chars
+                    end_sec = min(cursor + duration, local_cursor + max(1.2, duration * ratio))
+                    end_sec = max(end_sec, local_cursor + 0.8)
+                entries.append(
+                    {
+                        "index": len(entries) + 1,
+                        "chapter_title": title,
+                        "start_sec": round(local_cursor, 3),
+                        "end_sec": round(min(end_sec, local_cursor + remaining), 3),
+                        "text": part,
+                    }
+                )
+                local_cursor = end_sec
+            cursor += duration
+
+        return {
+            "chapter_count": len({str(item.get('chapter_id') or '') for item in items}),
+            "segment_count": len(items),
+            "voice": voice or "alloy",
+            "narration_text": "\n".join(blocks),
+            "subtitle_entries": entries,
+        }
+
+    def _final_cut_writer_binding(self, project: Project) -> tuple[str, str]:
+        try:
+            provider, model = self.registry.suggest_model("script")
+            adapter = self.registry.resolve(provider)
+            if adapter.supports("script", model):
+                return provider, model
+        except Exception:
+            pass
+        story_step = self._get_step_by_name(project.id, "story_scripting")
+        provider = str(story_step.model_provider or "").strip() if story_step else ""
+        model = str(story_step.model_name or "").strip() if story_step else ""
+        if provider and model:
+            try:
+                adapter = self.registry.resolve(provider)
+                if adapter.supports("script", model):
+                    return provider, model
+            except Exception:
+                pass
+        return self.registry.suggest_model("script")
+
+    def _heuristic_narration_lines_for_manifest(self, manifest: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        lines: list[dict[str, Any]] = []
+        for item in manifest:
+            chapter_id = str(item.get("chapter_id") or "").strip()
+            if not chapter_id:
+                continue
+            source = (
+                str(item.get("summary") or "").strip()
+                or str(item.get("chapter_excerpt") or "").strip()
+                or str(item.get("title") or "").strip()
+            )
+            narration = self._compact_final_cut_text(source, limit=96)
+            if narration:
+                lines.append({"chapter_id": chapter_id, "narration": narration})
+        return lines
+
+    def _chunk_final_cut_manifest(self, manifest: list[dict[str, Any]], *, batch_size: int = 10) -> list[list[dict[str, Any]]]:
+        size = max(1, batch_size)
+        return [manifest[index : index + size] for index in range(0, len(manifest), size)]
+
+    async def _generate_final_cut_narration_with_model(
+        self,
+        project: Project,
+        *,
+        manifest: list[dict[str, Any]],
+        task_prompt: str,
+        style_directive: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], float, str, str, str]:
+        provider, model = self._final_cut_writer_binding(project)
+        adapter = self.registry.resolve(provider)
+        aggregated_usage: dict[str, Any] = {}
+        total_estimated_cost = 0.0
+        normalized: list[dict[str, Any]] = []
+        had_model_success = False
+        had_fallback = False
+        recent_lines: list[str] = []
+
+        for batch in self._chunk_final_cut_manifest(manifest, batch_size=10):
+            compact_manifest = [
+                {
+                    "chapter_id": item.get("chapter_id"),
+                    "title": item.get("title"),
+                    "duration_sec": item.get("duration_sec"),
+                    "summary": item.get("summary"),
+                    "chapter_excerpt": item.get("chapter_excerpt"),
+                }
+                for item in batch
+            ]
+            req = ProviderRequest(
+                step="script",
+                model=model,
+                input={
+                    "project_name": project.name,
+                    "target_duration_sec": project.target_duration_sec,
+                    "segment_manifest": compact_manifest,
+                    "continuity_context": recent_lines[-2:],
+                    "requirements": {
+                        "language": "zh-CN",
+                        "tone": "cinematic narration",
+                        "one_or_two_sentences_per_segment": True,
+                        "return_exactly_one_item_per_segment": True,
+                        "avoid_meta_phrases": [
+                            "章节剧本已生成",
+                            "情节点",
+                            "第X章",
+                            "在这一章里",
+                            "接下来我们看到",
+                        ],
+                    },
+                },
+                prompt=(
+                    "你是电影旁白编剧。请根据当前这批章节片段清单，为每个片段写一段中文电影化旁白。"
+                    "要求：只写剧情、情绪、冲突和转折；不要复述元信息；不要写'章节'、'情节点'、'本段'这类字眼；"
+                    "每段最多两句，长度适合配音；必须保留原 chapter_id，并按输入顺序逐条返回。"
+                    "只返回 JSON，对象格式为 {\"segments\":[{\"chapter_id\":\"...\",\"narration\":\"...\"}]}，不要解释。"
+                    f"\n用户要求：{task_prompt}\n风格约束：{style_directive}"
+                ),
+                params={
+                    "temperature": 0.35,
+                    "max_tokens": max(1200, min(3200, 320 * len(compact_manifest))),
+                },
+            )
+            batch_lines: list[dict[str, Any]] = []
+            try:
+                response = await adapter.invoke(req)
+                aggregated_usage = self._merge_usage_metrics(aggregated_usage, response.usage)
+                total_estimated_cost += await adapter.estimate_cost(req, response.usage)
+                artifact_text = str(response.output.get("text") or "").strip()
+                parsed = self._parse_json_object_from_text(artifact_text)
+                segments = parsed.get("segments") if isinstance(parsed, dict) else None
+                if not isinstance(segments, list) or not segments:
+                    raise ValueError("narration writer did not return valid segments JSON")
+                requested_ids = [str(item.get("chapter_id") or "").strip() for item in batch]
+                allowed_ids = {chapter_id for chapter_id in requested_ids if chapter_id}
+                for item in segments:
+                    if not isinstance(item, dict):
+                        continue
+                    chapter_id = str(item.get("chapter_id") or "").strip()
+                    narration = self._compact_final_cut_text(str(item.get("narration") or "").strip(), limit=120)
+                    if not chapter_id or chapter_id not in allowed_ids or not narration:
+                        continue
+                    batch_lines.append({"chapter_id": chapter_id, "narration": narration})
+                line_map = {str(item.get("chapter_id") or ""): item for item in batch_lines}
+                batch_lines = [line_map[chapter_id] for chapter_id in requested_ids if chapter_id in line_map]
+                if len(batch_lines) != len(requested_ids):
+                    raise ValueError("narration writer returned incomplete batch")
+                had_model_success = True
+            except Exception:
+                batch_lines = self._heuristic_narration_lines_for_manifest(batch)
+                had_fallback = True
+
+            normalized.extend(batch_lines)
+            recent_lines.extend(str(item.get("narration") or "").strip() for item in batch_lines if str(item.get("narration") or "").strip())
+
+        if not normalized:
+            raise ValueError("narration writer returned empty usable narration")
+        generation_mode = "model" if had_model_success and not had_fallback else "mixed" if had_model_success else "heuristic"
+        return normalized, aggregated_usage, total_estimated_cost, provider, model, generation_mode
+
+    def _parse_json_object_from_text(self, text: str) -> dict[str, Any]:
+        candidate = (text or "").strip()
+        if not candidate:
+            return {}
+        fenced_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", candidate, flags=re.DOTALL)
+        if fenced_match:
+            candidate = fenced_match.group(1).strip()
+        else:
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start >= 0 and end > start:
+                candidate = candidate[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _compact_final_cut_text(self, value: str, *, limit: int) -> str:
+        cleaned = re.sub(r"\s+", " ", value or "").strip()
+        cleaned = cleaned.replace("——", "，").replace("--", "，")
+        cleaned = re.sub(r"[“”\"'`]+", "", cleaned)
+        cleaned = re.sub(r"[()（）\\[\\]{}]+", "", cleaned)
+        if len(cleaned) <= limit:
+            return cleaned
+        for token in ("。", "！", "？", "；", "，"):
+            position = cleaned.rfind(token, 0, limit)
+            if position >= max(12, limit // 2):
+                return cleaned[: position + 1]
+        return f"{cleaned[:limit].rstrip('，。； ')}。"
+
+    def _split_final_cut_sentences(self, text: str) -> list[str]:
+        pieces = [part.strip() for part in re.split(r"(?<=[。！？；])\s*", text) if part.strip()]
+        return pieces or [text.strip()]
+
+    def _subtitle_entries_to_srt(self, entries: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for index, entry in enumerate(entries, start=1):
+            start_sec = float(entry.get("start_sec") or 0)
+            end_sec = float(entry.get("end_sec") or max(start_sec + 1.2, 1.2))
+            if end_sec <= start_sec:
+                end_sec = start_sec + 1.2
+            text = str(entry.get("text") or "").strip() or "..."
+            lines.extend(
+                [
+                    str(index),
+                    f"{self._format_srt_timestamp(start_sec)} --> {self._format_srt_timestamp(end_sec)}",
+                    text,
+                    "",
+                ]
+            )
+        return "\n".join(lines).strip() + "\n"
+
+    def _format_srt_timestamp(self, seconds: float) -> str:
+        total_ms = max(int(round(seconds * 1000)), 0)
+        hours, remainder = divmod(total_ms, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        secs, millis = divmod(remainder, 1000)
+        return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
+    def _build_final_cut_summary(self, project: Project, output: dict[str, Any]) -> dict[str, Any]:
+        artifact = deepcopy(output.get("artifact") or {})
+        manifest = artifact.get("segment_manifest")
+        subtitle_entries = artifact.get("subtitle_entries")
+        return {
+            "chapter_count": len({str(item.get('chapter_id') or '') for item in manifest}) if isinstance(manifest, list) else 0,
+            "segment_count": len(manifest) if isinstance(manifest, list) else 0,
+            "has_narration_audio": bool(artifact.get("audio_url") or artifact.get("storage_key")),
+            "has_subtitles": bool(isinstance(subtitle_entries, list) and subtitle_entries),
+            "narration_text": artifact.get("narration_text"),
+            "audio_url": artifact.get("audio_url"),
+            "subtitle_url": artifact.get("subtitle_url"),
+            "subtitle_count": len(subtitle_entries) if isinstance(subtitle_entries, list) else 0,
+            "narration_generation_mode": artifact.get("narration_generation_mode"),
+            "narration_writer_provider": artifact.get("narration_writer_provider"),
+            "narration_writer_model": artifact.get("narration_writer_model"),
+            "target_duration_sec": project.target_duration_sec,
+        }
 
     def _collect_chapter_video_paths(self, project_id: str) -> list[Path]:
         result: list[Path] = []
@@ -1823,6 +3221,8 @@ class PipelineService:
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         started_at = step.started_at or now
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
         elapsed_sec = max(0.0, (now - started_at).total_seconds())
         token_usage = self._normalize_token_usage(usage)
         return {
@@ -1835,9 +3235,23 @@ class PipelineService:
             "elapsed_sec": round(elapsed_sec, 3),
             "elapsed_ms": int(round(elapsed_sec * 1000)),
             "estimated_cost": round(float(estimated_cost or 0.0), 6),
+            "cost_source": self._cost_source(provider, usage, execution_mode),
             "token_usage": token_usage,
             "raw_usage": usage or {},
         }
+
+    def _cost_source(self, provider: str, usage: dict[str, Any], execution_mode: str) -> str:
+        if execution_mode == "local":
+            return "local"
+        if isinstance(usage, dict):
+            if isinstance(usage.get("cost"), (int, float)):
+                return "provider_reported"
+            cost_details = usage.get("cost_details")
+            if isinstance(cost_details, dict) and isinstance(cost_details.get("upstream_inference_cost"), (int, float)):
+                return "provider_reported"
+        if provider == "openrouter":
+            return "openrouter_catalog_estimated"
+        return "heuristic_estimated"
 
     def _normalize_token_usage(self, usage: dict[str, Any]) -> dict[str, int]:
         if not isinstance(usage, dict):
@@ -1859,6 +3273,23 @@ class PipelineService:
         if normalized["total_tokens"] <= 0:
             normalized["total_tokens"] = normalized["input_tokens"] + normalized["output_tokens"]
         return normalized
+
+    def _merge_usage_metrics(self, base: dict[str, Any] | None, incoming: dict[str, Any] | None) -> dict[str, Any]:
+        merged = deepcopy(base or {})
+        if not isinstance(incoming, dict):
+            return merged
+        for key, value in incoming.items():
+            if isinstance(value, bool):
+                merged[key] = bool(merged.get(key) or value)
+            elif isinstance(value, (int, float)):
+                previous = merged.get(key)
+                merged[key] = float(previous) + float(value) if isinstance(previous, (int, float)) else float(value)
+            elif isinstance(value, dict):
+                existing = merged.get(key)
+                merged[key] = self._merge_usage_metrics(existing if isinstance(existing, dict) else {}, value)
+            elif key not in merged:
+                merged[key] = deepcopy(value)
+        return merged
 
     def _build_step_input(self, project: Project, step: PipelineStep, chapter: ChapterChunk | None = None) -> dict[str, Any]:
         previous = self.db.scalar(
@@ -1887,22 +3318,25 @@ class PipelineService:
                 payload["previous_output"] = stage_chain.get(dependency, payload["previous_output"])
             payload["chapter_storyboard_consistency_goal"] = "确保当前章节内所有分镜图片的人物、服装、场景、光线和动作连续一致。"
             payload["chapter_video_consistency_goal"] = "确保当前章节内所有视频片段的角色状态、动作承接、镜头节奏和视觉风格一致。"
+        elif step.step_name == "stitch_subtitle_tts":
+            payload["segment_manifest"] = self._build_final_cut_segment_manifest(project)
+            payload["narration_plan"] = self._build_final_cut_narration_plan(project)
+            payload["final_cut_goal"] = "将所有已通过章节片段合成为一条完整成片，生成字幕、旁白脚本与 AI 配音。"
         return payload
 
     def list_chapters(self, project_id: str) -> list[dict[str, Any]]:
-        project = self._get_project(project_id)
-        chapters = list(
-            self.db.scalars(
-                select(ChapterChunk)
-                .where(ChapterChunk.project_id == project_id)
-                .order_by(ChapterChunk.chapter_index.asc(), ChapterChunk.chunk_index.asc())
-            ).all()
-        )
+        chapters = self._list_project_chapters(project_id)
         steps = {step.step_name: step for step in self._list_steps(project_id)}
         fallback_stage_status = self._derive_chapter_stage_status(steps)
         items: list[dict[str, Any]] = []
         for chapter in chapters:
-            meta = self._hydrate_chapter_media_meta_for_read(project, chapter, steps, dict(chapter.meta or {}))
+            # Keep chapter list reads cheap. The persisted chapter meta already contains the
+            # latest stage outputs; regenerating contact sheets, gallery zips, or slideshow
+            # previews for every chapter on every refresh makes the page appear "empty"
+            # while the backend is busy recomputing artifacts that already exist.
+            meta = dict(chapter.meta or {})
+            if isinstance(meta.get("stages"), dict):
+                meta["stages"] = self._chapter_stages(chapter)
             consistency_summary = meta.get("consistency_summary") if isinstance(meta.get("consistency_summary"), dict) else {}
             stage_map = {
                 step_name: self._chapter_step_status(chapter, step_name)
@@ -1965,6 +3399,30 @@ class PipelineService:
                 output["storyboard_gallery"] = self._gallery_payload_from_artifact(source_artifact)
                 consistency_stage["output"] = output
                 stages["consistency_check"] = consistency_stage
+        elif not self._chapter_participates_in_step(chapter, "consistency_check"):
+            source_output = deepcopy((stages.get("storyboard_image") or {}).get("output") or {})
+            source_artifact = deepcopy(source_output.get("artifact") or {})
+            stages["consistency_check"] = {
+                "status": StepStatus.APPROVED.value,
+                "output": {
+                    "storyboard_gallery": self._gallery_payload_from_artifact(source_artifact),
+                    "consistency": {
+                        "score": 100,
+                        "threshold": settings.consistency_threshold,
+                        "scope": "project_storyboards",
+                        "chapter_id": chapter.id,
+                        "details": {
+                            "scoring_mode": "meta_chapter_skip",
+                            "summary": "前置内容/后记作为片头片尾画面，不参与主剧情分镜校核。",
+                            "excluded_from_consistency": True,
+                        },
+                    },
+                },
+                "attempt": 0,
+                "provider": "local",
+                "model": "meta-chapter-skip",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
 
         if isinstance(stages.get("segment_video"), dict):
             segment_stage = deepcopy(stages["segment_video"])
@@ -2162,6 +3620,13 @@ class PipelineService:
                 ]
 
         chapters: list[dict[str, Any]] = []
+        filtered_parts = [
+            (title, part)
+            for title, part in parts
+            if not self._is_auxiliary_literary_chapter(title, part)
+        ]
+        if filtered_parts:
+            parts = filtered_parts
         for chapter_index, (title, part) in enumerate(parts):
             chapters.extend(self._split_large_chapter(title, part, chapter_index))
         return chapters or [{"title": "章节 1", "summary": normalized[:100], "content": normalized, "chapter_index": 0, "chunk_index": 0}]
@@ -2226,6 +3691,50 @@ class PipelineService:
             )
         return segments
 
+    def _is_auxiliary_literary_chapter(self, title: str, content: str) -> bool:
+        normalized_title = re.sub(r"\s+", " ", str(title or "")).strip()
+        compact_title = re.sub(r"\s+", "", normalized_title)
+        lowered_title = normalized_title.lower()
+        is_part_heading = bool(
+            re.match(r"^第[0-9一二三四五六七八九十百千两〇零]+部", compact_title)
+            or re.match(r"^(part|book)\s+[0-9ivxlcdm]+", lowered_title)
+        )
+        is_auxiliary_title = is_part_heading or self._is_meta_chapter_title(normalized_title) or normalized_title in {
+            "题记",
+            "作者序",
+            "作者的话",
+        }
+        if not is_auxiliary_title:
+            return False
+
+        body = str(content or "").strip()
+        if not body:
+            return True
+        if normalized_title and body.startswith(normalized_title):
+            body = body[len(normalized_title) :].strip()
+        non_empty_lines = [line.strip() for line in body.splitlines() if line.strip()]
+        short_quote_block = len(body) <= 900 and len(non_empty_lines) <= 18
+        quote_like_lines = sum(
+            1
+            for line in non_empty_lines
+            if any(marker in line for marker in ("“", "”", "——", "《", "》", "——《", "—《"))
+        )
+        citation_like_lines = sum(
+            1
+            for line in non_empty_lines
+            if line.startswith("——")
+            or bool(re.search(r"《[^》]+》", line))
+            or bool(re.search(r"[A-Za-z]\s*[·.、]\s*[A-Za-z]", line))
+        )
+        return short_quote_block and (quote_like_lines >= max(2, len(non_empty_lines) // 3) or citation_like_lines >= 1)
+
+    def _chapter_is_auxiliary_filtered(self, chapter: ChapterChunk) -> bool:
+        meta = chapter.meta or {}
+        if bool(meta.get("auxiliary_filtered")):
+            return True
+        title = str(meta.get("canonical_title") or meta.get("title") or "")
+        return self._is_auxiliary_literary_chapter(title, chapter.content)
+
     def _serialize_chapter(self, chapter: ChapterChunk) -> dict[str, Any]:
         meta = dict(chapter.meta or {})
         return {
@@ -2240,12 +3749,44 @@ class PipelineService:
     def _chapter_meta(self, chapter: ChapterChunk) -> dict[str, Any]:
         return deepcopy(chapter.meta or {})
 
+    def _chapter_stage_output_id(self, output: Any) -> str | None:
+        if not isinstance(output, dict):
+            return None
+        chapter_payload = output.get("chapter")
+        if not isinstance(chapter_payload, dict):
+            return None
+        candidate = chapter_payload.get("id")
+        return str(candidate).strip() if isinstance(candidate, str) and candidate.strip() else None
+
+    def _repair_storyboard_stage_entry(self, chapter: ChapterChunk, stage: dict[str, Any]) -> dict[str, Any]:
+        output = deepcopy(stage.get("output") or {})
+        output_chapter_id = self._chapter_stage_output_id(output)
+        if output_chapter_id in {None, chapter.id}:
+            return stage
+        storyboard_step = self._get_storyboard_step(chapter.project_id)
+        active_version = self._get_active_storyboard_version(storyboard_step.id, chapter_id=chapter.id)
+        if not active_version or not isinstance(active_version.output_snapshot, dict):
+            return stage
+        repaired = deepcopy(stage)
+        repaired["output"] = deepcopy(active_version.output_snapshot)
+        repaired["attempt"] = int(active_version.source_attempt or repaired.get("attempt") or 0)
+        repaired["provider"] = active_version.model_provider or repaired.get("provider")
+        repaired["model"] = active_version.model_name or repaired.get("model")
+        repaired["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return repaired
+
     def _chapter_stages(self, chapter: ChapterChunk) -> dict[str, Any]:
         meta = self._chapter_meta(chapter)
         stages = meta.get("stages")
-        return deepcopy(stages) if isinstance(stages, dict) else {}
+        result = deepcopy(stages) if isinstance(stages, dict) else {}
+        storyboard_stage = result.get("storyboard_image")
+        if isinstance(storyboard_stage, dict):
+            result["storyboard_image"] = self._repair_storyboard_stage_entry(chapter, storyboard_stage)
+        return result
 
     def _chapter_step_status(self, chapter: ChapterChunk, step_name: str) -> str:
+        if not self._chapter_participates_in_step(chapter, step_name):
+            return StepStatus.APPROVED.value
         stages = self._chapter_stages(chapter)
         stage = stages.get(step_name)
         if isinstance(stage, dict):
@@ -2296,6 +3837,8 @@ class PipelineService:
         return merged
 
     def _chapter_dependency_satisfied(self, project_id: str, chapter: ChapterChunk, step_name: str) -> bool:
+        if not self._chapter_participates_in_step(chapter, step_name):
+            return True
         dependency = CHAPTER_DEPENDENCIES.get(step_name)
         if dependency == "chapter_chunking":
             step = self.db.scalar(
@@ -2304,16 +3847,29 @@ class PipelineService:
             return bool(step and step.status == StepStatus.APPROVED.value)
         if not dependency:
             return True
+        if dependency == "storyboard_image":
+            if self._chapter_step_status(chapter, dependency) == StepStatus.APPROVED.value:
+                return True
+            return bool(self._active_storyboard_frames_for_chapter(project_id, chapter))
         return self._chapter_step_status(chapter, dependency) == StepStatus.APPROVED.value
 
+    def _chapter_participates_in_step(self, chapter: ChapterChunk, step_name: str) -> bool:
+        if self._chapter_is_auxiliary_filtered(chapter):
+            return False
+        if step_name != "consistency_check":
+            return True
+        title = str((chapter.meta or {}).get("canonical_title") or (chapter.meta or {}).get("title") or "")
+        return not self._is_meta_chapter_title(title)
+
     def _list_project_chapters(self, project_id: str) -> list[ChapterChunk]:
-        return list(
+        chapters = list(
             self.db.scalars(
                 select(ChapterChunk)
                 .where(ChapterChunk.project_id == project_id)
                 .order_by(ChapterChunk.chapter_index.asc(), ChapterChunk.chunk_index.asc())
             ).all()
         )
+        return [chapter for chapter in chapters if not self._chapter_is_auxiliary_filtered(chapter)]
 
     def _get_chapter(self, project_id: str, chapter_id: str) -> ChapterChunk:
         chapter = self.db.scalar(
@@ -2428,13 +3984,31 @@ class PipelineService:
                     neighbor_index = current_index + offset
                     if 0 <= neighbor_index < len(chapters):
                         neighbor_frames.extend(self._storyboard_frames_for_chapter(chapters[neighbor_index]))
+        chapter_text = self._chapter_story_bible_matching_text(chapter, frames, neighbor_frames)
+        reference_characters = self._select_relevant_story_bible_entities(
+            story_bible.get("characters"),
+            chapter_text,
+            chapter=chapter,
+            limit=CONSISTENCY_REFERENCE_CHARACTER_LIMIT,
+            allow_fallback=True,
+        )
+        reference_scenes = self._select_relevant_story_bible_entities(
+            story_bible.get("scenes"),
+            chapter_text,
+            chapter=chapter,
+            limit=CONSISTENCY_REFERENCE_SCENE_LIMIT,
+            allow_fallback=False,
+        )
         return {
             "project_id": project.id,
             "chapter_id": chapter.id if chapter else None,
             "chapter_title": str((chapter.meta or {}).get("title") or "") if chapter else "",
+            "chapter_summary": str((chapter.meta or {}).get("summary") or "") if chapter else "",
             "frames": frames,
             "neighbor_frames": neighbor_frames,
             "story_bible": story_bible if isinstance(story_bible, dict) else {},
+            "reference_characters": reference_characters,
+            "reference_scenes": reference_scenes,
         }
 
     def _storyboard_frames_for_chapter(self, chapter: ChapterChunk | None) -> list[dict[str, Any]]:
@@ -2445,6 +4019,33 @@ class PipelineService:
         if not isinstance(frames, list):
             return []
         return [deepcopy(item) for item in frames if isinstance(item, dict)]
+
+    def _active_storyboard_frames_for_chapter(self, project_id: str, chapter: ChapterChunk) -> dict[int, dict[str, Any]]:
+        storyboard_step = self._get_storyboard_step(project_id)
+        candidates: list[dict[str, Any]] = []
+        active_version = self._get_active_storyboard_version(storyboard_step.id, chapter_id=chapter.id)
+        if active_version and isinstance(active_version.output_snapshot, dict):
+            candidates.append(deepcopy(active_version.output_snapshot))
+        stage_output = deepcopy(self._chapter_stage_chain(chapter).get("storyboard_image") or {})
+        if stage_output:
+            candidates.append(stage_output)
+        for candidate in candidates:
+            artifact = deepcopy(candidate.get("artifact") or {})
+            frames = artifact.get("frames")
+            if isinstance(frames, list):
+                return {
+                    int(frame.get("shot_index") or index + 1): deepcopy(frame)
+                    for index, frame in enumerate(frames)
+                    if isinstance(frame, dict)
+                }
+            gallery = candidate.get("storyboard_gallery")
+            if isinstance(gallery, dict) and isinstance(gallery.get("frames"), list):
+                return {
+                    int(frame.get("shot_index") or index + 1): deepcopy(frame)
+                    for index, frame in enumerate(gallery["frames"])
+                    if isinstance(frame, dict)
+                }
+        return {}
 
     def _project_chapter_consistency_scores(
         self,
@@ -2491,6 +4092,102 @@ class PipelineService:
             )
         return results
 
+    def _build_consistency_revision_prompt(self, chapter: ChapterChunk) -> str:
+        stage_output = deepcopy(self._chapter_stage_chain(chapter).get("consistency_check") or {})
+        consistency = deepcopy(stage_output.get("consistency") or {})
+        details = deepcopy(consistency.get("details") or {})
+        low_frames = [item for item in details.get("low_frames", []) if isinstance(item, dict)]
+        summary = str(details.get("summary") or consistency.get("summary") or "").strip()
+        revision_lines = [
+            "针对一致性校核的低分镜头进行定向修正，重新生成分镜时必须严格遵守 Story Bible 参考图与章节内既有镜头连续性。",
+            "优先保持人物身份、服装、发型、年龄感、场景结构、光线色调、镜头语言与前后镜头一致。",
+        ]
+        if summary:
+            revision_lines.append(f"本章校核摘要：{summary}")
+        for item in low_frames[:8]:
+            shot_index = int(item.get("shot_index") or 0)
+            reason = self._normalize_consistency_low_frame_reason(item)
+            if shot_index > 0:
+                revision_lines.append(f"重点修正镜头 {shot_index}：{reason}")
+        if len(revision_lines) <= 2:
+            revision_lines.append("若原分镜与剧情不符，请严格回到当前章节文本与分镜细化描述重绘，不得偏离情节。")
+        return "\n".join(revision_lines)
+
+    def _normalize_consistency_low_frame_reason(self, low_frame: dict[str, Any]) -> str:
+        explicit_reason = str(low_frame.get("reason") or "").strip()
+        if explicit_reason:
+            return explicit_reason
+        character_anchors = [str(item).strip() for item in low_frame.get("character_anchors", []) if str(item).strip()]
+        scene_anchors = [str(item).strip() for item in low_frame.get("scene_anchors", []) if str(item).strip()]
+        if character_anchors and scene_anchors:
+            return (
+                f"保持人物 {', '.join(character_anchors[:3])} 的外观与服装一致，同时延续场景 "
+                f"{', '.join(scene_anchors[:3])} 的空间关系和氛围。"
+            )
+        if character_anchors:
+            return f"保持人物 {', '.join(character_anchors[:3])} 的身份、发型、服装和表情连续。"
+        if scene_anchors:
+            return f"保持场景 {', '.join(scene_anchors[:3])} 的地点、布景、光线与色调连续。"
+        score = low_frame.get("score")
+        if isinstance(score, (int, float)):
+            return f"当前镜头一致性得分偏低（{int(score)}），请重点修正人物与场景连续性。"
+        return "请重点修正人物身份、场景空间、光线色调与镜头风格连续性。"
+
+    def _calibrate_consistency_report(
+        self,
+        report: Any,
+        consistency_context: dict[str, Any],
+        *,
+        threshold: int,
+    ) -> Any:
+        details = deepcopy(report.details)
+        low_frames = [item for item in details.get("low_frames", []) if isinstance(item, dict)]
+        if not low_frames:
+            return report
+        soft_issues = 0
+        hard_issues = 0
+        for item in low_frames:
+            reason = self._normalize_consistency_low_frame_reason(item)
+            if any(token in reason for token in CONSISTENCY_HARD_IDENTITY_PATTERNS):
+                hard_issues += 1
+                continue
+            if any(token in reason for token in CONSISTENCY_SOFT_MISMATCH_PATTERNS):
+                soft_issues += 1
+                continue
+            if "场景" in reason and ("不符" in reason or "差异" in reason):
+                soft_issues += 1
+                continue
+            hard_issues += 1
+        if soft_issues <= 0 or hard_issues > 0:
+            return report
+        boost = min(15, soft_issues * 4 + (2 if soft_issues >= 3 else 0))
+        calibrated_score = min(100, int(report.score) + boost)
+        details["calibration"] = {
+            "applied": True,
+            "reason": "soft_reference_mismatch_only",
+            "soft_issue_count": soft_issues,
+            "score_boost": boost,
+            "original_score": int(report.score),
+            "calibrated_score": calibrated_score,
+        }
+        return type(report)(
+            score=calibrated_score,
+            dimensions=deepcopy(report.dimensions),
+            should_rework=calibrated_score < threshold,
+            details=details,
+        )
+
+    def _consistency_rework_target_shots(self, chapter: ChapterChunk) -> list[int]:
+        stage_output = deepcopy(self._chapter_stage_chain(chapter).get("consistency_check") or {})
+        details = deepcopy((stage_output.get("consistency") or {}).get("details") or {})
+        low_frames = [item for item in details.get("low_frames", []) if isinstance(item, dict)]
+        shot_indexes = {
+            int(item.get("shot_index") or 0)
+            for item in low_frames
+            if isinstance(item.get("shot_index"), (int, float, str)) and str(item.get("shot_index")).strip()
+        }
+        return sorted(index for index in shot_indexes if index > 0)
+
     async def _score_storyboard_consistency_with_model(
         self,
         project: Project,
@@ -2498,18 +4195,32 @@ class PipelineService:
         consistency_context: dict[str, Any],
         *,
         threshold: int,
-    ) -> Any:
+    ) -> dict[str, Any]:
         fallback = score_consistency(consistency_context, threshold=threshold)
         provider, model = self._resolve_binding(project, "consistency_check", "consistency")
         if provider == "local":
             details = deepcopy(fallback.details)
             details["scoring_mode"] = "heuristic_fallback"
-            return type(fallback)(
+            result = type(fallback)(
                 score=fallback.score,
                 dimensions=fallback.dimensions,
                 should_rework=fallback.should_rework,
                 details=details,
             )
+            return {
+                "provider": "local",
+                "model": "heuristic-consistency",
+                "estimated_cost": 0.0,
+                "report": result,
+                "response": ProviderResponse(
+                    output={
+                        "summary": str(details.get("reason") or "heuristic consistency"),
+                        "scoring_mode": "heuristic_fallback",
+                    },
+                    usage={},
+                    raw={"scoring_mode": "heuristic_fallback"},
+                ),
+            }
 
         try:
             adapter = self.registry.resolve(provider)
@@ -2517,18 +4228,28 @@ class PipelineService:
             if not visual_inputs:
                 details = deepcopy(fallback.details)
                 details["scoring_mode"] = "heuristic_fallback"
-                return type(fallback)(
+                result = type(fallback)(
                     score=fallback.score,
                     dimensions=fallback.dimensions,
                     should_rework=fallback.should_rework,
                     details=details,
                 )
+                return {
+                    "provider": provider,
+                    "model": model,
+                    "estimated_cost": 0.0,
+                    "report": result,
+                    "response": ProviderResponse(
+                        output={
+                            "summary": "no visual inputs; heuristic fallback",
+                            "scoring_mode": "heuristic_fallback",
+                        },
+                        usage={},
+                        raw={"scoring_mode": "heuristic_fallback", "reason": "no_visual_inputs"},
+                    ),
+                }
             prompt = self._build_consistency_review_prompt(consistency_context, threshold)
             model_candidates = [model]
-            if provider == "openrouter":
-                for candidate in ("openrouter/auto", "openai/gpt-5", "google/gemini-2.5-pro", "anthropic/claude-sonnet-4"):
-                    if candidate not in model_candidates:
-                        model_candidates.append(candidate)
             last_error: Exception | None = None
             for candidate_model in model_candidates:
                 try:
@@ -2566,14 +4287,29 @@ class PipelineService:
                         "chapter_internal_character": int(dimensions.get("chapter_internal_character", fallback.dimensions.get("chapter_internal_character", 0))),
                         "chapter_internal_scene": int(dimensions.get("chapter_internal_scene", fallback.dimensions.get("chapter_internal_scene", 0))),
                         "reference_adherence": int(dimensions.get("reference_adherence", fallback.dimensions.get("reference_adherence", 0))),
-                        "cross_chapter_style": int(dimensions.get("cross_chapter_style", fallback.dimensions.get("cross_chapter_style", 0))),
-                    }
-                    return type(fallback)(
+                            "cross_chapter_style": int(dimensions.get("cross_chapter_style", fallback.dimensions.get("cross_chapter_style", 0))),
+                        }
+                    result = type(fallback)(
                         score=score,
                         dimensions=normalized_dimensions,
                         should_rework=score < threshold,
                         details=details,
                     )
+                    result = self._calibrate_consistency_report(result, consistency_context, threshold=threshold)
+                    return {
+                        "provider": provider,
+                        "model": candidate_model,
+                        "estimated_cost": await adapter.estimate_cost(req, response.usage),
+                        "report": result,
+                        "response": ProviderResponse(
+                            output={
+                                "summary": str(parsed.get("summary") or ""),
+                                "parsed": parsed,
+                            },
+                            usage=response.usage,
+                            raw=response.raw,
+                        ),
+                    }
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
                     continue
@@ -2582,19 +4318,36 @@ class PipelineService:
             details = deepcopy(fallback.details)
             details["scoring_mode"] = "heuristic_fallback"
             details["fallback_reason"] = str(exc)
-            return type(fallback)(
+            result = type(fallback)(
                 score=fallback.score,
                 dimensions=fallback.dimensions,
                 should_rework=fallback.should_rework,
                 details=details,
             )
+            result = self._calibrate_consistency_report(result, consistency_context, threshold=threshold)
+            return {
+                "provider": provider,
+                "model": model,
+                "estimated_cost": 0.0,
+                "report": result,
+                "response": ProviderResponse(
+                    output={
+                        "summary": str(exc),
+                        "scoring_mode": "heuristic_fallback",
+                    },
+                    usage={},
+                    raw={"scoring_mode": "heuristic_fallback", "fallback_reason": str(exc)},
+                ),
+            }
 
     def _build_consistency_review_prompt(self, consistency_context: dict[str, Any], threshold: int) -> str:
-        story_bible = consistency_context.get("story_bible") or {}
-        characters = [item for item in story_bible.get("characters", []) if isinstance(item, dict)][:4]
-        scenes = [item for item in story_bible.get("scenes", []) if isinstance(item, dict)][:4]
+        characters = consistency_context.get("reference_characters") or []
+        scenes = consistency_context.get("reference_scenes") or []
         frame_descriptions = []
-        for frame in consistency_context.get("frames", [])[:8]:
+        for frame in self._sample_consistency_frames(
+            consistency_context.get("frames") or [],
+            CONSISTENCY_CURRENT_FRAME_LIMIT,
+        ):
             if not isinstance(frame, dict):
                 continue
             frame_descriptions.append(
@@ -2603,10 +4356,15 @@ class PipelineService:
                     "visual": frame.get("visual"),
                     "action": frame.get("action"),
                     "dialogue": frame.get("dialogue"),
+                    "expected_characters": frame.get("characters") or frame.get("character_names") or [],
+                    "expected_scene": frame.get("scene") or frame.get("scene_hint") or frame.get("location") or "",
                 }
             )
         neighbor_descriptions = []
-        for frame in consistency_context.get("neighbor_frames", [])[:4]:
+        for frame in self._sample_consistency_frames(
+            consistency_context.get("neighbor_frames") or [],
+            CONSISTENCY_NEIGHBOR_FRAME_LIMIT,
+        ):
             if not isinstance(frame, dict):
                 continue
             neighbor_descriptions.append(
@@ -2614,13 +4372,24 @@ class PipelineService:
                     "shot_index": frame.get("shot_index"),
                     "visual": frame.get("visual"),
                     "action": frame.get("action"),
+                    "expected_characters": frame.get("characters") or frame.get("character_names") or [],
+                    "expected_scene": frame.get("scene") or frame.get("scene_hint") or frame.get("location") or "",
                 }
             )
         payload = {
             "chapter_title": consistency_context.get("chapter_title"),
+            "chapter_summary": consistency_context.get("chapter_summary"),
             "threshold": threshold,
             "reference_characters": characters,
             "reference_scenes": scenes,
+            "review_rules": [
+                "只将镜头与语义相关的人物/场景参考图比较，不要拿无关参考图扣分。",
+                "如果某个镜头对应的场景没有 Story Bible 参考图，不要因为它不像其他场景参考图而扣分。",
+                "优先检查同一角色的脸型、年龄感、发型、服装层次是否稳定，再检查章节内镜头之间的光线和场景连续性。",
+                "角色参考图首先用于识别人物身份与面部特征，不要把参考图中的具体服装当作全书所有章节都必须一致的硬约束。",
+                "如果镜头发生在同一地点体系的子场景，例如学校内的网球场、走廊、办公室，仍应视为同一地点家族，不要因为建筑外观不同直接扣分。",
+                "建立氛围的空镜、物件镜、电话镜头可以不出现清晰人脸；如果剧情本身不要求角色露面，不要因缺少正脸而重罚。",
+            ],
             "current_frames": frame_descriptions,
             "neighbor_frames": neighbor_descriptions,
         }
@@ -2628,26 +4397,63 @@ class PipelineService:
 
     def _consistency_visual_inputs(self, consistency_context: dict[str, Any]) -> list[dict[str, Any]]:
         images: list[dict[str, Any]] = []
-        story_bible = consistency_context.get("story_bible") or {}
-        for item in (story_bible.get("characters") or [])[:3]:
-            if not isinstance(item, dict):
+        sampled_current_frames = self._sample_consistency_frames(
+            consistency_context.get("frames") or [],
+            CONSISTENCY_CURRENT_FRAME_LIMIT,
+        )
+        sampled_neighbor_frames = self._sample_consistency_frames(
+            consistency_context.get("neighbor_frames") or [],
+            CONSISTENCY_NEIGHBOR_FRAME_LIMIT,
+        )
+        frame_character_names = {
+            str(item).strip()
+            for frame in sampled_current_frames
+            for item in (frame.get("characters") or frame.get("character_names") or [])
+            if str(item).strip()
+        }
+        frame_scene_names: set[str] = set()
+        for frame in sampled_current_frames:
+            for raw_value in (frame.get("scene"), frame.get("scene_hint"), frame.get("location")):
+                value = str(raw_value or "").strip()
+                if not value:
+                    continue
+                for token in re.split(r"[\\/|]|\\s{2,}", value):
+                    token = token.strip()
+                    if token:
+                        frame_scene_names.add(token)
+        for serialized in consistency_context.get("reference_characters") or []:
+            if not isinstance(serialized, str):
                 continue
-            url = self._reference_image_data_url(item.get("reference_storage_key"), item.get("reference_image_url"))
-            if url:
-                images.append({"url": url, "label": f"character:{item.get('name')}"})
-        for item in (story_bible.get("scenes") or [])[:2]:
-            if not isinstance(item, dict):
+            name = serialized.split(":", 1)[0].strip()
+            if frame_character_names and name not in frame_character_names:
                 continue
-            url = self._reference_image_data_url(item.get("reference_storage_key"), item.get("reference_image_url"))
+            raw = self._story_bible_entity_by_name(consistency_context.get("story_bible"), "characters", name)
+            if not raw:
+                continue
+            storage_key, image_url = self._story_bible_entity_reference_fields("characters", raw)
+            url = self._reference_image_data_url(storage_key, image_url, variant="portrait")
             if url:
-                images.append({"url": url, "label": f"scene:{item.get('name')}"})
-        for frame in consistency_context.get("frames", [])[:8]:
+                images.append({"url": url, "label": f"character:{name}"})
+        for serialized in consistency_context.get("reference_scenes") or []:
+            if not isinstance(serialized, str):
+                continue
+            name = serialized.split(":", 1)[0].strip()
+            if frame_scene_names and name not in frame_scene_names:
+                continue
+            raw = self._story_bible_entity_by_name(consistency_context.get("story_bible"), "scenes", name)
+            if not raw:
+                continue
+            storage_key, image_url = self._story_bible_entity_reference_fields("scenes", raw)
+            url = self._reference_image_data_url(storage_key, image_url)
+            if url:
+                images.append({"url": url, "label": f"scene:{name}"})
+        for frame in sampled_current_frames:
             if not isinstance(frame, dict):
                 continue
             url = self._reference_image_data_url(frame.get("storage_key"), frame.get("image_url"))
             if url:
                 images.append({"url": url, "label": f"current-shot:{frame.get('shot_index')}"})
-        for frame in consistency_context.get("neighbor_frames", [])[:4]:
+        for frame in sampled_neighbor_frames:
             if not isinstance(frame, dict):
                 continue
             url = self._reference_image_data_url(frame.get("storage_key"), frame.get("image_url"))
@@ -2655,11 +4461,16 @@ class PipelineService:
                 images.append({"url": url, "label": f"neighbor-shot:{frame.get('shot_index')}"})
         return images
 
-    def _reference_image_data_url(self, storage_key: Any, fallback_url: Any) -> str | None:
+    def _sample_consistency_frames(self, frames: list[Any], limit: int) -> list[dict[str, Any]]:
+        normalized = [item for item in frames if isinstance(item, dict)]
+        if limit <= 0 or len(normalized) <= limit:
+            return normalized
+        indexes = sorted({round(index * (len(normalized) - 1) / max(limit - 1, 1)) for index in range(limit)})
+        return [normalized[index] for index in indexes]
+
+    def _reference_image_data_url(self, storage_key: Any, fallback_url: Any, *, variant: str = "full") -> str | None:
         if isinstance(storage_key, str) and storage_key and Path(storage_key).exists():
-            path = Path(storage_key)
-            mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-            return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+            return _cached_reference_image_variant_data_url(storage_key, variant)
         if isinstance(fallback_url, str) and fallback_url.startswith("data:"):
             return fallback_url
         return None
@@ -2703,6 +4514,16 @@ class PipelineService:
         elif step.step_name == "shot_detailing" and chapter is not None:
             shot_payload = self._build_shot_detail_payload(project, chapter)
             artifact.update(shot_payload)
+        elif step.step_name == "stitch_subtitle_tts":
+            manifest = self._build_final_cut_segment_manifest(project)
+            plan = self._build_final_cut_narration_plan(project, manifest=manifest)
+            artifact.setdefault("segment_manifest", manifest)
+            artifact.setdefault("narration_text", plan["narration_text"])
+            artifact.setdefault("subtitle_entries", plan["subtitle_entries"])
+            artifact.setdefault("chapter_count", plan["chapter_count"])
+            artifact.setdefault("segment_count", plan["segment_count"])
+            artifact.setdefault("voice", plan["voice"])
+            artifact.setdefault("summary", f"已整理 {plan['segment_count']} 个章节片段的成片合成方案。")
         output["artifact"] = artifact
         return output
 
@@ -2777,6 +4598,28 @@ class PipelineService:
             fallback = self._build_local_story_bible_fallback(project, chapters, chapter_digest)
             characters = self._normalize_story_bible_entities(fallback.get("characters"), kind="character")
             scenes = self._normalize_story_bible_entities(fallback.get("scenes"), kind="scene")
+        characters = self._recount_story_bible_occurrences(characters, chapter_digest)
+        scenes = self._recount_story_bible_occurrences(scenes, chapter_digest)
+        characters = self._filter_story_bible_entities_by_occurrence(characters, kind="character", chapter_digest=chapter_digest)
+        scenes = self._filter_story_bible_entities_by_occurrence(scenes, kind="scene", chapter_digest=chapter_digest)
+        if not self._story_bible_entities_quality_ok(characters, kind="character") or not self._story_bible_entities_quality_ok(scenes, kind="scene"):
+            fallback = self._build_local_story_bible_fallback(project, chapters, chapter_digest)
+            if not self._story_bible_entities_quality_ok(characters, kind="character"):
+                fallback_characters = self._normalize_story_bible_entities(fallback.get("characters"), kind="character")
+                if fallback_characters:
+                    characters = fallback_characters
+                else:
+                    characters = []
+            if not self._story_bible_entities_quality_ok(scenes, kind="scene"):
+                fallback_scenes = self._normalize_story_bible_entities(fallback.get("scenes"), kind="scene")
+                if fallback_scenes:
+                    scenes = fallback_scenes
+                else:
+                    scenes = []
+        characters = self._recount_story_bible_occurrences(characters, chapter_digest)
+        scenes = self._recount_story_bible_occurrences(scenes, chapter_digest)
+        characters = self._filter_story_bible_entities_by_occurrence(characters, kind="character", chapter_digest=chapter_digest)
+        scenes = self._filter_story_bible_entities_by_occurrence(scenes, kind="scene", chapter_digest=chapter_digest)
         if not characters and not scenes:
             return {}
 
@@ -2815,7 +4658,8 @@ class PipelineService:
                 "2) characters 保留本章最关键人物，最多 6 个；scenes 保留本章关键场景，最多 6 个。\n"
                 "3) aliases 最多 3 个，必须是原文中的同一实体别称。\n"
                 "4) evidence 给出原文中的短语证据（10~30字）。\n"
-                "5) description/visual_anchor 要可用于后续分镜一致性控制。"
+                "5) 忽略书名、作者、目录、前言等元信息。\n"
+                "6) description/visual_anchor 要可用于后续分镜一致性控制。"
             )
             req = ProviderRequest(
                 step="script",
@@ -2933,7 +4777,8 @@ class PipelineService:
             "1) 将同一实体不同称呼合并（例如昵称/全名/职务称呼）。\n"
             "2) name 使用最可辨识、最稳定的主称呼；aliases 留其余称呼。\n"
             "3) 角色和场景分别最多保留 8 个，按 occurrence_count 与叙事重要性排序。\n"
-            "4) chapter_ids/chapter_titles 保留并集；occurrence_count 使用合并后总出现次数。"
+            "4) chapter_ids/chapter_titles 保留并集；occurrence_count 使用合并后总出现次数。\n"
+            "5) 删除明显无效实体：书名、作者名、指代词（如“他说”）、元信息短语。"
         )
         req = ProviderRequest(
             step="script",
@@ -3032,6 +4877,7 @@ class PipelineService:
             "他们", "我们", "自己", "一个", "前置内容", "章节", "时候", "事情", "地方", "声音", "问题", "先生们", "小姐", "女士",
             "男人", "女人", "孩子", "警察", "狱警", "囚犯", "典狱长", "监狱", "公司", "学校", "医院", "美国", "这里", "那里",
             "今天", "明天", "昨天", "现在", "后来", "开始", "然后", "已经", "没有", "不是", "这样", "那个", "这个",
+            "事实上", "例如", "当然", "东西", "因为", "如果", "但是", "于是", "因此", "并且", "或者", "其实", "时间", "一样", "的话",
             "Chapter", "CHAPTER", "chapter", "Part", "PART", "part",
         }
         for token in re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[\u4e00-\u9fff]{2,6}", text):
@@ -3046,6 +4892,23 @@ class PipelineService:
         compact = re.sub(r"\s+", "", title).lower()
         markers = ("前置内容", "前言", "序", "引言", "目录", "版权", "后记", "附录")
         return any(marker in compact for marker in markers)
+
+    def _should_skip_chapter_for_batch_step(self, chapter: ChapterChunk, step_name: str) -> bool:
+        if step_name not in CHAPTER_SCOPED_STEPS:
+            return False
+        return not self._chapter_participates_in_step(chapter, step_name)
+
+    def _is_fatal_batch_error(self, exc: Exception) -> bool:
+        message = str(exc or "").lower()
+        fatal_markers = (
+            "insufficient credits",
+            "402 from openrouter",
+            "401 from openrouter",
+            "403 from openrouter",
+            "invalid api key",
+            "authentication",
+        )
+        return any(marker in message for marker in fatal_markers)
 
     def _is_valid_story_bible_entity_name(self, name: str, *, kind: str) -> bool:
         value = str(name or "").strip()
@@ -3067,10 +4930,155 @@ class PipelineService:
             pronouns = {"他", "她", "他们", "她们", "我们", "你们", "大家", "有人", "某人"}
             if value in pronouns:
                 return False
+            honorific_only = {"先生", "女士", "太太", "小姐", "老师", "医生", "警官", "典狱长"}
+            if value in honorific_only:
+                return False
+            generic_character_noise = {
+                "救赎", "作者", "电影", "小说", "故事", "作品", "事实上", "例如", "当然", "东西", "因为", "如果", "但是",
+                "于是", "因此", "并且", "或者", "其实", "开始", "后来", "然后", "时间", "一样", "的话", "这些", "那些",
+            }
+            if any(term in value for term in generic_character_noise):
+                return False
+            if "的" in value and len(value) >= 4:
+                return False
             invalid_suffix = ("说", "道", "问", "想", "看", "听", "笑", "哭", "喊", "答", "讲")
             if value.endswith(invalid_suffix) and len(value) <= 4:
                 return False
+            if re.match(r"^[我你他她它这那][知说想看问答道]$", value):
+                return False
+            if value[0] in {"我", "你", "他", "她", "它", "这", "那"} and len(value) <= 3:
+                return False
+            if re.fullmatch(r"[\u4e00-\u9fff]{2,6}", value):
+                banned_chars = {"的", "了", "我", "你", "他", "她", "它", "这", "那", "有", "没", "不", "又", "都", "和", "在"}
+                if any(char in banned_chars for char in value):
+                    return False
         return True
+
+    def _story_bible_entities_quality_ok(self, items: list[dict[str, Any]], *, kind: str) -> bool:
+        if not items:
+            return False
+        strong = 0
+        for item in items:
+            occurrences = int(item.get("occurrence_count") or 0)
+            chapter_span = len(item.get("chapter_ids") or [])
+            if occurrences >= 2 or chapter_span >= 2:
+                strong += 1
+        if kind == "character":
+            return strong >= 2
+        return strong >= 1
+
+    def _recount_story_bible_occurrences(
+        self,
+        items: list[dict[str, Any]],
+        chapter_digest: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        recounted: list[dict[str, Any]] = []
+        for raw in items:
+            item = deepcopy(raw)
+            aliases = [str(item.get("name") or "").strip(), *[str(alias).strip() for alias in item.get("aliases") or []]]
+            aliases = [alias for alias in aliases if alias]
+            chapter_ids = set(item.get("chapter_ids") or [])
+            chapter_titles = set(item.get("chapter_titles") or [])
+            occurrence_count = int(item.get("occurrence_count") or 0)
+            for chapter in chapter_digest:
+                chapter_text = f"{chapter.get('summary', '')}\n{chapter.get('context', chapter.get('excerpt', ''))}"
+                if not chapter_text:
+                    continue
+                chapter_hit = False
+                for alias in aliases:
+                    hits = chapter_text.count(alias)
+                    if hits > 0:
+                        occurrence_count += hits
+                        chapter_hit = True
+                if chapter_hit:
+                    chapter_id = str(chapter.get("chapter_id") or "").strip()
+                    chapter_title = str(chapter.get("title") or "").strip()
+                    if chapter_id:
+                        chapter_ids.add(chapter_id)
+                    if chapter_title:
+                        chapter_titles.add(chapter_title)
+            item["occurrence_count"] = max(occurrence_count, int(item.get("occurrence_count") or 0), 1)
+            item["chapter_ids"] = list(chapter_ids)
+            item["chapter_titles"] = list(chapter_titles)
+            recounted.append(item)
+        return recounted
+
+    def _filter_story_bible_entities_by_occurrence(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        kind: str,
+        chapter_digest: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not items:
+            return []
+        if kind == "character":
+            author_aliases = self._detect_author_aliases(chapter_digest)
+            candidates = [
+                item
+                for item in items
+                if int(item.get("occurrence_count") or 0) >= 2 or len(item.get("chapter_ids") or []) >= 2
+            ]
+            strong = [
+                item
+                for item in candidates
+                if not self._is_likely_author_name(str(item.get("name") or ""), chapter_digest)
+                and not self._is_author_alias(str(item.get("name") or ""), author_aliases)
+            ]
+            if strong:
+                return strong
+            return candidates if candidates else items
+        return items
+
+    def _is_likely_author_name(self, name: str, chapter_digest: list[dict[str, Any]]) -> bool:
+        if not name:
+            return False
+        total_hits = 0
+        author_hits = 0
+        pattern_left = re.compile(rf"作者[^。\n]{{0,12}}{re.escape(name)}")
+        pattern_right = re.compile(rf"{re.escape(name)}[^。\n]{{0,12}}作者")
+        for chapter in chapter_digest:
+            text = f"{chapter.get('summary', '')}\n{chapter.get('context', chapter.get('excerpt', ''))}"
+            if not text:
+                continue
+            count = text.count(name)
+            if count <= 0:
+                continue
+            total_hits += count
+            author_hits += len(pattern_left.findall(text)) + len(pattern_right.findall(text))
+        if total_hits <= 0:
+            return False
+        return (author_hits / total_hits) >= 0.35
+
+    def _detect_author_aliases(self, chapter_digest: list[dict[str, Any]]) -> set[str]:
+        aliases: set[str] = set()
+        samples = chapter_digest[:3]
+        for chapter in samples:
+            text = f"{chapter.get('summary', '')}\n{chapter.get('context', chapter.get('excerpt', ''))}"
+            for match in re.findall(r"作者[:：]\s*([^\n。；;，,]{2,24})", text):
+                raw = str(match).strip().strip("《》\"'“”")
+                if not raw:
+                    continue
+                aliases.add(raw)
+                for part in re.split(r"[·\s,，/]+", raw):
+                    token = part.strip()
+                    if len(token) >= 2:
+                        aliases.add(token)
+        return aliases
+
+    def _is_author_alias(self, name: str, aliases: set[str]) -> bool:
+        if not name or not aliases:
+            return False
+        name_key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", name.lower())
+        if not name_key:
+            return False
+        for alias in aliases:
+            alias_key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", alias.lower())
+            if not alias_key:
+                continue
+            if name_key == alias_key or name_key in alias_key or alias_key in name_key:
+                return True
+        return False
 
     def _build_local_story_bible_fallback(
         self,
@@ -3083,13 +5091,28 @@ class PipelineService:
             for item in chapter_digest
         )
         character_counts: dict[str, int] = {}
+        speech_patterns = [
+            r"([\u4e00-\u9fff]{2,4})(?=(?:说|道|问|答|喊|叫|想|看|笑|哭|告诉|回答))",
+            r"(?:老|小)?([\u4e00-\u9fff]{2,3})(?:先生|女士|太太|医生|警官|典狱长)",
+        ]
+        for pattern in speech_patterns:
+            for token in re.findall(pattern, source_text):
+                name = str(token).strip()
+                if self._is_valid_story_bible_entity_name(name, kind="character"):
+                    character_counts[name] = character_counts.get(name, 0) + 4
+        for token in re.findall(r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\b", source_text):
+            name = str(token).strip()
+            if self._is_valid_story_bible_entity_name(name, kind="character"):
+                character_counts[name] = character_counts.get(name, 0) + 2
         for item in chapter_digest:
             for name in item.get("name_candidates") or []:
                 token = str(name).strip()
-                if token:
+                if token and self._is_valid_story_bible_entity_name(token, kind="character"):
                     character_counts[token] = character_counts.get(token, 0) + 2
         for token in re.findall(r"[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?|[\u4e00-\u9fff]{2,4}", source_text):
             if token in {"他们", "我们", "自己", "一个", "前置内容", "章节"}:
+                continue
+            if not self._is_valid_story_bible_entity_name(token, kind="character"):
                 continue
             character_counts[token] = character_counts.get(token, 0) + 1
 
@@ -3111,7 +5134,7 @@ class PipelineService:
                 "priority": index + 1,
             }
             for index, (name, count) in enumerate(sorted(character_counts.items(), key=lambda item: (-item[1], item[0]))[:6])
-            if count >= 2
+            if count >= 3
         ]
         scenes = [
             {
@@ -3137,7 +5160,12 @@ class PipelineService:
             name = str(raw.get("name") or "").strip()
             if not name:
                 continue
+            if not self._is_valid_story_bible_entity_name(name, kind=kind):
+                continue
             aliases = self._story_bible_aliases(raw)
+            aliases = [alias for alias in aliases if self._is_valid_story_bible_entity_name(alias, kind=kind)]
+            if not aliases:
+                aliases = [name]
             alias_keys = {key for alias in aliases for key in self._story_bible_entity_keys(alias)}
             match_bucket = None
             for bucket in buckets:
@@ -3313,6 +5341,8 @@ class PipelineService:
             if not isinstance(raw, dict):
                 continue
             name = str(raw.get("name") or "").strip()
+            if not self._is_valid_story_bible_entity_name(name, kind=kind):
+                continue
             key_candidates = self._story_bible_entity_keys(name)
             primary_key = next(iter(key_candidates), "")
             if not name or (primary_key and primary_key in seen_keys):
@@ -3368,7 +5398,8 @@ class PipelineService:
             model = fallback_models[0]
 
         async def render_item(category: str, item: dict[str, Any], index: int) -> None:
-            prompt = self._build_story_bible_reference_prompt(project, category, item)
+            reference_kind = "identity_portrait" if category == "characters" else "scene_board"
+            prompt = self._build_story_bible_reference_prompt(project, category, item, reference_kind=reference_kind)
             request_params = {
                 "aspect_ratio": "4:5" if category == "characters" else "16:9",
                 "size": "1024x1280" if category == "characters" else "1536x1024",
@@ -3382,11 +5413,33 @@ class PipelineService:
                 request_params=request_params,
                 shot_index=index + 1,
             )
-            reference_asset = self._materialize_story_bible_reference_asset(project, step, category, item["name"], index + 1, artifact)
-            item["reference_image_url"] = reference_asset["image_url"]
-            item["reference_storage_key"] = reference_asset["storage_key"]
-            item["reference_provider"] = artifact.get("provider") or provider
-            item["reference_model"] = artifact.get("model") or model
+            reference_asset = self._materialize_story_bible_reference_asset(
+                project,
+                step,
+                category,
+                item["name"],
+                index + 1,
+                artifact,
+                reference_kind=reference_kind,
+            )
+            if category == "characters":
+                item["identity_reference_image_url"] = reference_asset["image_url"]
+                item["identity_reference_storage_key"] = reference_asset["storage_key"]
+                item["identity_reference_provider"] = artifact.get("provider") or provider
+                item["identity_reference_model"] = artifact.get("model") or model
+                item["reference_image_url"] = reference_asset["image_url"]
+                item["reference_storage_key"] = reference_asset["storage_key"]
+                item["reference_provider"] = item["identity_reference_provider"]
+                item["reference_model"] = item["identity_reference_model"]
+            else:
+                item["scene_reference_image_url"] = reference_asset["image_url"]
+                item["scene_reference_storage_key"] = reference_asset["storage_key"]
+                item["scene_reference_provider"] = artifact.get("provider") or provider
+                item["scene_reference_model"] = artifact.get("model") or model
+                item["reference_image_url"] = reference_asset["image_url"]
+                item["reference_storage_key"] = reference_asset["storage_key"]
+                item["reference_provider"] = item["scene_reference_provider"]
+                item["reference_model"] = item["scene_reference_model"]
 
         for index, item in enumerate(characters[:4]):
             try:
@@ -3399,20 +5452,41 @@ class PipelineService:
             except Exception:  # noqa: BLE001
                 continue
 
-    def _build_story_bible_reference_prompt(self, project: Project, category: str, item: dict[str, Any]) -> str:
+    def _build_story_bible_reference_prompt(
+        self,
+        project: Project,
+        category: str,
+        item: dict[str, Any],
+        *,
+        reference_kind: str,
+    ) -> str:
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
-        lines = [
+        base_lines = [
             f"Project: {project.name}",
-            f"Reference type: {category}",
+            f"Reference type: {reference_kind}",
             f"Name: {item.get('name')}",
             f"Description: {item.get('description')}",
             f"Visual anchor: {item.get('visual_anchor')}",
             f"Base style: {visual_style.get('preset_label') if isinstance(visual_style, dict) else '电影质感'}",
             f"Rendering: {visual_style.get('rendering') if isinstance(visual_style, dict) else '写实电影画面'}",
             f"Lighting: {visual_style.get('lighting') if isinstance(visual_style, dict) else ''}",
-            "Hard constraints: single subject reference board, no text, no split panels, stable identity, production design reference.",
         ]
+        if category == "characters":
+            wardrobe_anchor = str(item.get("wardrobe_anchor") or "").strip()
+            lines = base_lines + [
+                f"Wardrobe anchor: {wardrobe_anchor or 'neutral, timeless, non-scene-specific wardrobe only'}",
+                "Frame: chest-up or waist-up portrait, centered subject, neutral background, no environment storytelling.",
+                "Pose: calm reference pose, looking slightly off-camera or front-facing, no dramatic action.",
+                "Hard constraints: identity portrait only, stable face geometry, stable age impression, stable hairstyle, minimal neutral wardrobe, no props, no scene background, no dramatic lighting gimmicks, no text.",
+            ]
+        else:
+            mood = str(item.get("mood") or "").strip()
+            lines = base_lines + [
+                f"Mood: {mood}",
+                "Frame: wide environment board focused on architecture, layout, light, color and atmosphere.",
+                "Hard constraints: scene reference only, no character close-up, no hero pose, emphasize set layout and lighting continuity, no text.",
+            ]
         return "\n".join(line for line in lines if line and not line.endswith(": "))
 
     def _materialize_story_bible_reference_asset(
@@ -3423,14 +5497,16 @@ class PipelineService:
         name: str,
         index: int,
         artifact: dict[str, Any],
+        *,
+        reference_kind: str,
     ) -> dict[str, Any]:
         file_path: Path | None = None
         mime_type = str(artifact.get("mime_type") or "image/png")
         image_data_url = artifact.get("image_data_url")
         image_base64 = artifact.get("image_base64")
         image_url = artifact.get("image_url") or artifact.get("thumbnail_url")
-        prefix = f"{category}-{index:02d}-{sanitize_component(name)}"
-        target_dir = project_category_dir(project.id, project.name, "references") / category
+        prefix = f"{reference_kind}-{index:02d}-{sanitize_component(name)}"
+        target_dir = project_category_dir(project.id, project.name, "references") / category / reference_kind
         target_dir.mkdir(parents=True, exist_ok=True)
 
         if isinstance(image_data_url, str) and image_data_url.startswith("data:") and ";base64," in image_data_url:
@@ -3502,9 +5578,24 @@ class PipelineService:
         sentences = [item.strip(" \t\r\n-—\"'“”‘’") for item in re.split(r"(?<=[。！？!?；;:：.])\s+", flat_text) if item.strip()]
         if not sentences:
             sentences = [item.strip() for item in re.split(r"[。！？!?；;:：.]+", flat_text) if item.strip()]
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         shots: list[dict[str, Any]] = []
         for index in range(shot_count):
             source = sentences[index % len(sentences)] if sentences else content[:180]
+            dialogue_match = re.findall(r"[“\"]([^”\"]{2,80})[”\"]", source)
+            shot_text = source.lower()
+            characters = self._extract_shot_entities(
+                story_bible.get("characters") if isinstance(story_bible, dict) else [],
+                shot_text,
+                chapter=chapter,
+                limit=3,
+            )
+            scenes = self._extract_shot_entities(
+                story_bible.get("scenes") if isinstance(story_bible, dict) else [],
+                shot_text,
+                chapter=chapter,
+                limit=2,
+            )
             shots.append(
                 {
                     "shot_index": index + 1,
@@ -3512,7 +5603,11 @@ class PipelineService:
                     "frame_type": "中景" if index % 3 else "远景",
                     "visual": source[:160],
                     "action": source[:120],
-                    "dialogue": source[:90],
+                    "dialogue": (dialogue_match[0] if dialogue_match else source[:90]),
+                    "characters": characters,
+                    "scene": scenes[0] if scenes else "",
+                    "scene_hint": " / ".join(scenes),
+                    "continuity_anchor": "保持同一人物外貌、服装和同一场景光线连续一致。",
                 }
             )
         return {
@@ -3531,6 +5626,50 @@ class PipelineService:
             body = "\n".join(lines[1:]).strip()
             return body or content
         return content
+
+    def _storyboard_version_count_for_chapter(self, project_id: str, chapter: ChapterChunk) -> int:
+        storyboard_step = self._get_storyboard_step(project_id)
+        return len(self.list_storyboard_versions(project_id, storyboard_step.id, chapter_id=chapter.id))
+
+    def _dominant_storyboard_model_for_chapter(self, project_id: str, chapter: ChapterChunk) -> str | None:
+        model_counts: dict[str, int] = {}
+        for frame in self._active_storyboard_frames_for_chapter(project_id, chapter).values():
+            model_name = str(frame.get("model") or "").strip()
+            if not model_name:
+                continue
+            model_counts[model_name] = model_counts.get(model_name, 0) + 1
+        if not model_counts:
+            return None
+        return max(model_counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+    def _available_storyboard_models(self, provider: str) -> list[str]:
+        if provider != "openrouter":
+            return []
+        catalog = [item for item in self.registry.list_catalog() if item.provider == provider and item.step == "image"]
+        return list(catalog[0].models) if catalog else []
+
+    def _preferred_storyboard_model_for_run(
+        self,
+        project: Project,
+        chapter: ChapterChunk,
+        provider: str,
+        primary_model: str,
+        params: dict[str, Any],
+    ) -> str:
+        if provider != "openrouter":
+            return primary_model
+        available_list = self._available_storyboard_models(provider)
+        available = set(available_list)
+        if primary_model not in available and available_list:
+            primary_model = available_list[0]
+        is_targeted_rework = bool(params.get("auto_revision_prompt")) or bool(params.get("target_shot_indexes"))
+        dominant = self._dominant_storyboard_model_for_chapter(project.id, chapter)
+        version_count = self._storyboard_version_count_for_chapter(project.id, chapter)
+        if is_targeted_rework and version_count >= 4 and "openai/gpt-5-image" in available:
+            return "openai/gpt-5-image"
+        if is_targeted_rework and dominant and dominant in available:
+            return dominant
+        return primary_model
 
     async def _invoke_storyboard_image_step(
         self,
@@ -3555,17 +5694,45 @@ class PipelineService:
         if not shots:
             raise ValueError("storyboard_image requires shot_detailing output before image generation")
 
+        requested_targets = {
+            int(item)
+            for item in (params.get("target_shot_indexes") or [])
+            if str(item).strip().isdigit() and int(item) > 0
+        }
+        existing_frames = self._active_storyboard_frames_for_chapter(project.id, chapter) if requested_targets else {}
         frames: list[dict[str, Any]] = []
         raw_outputs: list[dict[str, Any]] = []
+        aggregated_usage: dict[str, Any] = {}
         total_estimated_cost = 0.0
+        generated_frame_count = 0
+        render_model = self._preferred_storyboard_model_for_run(project, chapter, provider, model, params)
         system = (
             f"{system_prompt}\n"
             "你现在是电影分镜美术师。每次只返回一张真实图片，不要返回 markdown、JSON、镜头列表或文字解释。"
         )
         for shot in shots:
             shot_index = max(1, int(shot.get("shot_index") or len(frames) + 1))
-            image_prompt = self._build_storyboard_image_prompt(project, chapter, shot, task_prompt, style_directive)
-            reference_images = self._story_bible_reference_images_for_shot(project, shot)
+            if requested_targets and shot_index not in requested_targets and shot_index in existing_frames:
+                reused_frame = deepcopy(existing_frames[shot_index])
+                reused_frame["reused_from_previous_version"] = True
+                frames.append(reused_frame)
+                raw_outputs.append(
+                    {
+                        "shot_index": shot_index,
+                        "reused": True,
+                        "provider_output": {"storage_key": reused_frame.get("storage_key"), "model": reused_frame.get("model")},
+                    }
+                )
+                continue
+            image_prompt = self._build_storyboard_image_prompt(
+                project,
+                chapter,
+                shot,
+                task_prompt,
+                style_directive,
+                auto_revision_prompt=str(params.get("auto_revision_prompt") or "").strip() or None,
+            )
+            reference_images = self._story_bible_reference_images_for_shot(project, shot, chapter=chapter)
             request_params = {
                 **params,
                 "aspect_ratio": str(params.get("aspect_ratio") or "16:9"),
@@ -3576,13 +5743,16 @@ class PipelineService:
             frame_response, frame_artifact, used_model, cost = await self._generate_storyboard_frame_with_fallback(
                 adapter=adapter,
                 provider=provider,
-                primary_model=model,
+                primary_model=render_model,
                 system_prompt=system,
                 image_prompt=image_prompt,
                 request_params=request_params,
                 shot_index=shot_index,
             )
+            render_model = used_model or render_model
             total_estimated_cost += cost
+            aggregated_usage = self._merge_usage_metrics(aggregated_usage, frame_response.usage)
+            generated_frame_count += 1
             frame_asset = self._materialize_storyboard_frame_asset(project.id, chapter, step, shot_index, frame_artifact)
             raw_outputs.append(
                 {
@@ -3590,6 +5760,7 @@ class PipelineService:
                     "prompt": image_prompt,
                     "used_model": used_model,
                     "provider_output": frame_artifact,
+                    "usage": frame_response.usage,
                 }
             )
             frames.append(
@@ -3601,6 +5772,10 @@ class PipelineService:
                     "visual": str(shot.get("visual") or ""),
                     "action": str(shot.get("action") or ""),
                     "dialogue": str(shot.get("dialogue") or ""),
+                    "characters": list(shot.get("characters") or []) if isinstance(shot.get("characters"), list) else [],
+                    "scene": str(shot.get("scene") or ""),
+                    "scene_hint": str(shot.get("scene_hint") or ""),
+                    "continuity_anchor": str(shot.get("continuity_anchor") or ""),
                     "summary": str(shot.get("visual") or "")[:160],
                     "prompt": image_prompt,
                     "provider": frame_artifact.get("provider") or provider,
@@ -3613,17 +5788,27 @@ class PipelineService:
         artifact = {
             "provider": provider,
             "step": "image",
-            "model": model,
+            "model": render_model,
             "artifact_mode": "real_storyboard_frames",
-            "summary": f"已真实生成当前章节 {len(frames)} 张分镜图。",
+            "summary": (
+                f"已定向重绘 {generated_frame_count} 张低分镜头，并复用 {len(frames) - generated_frame_count} 张既有分镜图。"
+                if requested_targets and generated_frame_count < len(frames)
+                else f"已真实生成当前章节 {len(frames)} 张分镜图。"
+            ),
             "frame_count": len(frames),
+            "generated_frame_count": generated_frame_count,
+            "reused_frame_count": len(frames) - generated_frame_count,
             "frames": frames,
             "image_url": frames[0]["image_url"],
             "thumbnail_url": frames[0]["thumbnail_url"],
             "cover_image_url": frames[0]["image_url"],
             "storage_key": frames[0]["storage_key"],
         }
-        return ProviderResponse(output=artifact, usage={"frame_count": len(frames)}, raw={"frames": raw_outputs}), total_estimated_cost
+        aggregated_usage["frame_count"] = len(frames)
+        aggregated_usage["generated_frame_count"] = generated_frame_count
+        aggregated_usage["reused_frame_count"] = len(frames) - generated_frame_count
+        aggregated_usage["request_count"] = generated_frame_count
+        return ProviderResponse(output=artifact, usage=aggregated_usage, raw={"frames": raw_outputs}), total_estimated_cost
 
     async def _invoke_segment_video_step(
         self,
@@ -3640,14 +5825,18 @@ class PipelineService:
     ) -> tuple[ProviderResponse, float]:
         if chapter is None:
             raise ValueError("segment_video requires a chapter context")
-        reference_images = self._story_bible_reference_images_for_chapter(project)
+        reference_images = self._story_bible_reference_images_for_chapter(project, chapter=chapter)
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         reference_paths = [
-            str(item.get("storage_key"))
-            for group in (
-                normalize_style_profile(project.style_profile).get("story_bible", {}).get("characters", []),
-                normalize_style_profile(project.style_profile).get("story_bible", {}).get("scenes", []),
+            storage_key
+            for group_name, group in (
+                ("characters", story_bible.get("characters", []) if isinstance(story_bible, dict) else []),
+                ("scenes", story_bible.get("scenes", []) if isinstance(story_bible, dict) else []),
             )
-            for item in group if isinstance(item, dict) and item.get("reference_storage_key")
+            for item in group
+            if isinstance(item, dict)
+            for storage_key, _ in [self._story_bible_entity_reference_fields(group_name, item)]
+            if storage_key
         ]
         prompt = self._build_segment_video_prompt(project, chapter, task_prompt, style_directive)
         req = ProviderRequest(
@@ -3667,8 +5856,148 @@ class PipelineService:
             },
         )
         response = await adapter.invoke(req)
-        estimated_cost = await adapter.estimate_cost(req)
+        estimated_cost = await adapter.estimate_cost(req, response.usage)
         return response, estimated_cost
+
+    async def _invoke_stitch_subtitle_tts_step(
+        self,
+        project: Project,
+        step: PipelineStep,
+        adapter: Any,
+        provider: str,
+        model: str,
+        system_prompt: str,
+        task_prompt: str,
+        style_directive: str,
+        params: dict[str, Any],
+    ) -> tuple[ProviderResponse, float]:
+        manifest = self._build_final_cut_segment_manifest(project)
+        if not manifest:
+            raise ValueError("no approved chapter video segments available for final cut")
+        voice = str(params.get("voice") or "alloy")
+        target_duration_sec = round(
+            sum(max(float(item.get("duration_sec") or 0.0), 0.0) for item in manifest),
+            3,
+        )
+        aggregated_usage: dict[str, Any] = {}
+        total_estimated_cost = 0.0
+        narration_generation_mode = "heuristic"
+        narration_writer_provider = ""
+        narration_writer_model = ""
+        segment_lines: list[dict[str, Any]] | None = None
+        try:
+            (
+                segment_lines,
+                writer_usage,
+                writer_cost,
+                narration_writer_provider,
+                narration_writer_model,
+                narration_generation_mode,
+            ) = (
+                await self._generate_final_cut_narration_with_model(
+                    project,
+                    manifest=manifest,
+                    task_prompt=task_prompt,
+                    style_directive=style_directive,
+                )
+            )
+            aggregated_usage = self._merge_usage_metrics(aggregated_usage, writer_usage)
+            total_estimated_cost += writer_cost
+        except Exception:
+            segment_lines = None
+
+        plan = self._build_final_cut_narration_plan(
+            project,
+            manifest=manifest,
+            voice=voice,
+            segment_lines=segment_lines,
+        )
+        narration_text = str(plan.get("narration_text") or "").strip()
+        if not narration_text:
+            raise ValueError("final cut narration plan is empty")
+
+        async def invoke_tts(speed: float) -> tuple[ProviderResponse, float, float | None]:
+            req = ProviderRequest(
+                step="tts",
+                model=model,
+                input={
+                    "tts_text": narration_text,
+                    "segment_manifest": manifest,
+                    "subtitle_entries": plan["subtitle_entries"],
+                    "project_name": project.name,
+                },
+                prompt=(
+                    f"{system_prompt}\n{task_prompt}\n{style_directive}\n"
+                    "请只朗读旁白正文，使用自然、克制、电影预告片式的中文旁白语气，不要读出 JSON、路径或字段名。"
+                ),
+                params={
+                    **params,
+                    "voice": voice,
+                    "speed": speed,
+                    "tts_text": narration_text,
+                    "format": params.get("format") or "mp3",
+                    "instructions": params.get("instructions") or "Calm Mandarin narration for cinematic storytelling.",
+                },
+            )
+            response = await adapter.invoke(req)
+            estimated_cost = await adapter.estimate_cost(req, response.usage)
+            duration = self._probe_audio_duration_from_artifact(deepcopy(response.output or {}))
+            return response, estimated_cost, duration
+
+        try:
+            requested_speed = float(params.get("speed") or 1.0)
+        except (TypeError, ValueError):
+            requested_speed = 1.0
+        response, estimated_cost, spoken_duration_sec = await invoke_tts(requested_speed)
+        aggregated_usage = self._merge_usage_metrics(aggregated_usage, response.usage)
+        total_estimated_cost += estimated_cost
+        if target_duration_sec > 0 and spoken_duration_sec and abs(spoken_duration_sec - target_duration_sec) > max(6.0, target_duration_sec * 0.05):
+            corrected_speed = max(0.55, min(1.35, requested_speed * (spoken_duration_sec / target_duration_sec)))
+            if abs(corrected_speed - requested_speed) >= 0.03:
+                retry_response, retry_cost, retry_duration = await invoke_tts(corrected_speed)
+                response = retry_response
+                spoken_duration_sec = retry_duration
+                requested_speed = corrected_speed
+                aggregated_usage = self._merge_usage_metrics(aggregated_usage, retry_response.usage)
+                total_estimated_cost += retry_cost
+        artifact = deepcopy(response.output or {})
+        artifact.update(
+            {
+                "provider": artifact.get("provider") or provider,
+                "step": artifact.get("step") or "tts",
+                "model": artifact.get("model") or model,
+                "segment_manifest": manifest,
+                "narration_text": narration_text,
+                "subtitle_entries": plan["subtitle_entries"],
+                "subtitle_format": "srt",
+                "chapter_count": plan["chapter_count"],
+                "segment_count": plan["segment_count"],
+                "voice": voice,
+                "tts_speed": round(requested_speed, 3),
+                "target_duration_sec": target_duration_sec,
+                "spoken_audio_duration_sec": round(spoken_duration_sec, 3) if spoken_duration_sec else None,
+                "narration_generation_mode": narration_generation_mode,
+                "narration_writer_provider": narration_writer_provider,
+                "narration_writer_model": narration_writer_model,
+                "summary": str(artifact.get("summary") or f"已生成 {plan['segment_count']} 个章节片段的旁白与字幕方案。"),
+            }
+        )
+        return (
+            ProviderResponse(
+                output=artifact,
+                usage=aggregated_usage,
+                raw={
+                    "tts": response.raw,
+                    "tts_speed": requested_speed,
+                    "spoken_audio_duration_sec": spoken_duration_sec,
+                    "target_duration_sec": target_duration_sec,
+                    "narration_generation_mode": narration_generation_mode,
+                    "narration_writer_provider": narration_writer_provider,
+                    "narration_writer_model": narration_writer_model,
+                },
+            ),
+            total_estimated_cost,
+        )
 
     def _build_segment_video_prompt(
         self,
@@ -3728,8 +6057,8 @@ class PipelineService:
                 response = await adapter.invoke(req)
                 artifact = deepcopy(response.output or {})
                 if not any(isinstance(artifact.get(key), str) and artifact.get(key) for key in ("image_data_url", "image_base64", "image_url", "thumbnail_url")):
-                    raise ValueError(f"storyboard_image did not return a real image for shot {shot_index}")
-                cost = await adapter.estimate_cost(req)
+                    raise ValueError(self._storyboard_missing_image_reason(response, artifact, shot_index))
+                cost = await adapter.estimate_cost(req, response.usage)
                 return response, artifact, candidate_model, cost
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -3743,21 +6072,18 @@ class PipelineService:
         available = catalog[0].models if catalog else []
         preferred = [
             primary_model,
-            "openai/gpt-5-image",
+            "openai/gpt-5-image-mini",
             "google/gemini-3.1-flash-image-preview",
             "google/gemini-3-pro-image-preview",
-            "openrouter/auto",
+            "openai/gpt-5-image",
         ]
         candidates: list[str] = []
         for item in preferred:
             if item in available and item not in candidates:
                 candidates.append(item)
-        for item in available:
-            if item not in candidates:
-                candidates.append(item)
         if not candidates:
             candidates.append(primary_model)
-        return candidates
+        return candidates[:STORYBOARD_IMAGE_FALLBACK_LIMIT]
 
     def _build_storyboard_image_prompt(
         self,
@@ -3766,6 +6092,7 @@ class PipelineService:
         shot: dict[str, Any],
         task_prompt: str,
         style_directive: str,
+        auto_revision_prompt: str | None = None,
     ) -> str:
         title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
         summary = str((chapter.meta or {}).get("summary") or chapter.content[:160])
@@ -3773,8 +6100,33 @@ class PipelineService:
         visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
         keywords = ", ".join(visual_style.get("keywords", [])) if isinstance(visual_style, dict) else ""
         palette = ", ".join(visual_style.get("palette", [])) if isinstance(visual_style, dict) else ""
-        related_characters = self._story_bible_entities_for_prompt(story_bible.get("characters"), shot)
-        related_scenes = self._story_bible_entities_for_prompt(story_bible.get("scenes"), shot)
+        compact_style = ", ".join(
+            part
+            for part in [
+                str(visual_style.get("rendering") or "").strip(),
+                str(visual_style.get("lighting") or "").strip(),
+                str(visual_style.get("camera_language") or "").strip(),
+                keywords,
+                palette,
+                str(visual_style.get("custom_style") or "").strip(),
+                str(visual_style.get("custom_directives") or "").strip(),
+            ]
+            if part
+        )
+        related_characters = self._story_bible_entities_for_prompt(
+            story_bible.get("characters"),
+            shot,
+            chapter=chapter,
+            allow_fallback=True,
+        )
+        related_scenes = self._story_bible_entities_for_prompt(
+            story_bible.get("scenes"),
+            shot,
+            chapter=chapter,
+            allow_fallback=False,
+        )
+        primary_characters = ", ".join(str(item) for item in (shot.get("characters") or []) if str(item).strip())
+        primary_scene = str(shot.get("scene_hint") or shot.get("scene") or "").strip()
         constraints = [
             "single cinematic storyboard frame",
             "no text overlay",
@@ -3785,51 +6137,142 @@ class PipelineService:
             "consistent wardrobe",
             "consistent location continuity",
         ]
+        safety_context = self._storyboard_image_safety_context(summary, shot)
+        safe_summary = self._sanitize_storyboard_image_text(summary, field="summary")
+        safe_visual = self._sanitize_storyboard_image_text(str(shot.get("visual") or summary), field="visual")
+        safe_action = self._sanitize_storyboard_image_text(str(shot.get("action") or ""), field="action")
+        safe_dialogue = self._sanitize_storyboard_image_text(str(shot.get("dialogue") or ""), field="dialogue")
+        if safety_context["sexual_content_softened"]:
+            constraints.extend(
+                [
+                    "PG-13 framing",
+                    "fully clothed adult characters",
+                    "implied intimacy only",
+                    "no nudity",
+                    "no lingerie emphasis",
+                    "no explicit sexual content",
+                ]
+            )
         lines = [
             f"Chapter: {title}",
-            f"Chapter summary: {summary}",
+            f"Chapter summary: {safe_summary}",
             f"Shot {int(shot.get('shot_index') or 1)}",
             f"Visual style keywords: {keywords}",
             f"Palette: {palette}",
             f"Rendering: {visual_style.get('rendering') if isinstance(visual_style, dict) else '写实电影画面'}",
             f"Lighting: {visual_style.get('lighting') if isinstance(visual_style, dict) else ''}",
             f"Camera language: {visual_style.get('camera_language') if isinstance(visual_style, dict) else ''}",
-            f"Scene description: {shot.get('visual') or summary}",
-            f"Character action: {shot.get('action') or ''}",
-            f"Dialogue context: {shot.get('dialogue') or ''}",
+            f"Scene description: {safe_visual}",
+            f"Character action: {safe_action}",
+            f"Dialogue context: {safe_dialogue}",
             f"Shot type: {shot.get('frame_type') or '中景'}",
+            f"Primary characters in this shot: {primary_characters}",
+            f"Primary scene in this shot: {primary_scene}",
             f"Character reference anchors: {related_characters}",
             f"Scene reference anchors: {related_scenes}",
+            f"Continuity anchor: {shot.get('continuity_anchor') or ''}",
             f"User image directive: {task_prompt}",
-            f"Style bible: {style_directive}",
+            f"Consistency correction hint: {auto_revision_prompt or ''}",
+            f"Compact style directive: {compact_style or style_directive}",
             f"Hard constraints: {', '.join(constraints)}",
         ]
         return "\n".join(line for line in lines if line and not line.endswith(": "))
 
-    def _story_bible_entities_for_prompt(self, items: Any, shot: dict[str, Any]) -> str:
-        if not isinstance(items, list):
-            return ""
-        shot_text = " ".join(
+    def _storyboard_image_safety_context(self, summary: str, shot: dict[str, Any]) -> dict[str, Any]:
+        text = " ".join(
             [
+                summary,
                 str(shot.get("visual") or ""),
                 str(shot.get("action") or ""),
                 str(shot.get("dialogue") or ""),
             ]
-        ).lower()
-        selected: list[str] = []
-        fallback: list[str] = []
-        for raw in items:
-            if not isinstance(raw, dict):
-                continue
-            name = str(raw.get("name") or "").strip()
-            description = str(raw.get("visual_anchor") or raw.get("description") or "").strip()
-            if not name:
-                continue
-            serialized = f"{name}: {description}"
-            fallback.append(serialized)
-            if name.lower() in shot_text or any(token in shot_text for token in self._anchor_tokens(description)):
-                selected.append(serialized)
-        chosen = selected[:3] or fallback[:3]
+        )
+        return {
+            "sexual_content_softened": self._has_storyboard_image_sexual_risk(text),
+        }
+
+    def _has_storyboard_image_sexual_risk(self, text: str) -> bool:
+        normalized = text.strip().lower()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in STORYBOARD_IMAGE_SEXUAL_RISK_PATTERNS)
+
+    def _sanitize_storyboard_image_text(self, text: str, *, field: str) -> str:
+        value = " ".join(text.split())
+        if not value:
+            return ""
+        if not self._has_storyboard_image_sexual_risk(value):
+            return value
+
+        has_children_context = any(token in value for token in ("孩子", "孩子们", "child", "children"))
+        has_doorway_context = any(token in value for token in ("门口", "门前", "门廊", "door", "threshold"))
+        has_embrace_context = any(token in value for token in ("搂", "拥抱", "抱住", "hug", "embrace"))
+
+        if field == "summary":
+            summary = "章节开场为成年角色在家庭空间中的亲密重逢，整体表达含蓄克制，采用 PG-13 电影化构图，避免裸露与内衣特写。"
+            if has_children_context:
+                summary += " 情节信息包含孩子暂由他人照看。"
+            return summary
+        if field == "visual":
+            visual = "成年角色在"
+            visual += "家门口" if has_doorway_context else "私密家庭空间"
+            visual += "重逢，气氛亲密但克制，穿着完整居家服，不出现裸露或内衣焦点。"
+            if has_embrace_context:
+                visual += " 构图可表现轻微靠近或克制拥抱。"
+            return visual
+        if field == "action":
+            action = "角色靠近并进行克制的亲密互动，以表情和姿态传达情绪，不表现裸露或明确性暗示。"
+            if has_embrace_context:
+                action += " 可保留轻拥动作。"
+            return action
+        if field == "dialogue":
+            dialogue = "对话强调家庭关系与私人相处时段，保持含蓄表达。"
+            if has_children_context:
+                dialogue += " 可体现孩子暂由他人照看这一信息。"
+            return dialogue
+        return value
+
+    def _storyboard_missing_image_reason(self, response: ProviderResponse, artifact: dict[str, Any], shot_index: int) -> str:
+        artifact_error = artifact.get("error_message")
+        if isinstance(artifact_error, str) and artifact_error.strip():
+            return f"storyboard_image model rejected shot {shot_index}: {artifact_error.strip()}"
+        artifact_text = artifact.get("text")
+        if isinstance(artifact_text, str) and artifact_text.strip():
+            return f"storyboard_image model did not return an image for shot {shot_index}: {artifact_text.strip()}"
+        raw = response.raw if isinstance(response.raw, dict) else {}
+        choices = raw.get("choices") if isinstance(raw, dict) else None
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            choice_error = first.get("error")
+            if isinstance(choice_error, dict):
+                message = choice_error.get("message")
+                if isinstance(message, str) and message.strip():
+                    return f"storyboard_image model rejected shot {shot_index}: {message.strip()}"
+            message = first.get("message")
+            if isinstance(message, dict):
+                refusal = message.get("refusal")
+                if isinstance(refusal, str) and refusal.strip():
+                    return f"storyboard_image model rejected shot {shot_index}: {refusal.strip()}"
+        return f"storyboard_image did not return a real image for shot {shot_index}"
+
+    def _story_bible_entities_for_prompt(
+        self,
+        items: Any,
+        shot: dict[str, Any],
+        *,
+        chapter: ChapterChunk | None = None,
+        allow_fallback: bool = False,
+    ) -> str:
+        if not isinstance(items, list):
+            return ""
+        shot_text = self._story_bible_matching_text(shot)
+        chosen = self._select_relevant_story_bible_entities(
+            items,
+            shot_text,
+            chapter=chapter,
+            limit=3,
+            allow_fallback=allow_fallback,
+        )
         return " | ".join(chosen)
 
     def _anchor_tokens(self, text: str) -> list[str]:
@@ -3839,44 +6282,251 @@ class PipelineService:
             if token not in {"保持", "一致", "稳定", "角色", "场景", "镜头", "光线", "空间", "服装"}
         ][:8]
 
-    def _story_bible_reference_images_for_shot(self, project: Project, shot: dict[str, Any]) -> list[dict[str, Any]]:
-        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
-        shot_text = " ".join(
+    def _story_bible_matching_text(self, payload: dict[str, Any]) -> str:
+        parts: list[str] = [
+            str(payload.get("visual") or ""),
+            str(payload.get("action") or ""),
+            str(payload.get("dialogue") or ""),
+            str(payload.get("summary") or ""),
+            str(payload.get("scene") or ""),
+            str(payload.get("scene_hint") or ""),
+            str(payload.get("location") or ""),
+            str(payload.get("setting") or ""),
+            str(payload.get("continuity_anchor") or ""),
+        ]
+        characters = payload.get("characters") or payload.get("character_names") or []
+        if isinstance(characters, list):
+            parts.extend(str(item) for item in characters if str(item).strip())
+        return " ".join(part for part in parts if part).lower()
+
+    def _chapter_story_bible_matching_text(
+        self,
+        chapter: ChapterChunk | None,
+        frames: list[dict[str, Any]] | None = None,
+        neighbor_frames: list[dict[str, Any]] | None = None,
+    ) -> str:
+        if chapter is None:
+            return ""
+        meta = chapter.meta or {}
+        parts = [
+            str(meta.get("title") or ""),
+            str(meta.get("summary") or ""),
+            self._chapter_body_text(chapter)[:1200],
+        ]
+        for frame in frames or []:
+            parts.append(self._story_bible_matching_text(frame))
+        for frame in neighbor_frames or []:
+            parts.append(self._story_bible_matching_text(frame))
+        return " ".join(part for part in parts if part).lower()
+
+    def _story_bible_entity_label(self, raw: dict[str, Any]) -> str:
+        name = str(raw.get("name") or "").strip()
+        description = str(raw.get("visual_anchor") or raw.get("description") or "").strip()
+        return f"{name}: {description}" if description else name
+
+    def _story_bible_entity_match_score(
+        self,
+        raw: dict[str, Any],
+        text: str,
+        *,
+        chapter: ChapterChunk | None = None,
+        include_chapter_bonus: bool = True,
+    ) -> int:
+        name = str(raw.get("name") or "").strip().lower()
+        if not name:
+            return 0
+        score = 0
+        if chapter is not None and include_chapter_bonus:
+            chapter_ids = [str(item) for item in raw.get("chapter_ids", []) if str(item).strip()]
+            if chapter.id in chapter_ids:
+                score += 12
+            title = str((chapter.meta or {}).get("title") or "").strip()
+            chapter_titles = [str(item).strip() for item in raw.get("chapter_titles", []) if str(item).strip()]
+            if title and title in chapter_titles:
+                score += 8
+        if name in text:
+            score += 10
+        aliases = [str(item).strip().lower() for item in raw.get("aliases", []) if str(item).strip()]
+        for alias in aliases:
+            if alias and alias in text:
+                score += 6
+        searchable = " ".join(
             [
-                str(shot.get("visual") or ""),
-                str(shot.get("action") or ""),
-                str(shot.get("dialogue") or ""),
+                str(raw.get("name") or ""),
+                str(raw.get("description") or ""),
+                str(raw.get("visual_anchor") or ""),
+                " ".join(str(item) for item in raw.get("chapter_titles", []) if str(item).strip()),
             ]
-        ).lower()
+        )
+        for token in self._anchor_tokens(searchable):
+            if token in text:
+                score += 2
+        occurrence = int(raw.get("occurrence_count") or 0)
+        if score > 0:
+            score += min(3, occurrence // 40)
+        return score
+
+    def _select_relevant_story_bible_entities(
+        self,
+        items: Any,
+        text: str,
+        *,
+        chapter: ChapterChunk | None = None,
+        limit: int,
+        allow_fallback: bool,
+        include_chapter_bonus: bool = True,
+    ) -> list[str]:
+        if not isinstance(items, list) or limit <= 0:
+            return []
+        matched: list[tuple[int, int, str]] = []
+        fallback: list[tuple[int, str]] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            label = self._story_bible_entity_label(raw)
+            if not label.strip():
+                continue
+            occurrence = int(raw.get("occurrence_count") or 0)
+            score = self._story_bible_entity_match_score(raw, text, chapter=chapter, include_chapter_bonus=include_chapter_bonus)
+            fallback.append((occurrence, label))
+            if score > 0:
+                matched.append((score, occurrence, label))
+        if matched:
+            matched.sort(key=lambda item: (-item[0], -item[1], item[2]))
+            return [item[2] for item in matched[:limit]]
+        if allow_fallback:
+            fallback.sort(key=lambda item: (-item[0], item[1]))
+            return [item[1] for item in fallback[:limit]]
+        return []
+
+    def _extract_shot_entities(
+        self,
+        items: Any,
+        text: str,
+        *,
+        chapter: ChapterChunk | None = None,
+        limit: int,
+        include_chapter_bonus: bool = False,
+    ) -> list[str]:
+        if not isinstance(items, list):
+            return []
+        matches: list[tuple[int, int, str]] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            score = self._story_bible_entity_match_score(raw, text, chapter=chapter, include_chapter_bonus=include_chapter_bonus)
+            if score <= 0:
+                continue
+            occurrence = int(raw.get("occurrence_count") or 0)
+            matches.append((score, occurrence, name))
+        matches.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        return [item[2] for item in matches[:limit]]
+
+    def _story_bible_entity_by_name(
+        self,
+        story_bible: Any,
+        group: str,
+        name: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(story_bible, dict) or not name:
+            return None
+        for raw in story_bible.get(group, []) or []:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("name") or "").strip() == name:
+                return raw
+        return None
+
+    def _story_bible_entity_reference_fields(self, group: str, raw: dict[str, Any]) -> tuple[str | None, str | None]:
+        if group == "characters":
+            storage_key = raw.get("identity_reference_storage_key") or raw.get("reference_storage_key")
+            image_url = raw.get("identity_reference_image_url") or raw.get("reference_image_url")
+            return (
+                str(storage_key).strip() if isinstance(storage_key, str) and str(storage_key).strip() else None,
+                str(image_url).strip() if isinstance(image_url, str) and str(image_url).strip() else None,
+            )
+        storage_key = raw.get("scene_reference_storage_key") or raw.get("reference_storage_key")
+        image_url = raw.get("scene_reference_image_url") or raw.get("reference_image_url")
+        return (
+            str(storage_key).strip() if isinstance(storage_key, str) and str(storage_key).strip() else None,
+            str(image_url).strip() if isinstance(image_url, str) and str(image_url).strip() else None,
+        )
+
+    def _story_bible_reference_images_for_shot(
+        self,
+        project: Project,
+        shot: dict[str, Any],
+        *,
+        chapter: ChapterChunk | None = None,
+    ) -> list[dict[str, Any]]:
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        shot_text = self._story_bible_matching_text(shot)
         selected: list[dict[str, Any]] = []
         for group in ("characters", "scenes"):
+            allow_fallback = False
+            candidates = self._extract_shot_entities(
+                story_bible.get(group, []) if isinstance(story_bible, dict) else [],
+                shot_text,
+                chapter=chapter,
+                limit=STORYBOARD_REFERENCE_IMAGE_LIMIT,
+            )
             for raw in (story_bible.get(group, []) if isinstance(story_bible, dict) else []):
                 if not isinstance(raw, dict):
                     continue
                 name = str(raw.get("name") or "").strip()
-                if not name:
+                if not name or name not in candidates:
                     continue
-                tokens = self._anchor_tokens(" ".join([name, str(raw.get("description") or ""), str(raw.get("visual_anchor") or "")]))
-                if name.lower() not in shot_text and not any(token in shot_text for token in tokens):
-                    continue
-                data_url = self._reference_image_data_url(raw.get("reference_storage_key"), raw.get("reference_image_url"))
+                storage_key, image_url = self._story_bible_entity_reference_fields(group, raw)
+                data_url = self._reference_image_data_url(storage_key, image_url, variant="portrait" if group == "characters" else "full")
                 if data_url:
                     selected.append({"url": data_url, "label": f"{group}:{name}"})
         if selected:
-            return selected[:4]
-        return self._story_bible_reference_images_for_chapter(project)[:4]
+            return selected[:STORYBOARD_REFERENCE_IMAGE_LIMIT]
+        return self._story_bible_reference_images_for_chapter(project, chapter=chapter)[:STORYBOARD_REFERENCE_IMAGE_LIMIT]
 
-    def _story_bible_reference_images_for_chapter(self, project: Project) -> list[dict[str, Any]]:
+    def _story_bible_reference_images_for_chapter(
+        self,
+        project: Project,
+        chapter: ChapterChunk | None = None,
+    ) -> list[dict[str, Any]]:
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         selected: list[dict[str, Any]] = []
+        chapter_text = self._chapter_story_bible_matching_text(chapter)
         for group in ("characters", "scenes"):
+            allow_fallback = group == "characters"
+            chosen = set(
+                self._extract_shot_entities(
+                    story_bible.get(group, []) if isinstance(story_bible, dict) else [],
+                    chapter_text,
+                    chapter=chapter,
+                    limit=STORYBOARD_REFERENCE_IMAGE_LIMIT,
+                )
+            )
+            if not chosen and allow_fallback:
+                chosen = {
+                    item.split(":", 1)[0]
+                    for item in self._select_relevant_story_bible_entities(
+                        story_bible.get(group, []) if isinstance(story_bible, dict) else [],
+                        chapter_text,
+                        chapter=chapter,
+                        limit=STORYBOARD_REFERENCE_IMAGE_LIMIT,
+                        allow_fallback=True,
+                    )
+                }
             for raw in (story_bible.get(group, []) if isinstance(story_bible, dict) else []):
                 if not isinstance(raw, dict):
                     continue
-                data_url = self._reference_image_data_url(raw.get("reference_storage_key"), raw.get("reference_image_url"))
+                name = str(raw.get("name") or "").strip()
+                if chosen and name not in chosen:
+                    continue
+                storage_key, image_url = self._story_bible_entity_reference_fields(group, raw)
+                data_url = self._reference_image_data_url(storage_key, image_url, variant="portrait" if group == "characters" else "full")
                 if data_url:
-                    selected.append({"url": data_url, "label": f"{group}:{raw.get('name')}"})
-        return selected[:5]
+                    selected.append({"url": data_url, "label": f"{group}:{name}"})
+        return selected[:STORYBOARD_REFERENCE_IMAGE_LIMIT]
 
     def _build_source_document_input(self, project: Project, step_name: str) -> dict[str, Any]:
         document = self.db.scalar(

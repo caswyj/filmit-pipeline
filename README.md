@@ -62,6 +62,50 @@ docker compose up -d --build api web llm-worker media-worker
 - API: `http://localhost:8000`
 - API Docs: `http://localhost:8000/docs`
 
+## 安全说明
+
+- 不要提交 `.env`、本地数据库、浏览器缓存或任何包含真实 API key 的文件。
+- `README.md`、`.env.example` 与代码示例中只使用占位符，例如 `sk-...` 或 `N2V_OPENROUTER_API_KEY=...`。
+- 当前仓库默认忽略 `.env`、`apps/api/generated/`、`.playwright-cli/`、`*.egg-info/` 等本地生成内容。
+
+## Playwright 浏览器测试
+
+后续页面维护、交互回归和新需求验收默认使用 `Playwright`。
+
+首次安装浏览器：
+
+```bash
+cd apps/web
+npm run playwright:install
+```
+
+执行快速冒烟测试：
+
+```bash
+cd apps/web
+npm run playwright:test
+```
+
+可视化执行：
+
+```bash
+cd apps/web
+npm run playwright:test:headed
+```
+
+执行现有的整条工作流自动化脚本：
+
+```bash
+cd apps/web
+npm run playwright:demo-workflow -- --headed --stop-after-step chapter_chunking
+```
+
+说明：
+
+- Playwright 默认访问 `http://127.0.0.1:3000`
+- API 默认访问 `http://127.0.0.1:8000`
+- 产物输出到 `output/playwright/`
+
 ## 文件落盘
 
 当前所有项目相关文件默认统一落盘到：
