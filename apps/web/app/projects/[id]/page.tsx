@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 
+import { AgentPanel } from "./components/agent-panel";
+
 type Project = {
   id: string;
   name: string;
@@ -1780,7 +1782,9 @@ export default function ProjectPage() {
 
   return (
     <main className="shell" data-testid="project-page">
-      <section className="card row" style={{ justifyContent: "space-between" }} data-testid="project-header">
+      <div className="projectWorkspace">
+        <div className="projectMain">
+          <section className="card row" style={{ justifyContent: "space-between" }} data-testid="project-header">
         <div>
           <h1 data-testid="project-title">{project?.name ?? "项目审核台"}</h1>
           <p className="muted">状态: {project?.status ?? "-"} | 目标时长: {project?.target_duration_sec ?? "-"}s</p>
@@ -2549,8 +2553,20 @@ export default function ProjectPage() {
               ))}
             </section>
           ) : null}
-        </section>
-      </section>
+          </section>
+        </div>
+        <aside className="agentSidebar">
+          <AgentPanel
+            projectId={projectId}
+            projectName={project?.name ?? "项目审核台"}
+            projectStatus={project?.status ?? "-"}
+            targetDurationSec={project?.target_duration_sec ?? 0}
+            selectedStepName={selected?.step_display_name ?? null}
+            selectedChapterId={selectedChapter?.id ?? null}
+            selectedChapterTitle={selectedChapter?.title ?? null}
+          />
+        </aside>
+      </div>
     </main>
   );
 }

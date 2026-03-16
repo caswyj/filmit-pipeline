@@ -47,6 +47,10 @@ class Project(Base):
     storyboard_versions: Mapped[list["StoryboardVersion"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    agent_sessions: Mapped[list["AgentSession"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    agent_messages: Mapped[list["AgentMessage"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    agent_runs: Mapped[list["AgentRun"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    agent_tool_calls: Mapped[list["AgentToolCall"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
 class SourceDocument(Base):
@@ -245,3 +249,92 @@ class ExportJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     project: Mapped[Project] = relationship(back_populates="exports")
+
+
+class AgentSession(Base):
+    __tablename__ = "agent_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="FilmIt Agent")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    session_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="PROJECT_DEFAULT")
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    agent_provider: Mapped[str] = mapped_column(String(64), nullable=False, default="openai")
+    agent_model_name: Mapped[str] = mapped_column(String(128), nullable=False, default="gpt-5-mini")
+    approval_mode: Mapped[str] = mapped_column(String(64), nullable=False, default="explicit_write_confirmation")
+    retrieval_mode: Mapped[str] = mapped_column(String(64), nullable=False, default="local_lightweight_index")
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="agent_sessions")
+    messages: Mapped[list["AgentMessage"]] = relationship(back_populates="session", cascade="all, delete-orphan")
+    runs: Mapped[list["AgentRun"]] = relationship(back_populates="session", cascade="all, delete-orphan")
+    tool_calls: Mapped[list["AgentToolCall"]] = relationship(back_populates="session", cascade="all, delete-orphan")
+
+
+class AgentMessage(Base):
+    __tablename__ = "agent_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(String(36), ForeignKey("agent_sessions.id"), nullable=False)
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    content_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="visible")
+    token_estimate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    session: Mapped[AgentSession] = relationship(back_populates="messages")
+    project: Mapped[Project] = relationship(back_populates="agent_messages")
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(String(36), ForeignKey("agent_sessions.id"), nullable=False)
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="QUEUED")
+    run_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="chat")
+    input_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    output_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    agent_provider: Mapped[str] = mapped_column(String(64), nullable=False, default="openai")
+    agent_model_name: Mapped[str] = mapped_column(String(128), nullable=False, default="gpt-5-mini")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    session: Mapped[AgentSession] = relationship(back_populates="runs")
+    project: Mapped[Project] = relationship(back_populates="agent_runs")
+    tool_calls: Mapped[list["AgentToolCall"]] = relationship(back_populates="run", cascade="all, delete-orphan")
+
+
+class AgentToolCall(Base):
+    __tablename__ = "agent_tool_calls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(String(36), ForeignKey("agent_runs.id"), nullable=False)
+    session_id: Mapped[str] = mapped_column(String(36), ForeignKey("agent_sessions.id"), nullable=False)
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    call_status: Mapped[str] = mapped_column(String(32), nullable=False, default="PLANNED")
+    args_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    approval_policy: Mapped[str] = mapped_column(String(64), nullable=False, default="auto_read_only")
+    requires_user_confirmation: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    run: Mapped[AgentRun] = relationship(back_populates="tool_calls")
+    session: Mapped[AgentSession] = relationship(back_populates="tool_calls")
+    project: Mapped[Project] = relationship(back_populates="agent_tool_calls")

@@ -317,6 +317,109 @@ button.primary {
   gap: 12px;
 }
 
+.projectWorkspace {
+  display: grid;
+  gap: 16px;
+}
+
+.projectMain {
+  min-width: 0;
+}
+
+.agentSidebar {
+  min-width: 0;
+}
+
+.agentPanelShell {
+  display: grid;
+  gap: 12px;
+}
+
+.agentToggleCard {
+  background:
+    linear-gradient(150deg, rgba(217, 95, 35, 0.12), rgba(21, 35, 59, 0.04) 58%),
+    var(--panel);
+}
+
+.agentConversationCard {
+  display: grid;
+  gap: 12px;
+}
+
+.agentMessages {
+  display: grid;
+  gap: 12px;
+  max-height: 58vh;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.agentMessage {
+  border-radius: 16px;
+  border: 1px solid rgba(21, 35, 59, 0.08);
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.agentMessage.user {
+  background: rgba(217, 95, 35, 0.12);
+  border-color: rgba(217, 95, 35, 0.25);
+}
+
+.agentMessage.assistant {
+  background: rgba(21, 35, 59, 0.04);
+}
+
+.agentMessageMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.agentInputForm {
+  display: grid;
+  gap: 10px;
+}
+
+.agentSourceList,
+.agentToolCallList {
+  display: grid;
+  gap: 8px;
+}
+
+.agentSourceItem {
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.84);
+  border: 1px solid rgba(21, 35, 59, 0.06);
+  padding: 10px 12px;
+}
+
+.agentSourceItem p {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+.agentApprovalCard {
+  border-radius: 14px;
+  padding: 12px;
+  background: rgba(217, 95, 35, 0.12);
+  border: 1px solid rgba(217, 95, 35, 0.24);
+  margin-top: 12px;
+}
+
+.agentApprovalCard p {
+  margin: 8px 0 0;
+}
+
+.agentNextActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
 @media (min-width: 980px) {
   .showcaseGrid {
     grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.85fr);
@@ -324,5 +427,17 @@ button.primary {
 
   .grid {
     grid-template-columns: 280px minmax(0, 1.6fr) 380px;
+  }
+}
+
+@media (min-width: 1280px) {
+  .projectWorkspace {
+    grid-template-columns: minmax(0, 1.68fr) minmax(340px, 0.8fr);
+    align-items: start;
+  }
+
+  .agentPanelShell {
+    position: sticky;
+    top: 24px;
   }
 }

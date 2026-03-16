@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     openrouter_site_url: str = "http://localhost:3000"
     openrouter_app_name: str = "FilmIt Pipeline"
     openrouter_timeout_sec: int = 180
+    agent_provider: str = "openai"
+    agent_model_name: str = "gpt-5-mini"
+    agent_live_model_enabled: bool = True
+    agent_max_output_tokens: int = 900
     video_poll_interval_sec: int = 8
     video_poll_max_attempts: int = 15
 

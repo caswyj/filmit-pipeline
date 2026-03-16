@@ -8,7 +8,9 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agent import AgentSessionService
 from app.db.models import Project, SourceDocument
+from app.schemas.agent import AgentMessageRead, AgentSendMessagePayload, AgentSessionRead, AgentTurnRead, AgentRunRead
 from app.schemas.chapter import ChapterRead
 from app.schemas.demo import DemoCaseRead, DemoImportPayload
 from app.db.session import get_db
@@ -38,6 +40,10 @@ GENERATED_DIR = storage_root()
 
 def get_service(db: Session = Depends(get_db)) -> PipelineService:
     return PipelineService(db)
+
+
+def get_agent_service(db: Session = Depends(get_db)) -> AgentSessionService:
+    return AgentSessionService(db)
 
 
 def _get_project_or_404(db: Session, project_id: str) -> Project:
@@ -227,6 +233,46 @@ async def rebuild_story_bible(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return ProjectRead.model_validate(updated)
+
+
+@router.get("/projects/{project_id}/agent/sessions/default", response_model=AgentSessionRead)
+def get_default_agent_session(
+    project_id: str,
+    db: Session = Depends(get_db),
+    agent_svc: AgentSessionService = Depends(get_agent_service),
+) -> AgentSessionRead:
+    project = _get_project_or_404(db, project_id)
+    session = agent_svc.get_or_create_default_session(project)
+    return AgentSessionRead.model_validate(session)
+
+
+@router.get("/projects/{project_id}/agent/sessions/default/messages", response_model=list[AgentMessageRead])
+def list_default_agent_messages(
+    project_id: str,
+    db: Session = Depends(get_db),
+    agent_svc: AgentSessionService = Depends(get_agent_service),
+) -> list[AgentMessageRead]:
+    project = _get_project_or_404(db, project_id)
+    messages = agent_svc.list_messages(project)
+    return [AgentMessageRead.model_validate(item) for item in messages]
+
+
+@router.post("/projects/{project_id}/agent/sessions/default/messages", response_model=AgentTurnRead)
+async def send_message_to_default_agent_session(
+    project_id: str,
+    payload: AgentSendMessagePayload,
+    db: Session = Depends(get_db),
+    agent_svc: AgentSessionService = Depends(get_agent_service),
+) -> AgentTurnRead:
+    project = _get_project_or_404(db, project_id)
+    result = await agent_svc.send_message(project, payload.message, page_context=payload.page_context)
+    run = result["run"]
+    return AgentTurnRead(
+        session=AgentSessionRead.model_validate(result["session"]),
+        user_message=AgentMessageRead.model_validate(result["user_message"]),
+        assistant_message=AgentMessageRead.model_validate(result["assistant_message"]),
+        run=AgentRunRead.model_validate(run),
+    )
 
 
 @router.get("/providers/models", response_model=list[ProviderModelRead])
