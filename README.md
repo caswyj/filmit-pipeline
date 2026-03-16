@@ -1,6 +1,6 @@
 # FilmIt Pipeline
 
-本项目实现 `docs/architecture-v1.0.0.md` 定义的 `v1.0.0` 技术架构基线：
+本项目当前以 `docs/architecture-v1.1.0.md` 作为技术架构基线：
 
 - `PDF/TXT` 小说输入
 - 8 步流水线处理
@@ -128,7 +128,7 @@ npm run playwright:demo-workflow -- --headed --stop-after-step chapter_chunking
 
 ## 当前实现说明
 
-`v1.0.0` 已实现内容：
+当前已实现内容：
 
 1. 核心数据库模型（项目、步骤、镜头、素材、审计、版本）
 2. 流程状态机（`PENDING -> GENERATING -> REVIEW_REQUIRED -> APPROVED`）
@@ -143,7 +143,7 @@ npm run playwright:demo-workflow -- --headed --stop-after-step chapter_chunking
 11. `segment_video` 任务轮询与本地视频片段落盘
 12. 八步中文显示名与每步提示词模板预设
 
-后续建议按 `docs/architecture-v1.0.0.md` 继续扩展真实模型调用、媒体生成与高级时间线编辑。
+后续建议按 `docs/architecture-v1.1.0.md` 继续扩展 Story Bible 资产拆分、真实图生视频与高级时间线编辑。
 
 ## 真实模型测试
 

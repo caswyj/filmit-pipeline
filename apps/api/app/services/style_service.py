@@ -117,6 +117,18 @@ STYLE_PRESETS: list[dict[str, Any]] = [
     },
 ]
 
+VISUAL_STYLE_DEFAULTS: dict[str, Any] = {
+    "director_style": "现代商业电影",
+    "real_light_source_strategy": "真实光源驱动，优先场景内实景光源与动机光",
+    "skin_texture_level": "保留真实肌肤纹理，不过度磨皮",
+    "shot_distance_profile": "中景为主，情绪峰值切近景，场景转换使用远景建立",
+    "lens_package": "35mm / 50mm / 85mm 电影镜头组",
+    "camera_movement_style": "克制推进与稳定跟拍，必要时使用导演风格化运镜",
+    "first_last_frame_bridge": True,
+    "continuity_method": "story_bible + first_last_frame",
+    "forbid_readable_text": True,
+}
+
 
 def list_style_presets() -> list[dict[str, Any]]:
     return deepcopy(STYLE_PRESETS)
@@ -132,6 +144,7 @@ def get_style_preset(preset_id: str) -> dict[str, Any] | None:
 def normalize_style_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
     profile = deepcopy(profile or {})
     existing_story_bible = deepcopy(profile.get("story_bible") or {})
+    existing_visual_style = deepcopy(existing_story_bible.get("visual_style") or {}) if isinstance(existing_story_bible, dict) else {}
     passthrough = {
         key: value
         for key, value in profile.items()
@@ -141,6 +154,10 @@ def normalize_style_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
     preset = get_style_preset(preset_id) or get_style_preset("cinematic") or deepcopy(STYLE_PRESETS[0])
     custom_style = str(profile.get("custom_style") or "").strip()
     custom_directives = str(profile.get("custom_directives") or "").strip()
+    visual_controls = {
+        key: profile.get(key, existing_visual_style.get(key, default))
+        for key, default in VISUAL_STYLE_DEFAULTS.items()
+    }
 
     story_bible = {
         "visual_style": {
@@ -155,11 +172,14 @@ def normalize_style_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
             "motion_feel": preset["motion_feel"],
             "custom_style": custom_style,
             "custom_directives": custom_directives,
+            **visual_controls,
         },
         "consistency_guardrails": [
             "保持同一角色在不同镜头中的服装、发型、年龄感一致",
             "保持同一场景的空间布局、主色调、时间段一致",
             "镜头运动与动作连续，不凭空切换朝向和道具位置",
+            "章节边界优先使用首尾帧桥接，避免跨章节主体跳变",
+            "所有 Storyboard 与 Story Bible 参考图禁止出现可读字幕、logo、水印",
         ],
     }
     if isinstance(existing_story_bible, dict):
@@ -173,6 +193,7 @@ def normalize_style_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
         "preset_label": preset["label"],
         "custom_style": custom_style,
         "custom_directives": custom_directives,
+        **visual_controls,
         "story_bible": story_bible,
     }
 
@@ -190,6 +211,15 @@ def build_style_prompt(style_profile: dict[str, Any] | None) -> str:
         f"- 渲染：{visual_style['rendering']}",
         f"- 镜头语言：{visual_style['camera_language']}",
         f"- 动势：{visual_style['motion_feel']}",
+        f"- 导演风格：{visual_style.get('director_style')}",
+        f"- 真实光源管理：{visual_style.get('real_light_source_strategy')}",
+        f"- 肌肤纹理：{visual_style.get('skin_texture_level')}",
+        f"- 景别策略：{visual_style.get('shot_distance_profile')}",
+        f"- 镜头组：{visual_style.get('lens_package')}",
+        f"- 运镜风格：{visual_style.get('camera_movement_style')}",
+        f"- 连续性方法：{visual_style.get('continuity_method')}",
+        f"- 首尾帧桥接：{'启用' if bool(visual_style.get('first_last_frame_bridge')) else '关闭'}",
+        f"- 分镜禁字：{'强制开启' if bool(visual_style.get('forbid_readable_text')) else '关闭'}",
     ]
     if visual_style["custom_style"]:
         lines.append(f"- 用户自定义风格名：{visual_style['custom_style']}")
@@ -231,4 +261,22 @@ def build_style_prompt(style_profile: dict[str, Any] | None) -> str:
                 )
                 if ref:
                     lines.append(f"  - {name} 场景参考图: {ref}")
+    props = story_bible.get("props")
+    if isinstance(props, list) and props:
+        lines.append("- 核心物品锚点：")
+        for item in props[:5]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            desc = item.get("description") or item.get("visual_anchor")
+            if name:
+                lines.append(f"  - {name}: {desc}")
+                ref = (
+                    item.get("prop_reference_storage_key")
+                    or item.get("prop_reference_image_url")
+                    or item.get("reference_storage_key")
+                    or item.get("reference_image_url")
+                )
+                if ref:
+                    lines.append(f"  - {name} 物品参考图: {ref}")
     return "\n".join(lines)

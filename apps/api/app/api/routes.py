@@ -13,7 +13,14 @@ from app.schemas.chapter import ChapterRead
 from app.schemas.demo import DemoCaseRead, DemoImportPayload
 from app.db.session import get_db
 from app.schemas.document import SourceDocumentRead
-from app.schemas.project import ModelBindingPayload, ProjectCreate, ProjectRead, ProjectTimelineRead, ProjectUpdate
+from app.schemas.project import (
+    ModelBindingPayload,
+    ProjectCreate,
+    ProjectRead,
+    ProjectTimelineRead,
+    ProjectUpdate,
+    StoryBibleEntityRegeneratePayload,
+)
 from app.schemas.prompt import PromptTemplateRead
 from app.schemas.provider import ProviderModelRead
 from app.schemas.review import (
@@ -100,8 +107,10 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db), svc: P
 
 
 @router.get("/projects/{project_id}", response_model=ProjectRead)
-def get_project(project_id: str, db: Session = Depends(get_db)) -> Project:
-    return _get_project_or_404(db, project_id)
+def get_project(project_id: str, db: Session = Depends(get_db), svc: PipelineService = Depends(get_service)) -> ProjectRead:
+    project = _get_project_or_404(db, project_id)
+    hydrated = svc.hydrate_project_story_bible_reference_assets(project, persist=True)
+    return ProjectRead.model_validate(hydrated)
 
 
 @router.patch("/projects/{project_id}", response_model=ProjectRead)
@@ -224,6 +233,25 @@ async def rebuild_story_bible(
     project = _get_project_or_404(db, project_id)
     try:
         updated = await svc.rebuild_story_bible_references(project)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return ProjectRead.model_validate(updated)
+
+
+@router.post("/projects/{project_id}/story-bible/regenerate-item", response_model=ProjectRead)
+async def regenerate_story_bible_item(
+    project_id: str,
+    payload: StoryBibleEntityRegeneratePayload,
+    db: Session = Depends(get_db),
+    svc: PipelineService = Depends(get_service),
+) -> ProjectRead:
+    project = _get_project_or_404(db, project_id)
+    try:
+        updated = await svc.regenerate_story_bible_entity_reference(
+            project,
+            kind=payload.kind,
+            name=payload.name,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return ProjectRead.model_validate(updated)

@@ -40,7 +40,12 @@ class OpenRouterProviderAdapter(ProviderAdapter):
 
         payload = self._build_payload(req)
         max_tokens = req.params.get("max_tokens")
-        if isinstance(max_tokens, int) and max_tokens > 0:
+        if req.step == "image":
+            if isinstance(max_tokens, int) and max_tokens > 0:
+                payload["max_tokens"] = min(max_tokens, 1024)
+            else:
+                payload["max_tokens"] = 256
+        elif isinstance(max_tokens, int) and max_tokens > 0:
             payload["max_tokens"] = max_tokens
 
         response = await self._post_json(payload)

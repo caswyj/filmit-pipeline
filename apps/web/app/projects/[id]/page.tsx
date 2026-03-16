@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Project = {
   id: string;
@@ -68,11 +68,13 @@ type BatchStepRunResponse = {
   succeeded: number;
   failed: number;
   skipped: number;
+  total_estimated_cost: number;
   chapter_results: Array<{
     chapter_id: string;
     chapter_title: string;
     status: string;
     detail: string;
+    estimated_cost?: number | null;
   }>;
   current_step: Step | null;
 };
@@ -116,16 +118,38 @@ type PromptTemplate = {
   task_prompt: string;
 };
 
+type StoryBibleAssetView = {
+  view_key: string;
+  view_label: string;
+  image_url?: string;
+  thumbnail_url?: string;
+  export_url?: string;
+  storage_key?: string;
+  provider?: string;
+  model?: string;
+};
+
 type StoryBibleEntity = {
   name: string;
   description?: string;
   visual_anchor?: string;
+  reference_display_description?: string;
   reference_image_url?: string;
   reference_storage_key?: string;
   identity_reference_image_url?: string;
   identity_reference_storage_key?: string;
   scene_reference_image_url?: string;
   scene_reference_storage_key?: string;
+  prop_reference_image_url?: string;
+  prop_reference_storage_key?: string;
+  reference_generation_status?: string;
+  reference_generation_error?: string;
+  reference_variant_count?: number;
+  reference_variant_expected?: number;
+  reference_hard_constraints?: string[];
+  identity_reference_views: StoryBibleAssetView[];
+  scene_reference_variants: StoryBibleAssetView[];
+  prop_reference_views: StoryBibleAssetView[];
 };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
@@ -133,6 +157,74 @@ const localOnlySteps = new Set(["ingest_parse", "chapter_chunking"]);
 const textEditableSteps = new Set(["ingest_parse", "chapter_chunking", "story_scripting", "shot_detailing"]);
 const chapterScopedSteps = new Set(["story_scripting", "shot_detailing", "storyboard_image", "consistency_check", "segment_video"]);
 const mediaFocusedSteps = new Set(["storyboard_image", "consistency_check", "segment_video"]);
+const directorStyleOptions = [
+  "现代商业电影",
+  "希区柯克式悬疑",
+  "大卫·芬奇式冷静控制",
+  "王家卫式情绪化",
+  "黑泽明式横向调度",
+];
+const realLightSourceOptions = [
+  "真实光源驱动，优先场景内实景光源与动机光",
+  "高对比戏剧化光源",
+  "低照度氛围光",
+  "霓虹/广告牌动机光",
+  "烛光/钨丝暖光",
+];
+const skinTextureOptions = [
+  "保留真实肌肤纹理，不过度磨皮",
+  "轻度柔化但保留毛孔细节",
+  "商业级干净肤质",
+  "粗粝写实肤质",
+];
+const shotDistanceOptions = [
+  "中景为主，情绪峰值切近景，场景转换使用远景建立",
+  "近景主导，强调表演和情绪",
+  "远景建立后回到中景叙事",
+  "近中远景均衡切换",
+];
+const lensPackageOptions = [
+  "35mm / 50mm / 85mm 电影镜头组",
+  "24mm / 35mm / 50mm 广角到标准",
+  "50mm / 85mm / 135mm 偏长焦镜头组",
+  "变焦混合镜头组",
+];
+const cameraMotionOptions = [
+  "克制推进与稳定跟拍，必要时使用导演风格化运镜",
+  "稳定跟拍与缓慢摇移",
+  "手持纪实与近距离跟随",
+  "希区柯克式变焦",
+  "库布里克式对称推进",
+  "黑泽明式横向调度",
+];
+const storyboardQualityOptions = [
+  {
+    id: "draft",
+    label: "草稿",
+    description: "最低成本，单模型、低分辨率、默认批量预算 5 美元",
+    defaultSize: "1024x576",
+    defaultBudget: 5,
+  },
+  {
+    id: "balanced",
+    label: "均衡",
+    description: "适中质量，单模型、720p、默认批量预算 8 美元",
+    defaultSize: "1280x720",
+    defaultBudget: 8,
+  },
+  {
+    id: "quality",
+    label: "精修",
+    description: "高质量，允许有限 fallback，默认批量预算 15 美元",
+    defaultSize: "1536x1024",
+    defaultBudget: 15,
+  },
+] as const;
+const storyboardImageSizeOptions = [
+  { value: "1024x576", label: "1024 x 576（推荐草稿）" },
+  { value: "1280x720", label: "1280 x 720（推荐均衡）" },
+  { value: "1536x1024", label: "1536 x 1024（高成本）" },
+];
 
 const stepTypeByName: Record<string, string> = {
   ingest_parse: "chunk",
@@ -164,6 +256,16 @@ function asNumber(value: unknown, fallback = 0): number {
   return fallback;
 }
 
+function asBoolean(value: unknown, fallback = false): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "off"].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
 function asList(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
@@ -178,6 +280,7 @@ function dimensionLabel(key: string): string {
     chapter_internal_scene: "章节内场景连续性",
     reference_adherence: "Story Bible 贴合度",
     cross_chapter_style: "跨章节风格连续性",
+    motion_dynamicity: "视频运动有效性",
   };
   return mapping[key] ?? key;
 }
@@ -331,7 +434,7 @@ function extractStoryboardGallery(output: Record<string, unknown>): Record<strin
     return {
       frame_count: artifact.frame_count,
       frames: artifact.frames,
-      contact_sheet_url: artifact.thumbnail_url,
+      contact_sheet_url: artifact.thumbnail_url || artifact.image_url || artifact.export_url,
       gallery_export_url: artifact.gallery_export_url,
       cover_image_url: artifact.cover_image_url,
     };
@@ -353,6 +456,50 @@ function chapterStageOutput(chapter: Chapter | null, stepName: string | undefine
   return asRecord(stage.output);
 }
 
+function chapterHasRenderableOutput(chapter: Chapter, stepName: string | undefined): boolean {
+  if (!stepName) return false;
+  const output = chapterStageOutput(chapter, stepName);
+  if (Object.keys(output).length === 0) return false;
+  if (stepName === "storyboard_image" || stepName === "consistency_check") {
+    if (extractStoryboardFrames(output).length > 0) return true;
+    const gallery = extractStoryboardGallery(output);
+    return asString(gallery.contact_sheet_url, "") !== "";
+  }
+  if (stepName === "segment_video") {
+    const artifact = asRecord(output.artifact);
+    return asString(artifact.preview_url, asString(artifact.export_url, "")) !== "";
+  }
+  const artifact = asRecord(output.artifact);
+  return Object.keys(artifact).length > 0 || asString(output.summary, "") !== "";
+}
+
+function pickPreferredChapter(
+  chapters: Chapter[],
+  stepName: string | undefined,
+  selectedChapterId: string | null
+): Chapter | null {
+  if (chapters.length === 0) return null;
+  const selectedChapter = selectedChapterId ? chapters.find((chapter) => chapter.id === selectedChapterId) ?? null : null;
+  if (selectedChapter) return selectedChapter;
+
+  if (stepName && chapterScopedSteps.has(stepName)) {
+    const withRenderableOutput = chapters.find((chapter) => chapterHasRenderableOutput(chapter, stepName));
+    if (withRenderableOutput) return withRenderableOutput;
+    const readyForReview = chapters.find((chapter) => {
+      const status = asString(chapter.stage_map[stepName], "");
+      return status === "REVIEW_REQUIRED" || status === "APPROVED";
+    });
+    if (readyForReview) return readyForReview;
+    const inProgress = chapters.find((chapter) => {
+      const status = asString(chapter.stage_map[stepName], "");
+      return status === "GENERATING" || status === "PENDING";
+    });
+    if (inProgress) return inProgress;
+  }
+
+  return chapters[0];
+}
+
 function chapterStageRecord(chapter: Chapter | null, stepName: string | undefined): Record<string, unknown> {
   if (!chapter || !stepName) return {};
   const meta = asRecord(chapter.meta);
@@ -367,6 +514,22 @@ function stepExecutionStats(step: Step, chapter: Chapter | null): Record<string,
   return asRecord(asRecord(step.output_ref).execution_stats);
 }
 
+function asStoryBibleAssetViewList(value: unknown): StoryBibleAssetView[] {
+  return asList(value)
+    .map((item) => asRecord(item))
+    .filter((item) => asString(item.view_key, "") !== "" || asString(item.image_url, "") !== "")
+    .map((item) => ({
+      view_key: asString(item.view_key, ""),
+      view_label: asString(item.view_label, asString(item.view_key, "参考图")),
+      image_url: asString(item.image_url, ""),
+      thumbnail_url: asString(item.thumbnail_url, ""),
+      export_url: asString(item.export_url, ""),
+      storage_key: asString(item.storage_key, ""),
+      provider: asString(item.provider, ""),
+      model: asString(item.model, ""),
+    }));
+}
+
 function asStoryBibleEntityList(value: unknown): StoryBibleEntity[] {
   return asList(value)
     .map((item) => asRecord(item))
@@ -375,12 +538,23 @@ function asStoryBibleEntityList(value: unknown): StoryBibleEntity[] {
       name: asString(item.name, ""),
       description: asString(item.description, ""),
       visual_anchor: asString(item.visual_anchor, ""),
+      reference_display_description: asString(item.reference_display_description, ""),
       reference_image_url: asString(item.reference_image_url, ""),
       reference_storage_key: asString(item.reference_storage_key, ""),
       identity_reference_image_url: asString(item.identity_reference_image_url, ""),
       identity_reference_storage_key: asString(item.identity_reference_storage_key, ""),
       scene_reference_image_url: asString(item.scene_reference_image_url, ""),
       scene_reference_storage_key: asString(item.scene_reference_storage_key, ""),
+      prop_reference_image_url: asString(item.prop_reference_image_url, ""),
+      prop_reference_storage_key: asString(item.prop_reference_storage_key, ""),
+      reference_generation_status: asString(item.reference_generation_status, ""),
+      reference_generation_error: asString(item.reference_generation_error, ""),
+      reference_variant_count: asNumber(item.reference_variant_count, 0),
+      reference_variant_expected: asNumber(item.reference_variant_expected, 0),
+      reference_hard_constraints: asList(item.reference_hard_constraints).map((entry) => asString(entry, "")).filter(Boolean),
+      identity_reference_views: asStoryBibleAssetViewList(item.identity_reference_views),
+      scene_reference_variants: asStoryBibleAssetViewList(item.scene_reference_variants),
+      prop_reference_views: asStoryBibleAssetViewList(item.prop_reference_views),
     }));
 }
 
@@ -406,6 +580,17 @@ export default function ProjectPage() {
   const [stylePresetId, setStylePresetId] = useState("cinematic");
   const [customStyle, setCustomStyle] = useState("");
   const [customDirectives, setCustomDirectives] = useState("");
+  const [directorStyle, setDirectorStyle] = useState(directorStyleOptions[0]);
+  const [realLightSourceStrategy, setRealLightSourceStrategy] = useState(realLightSourceOptions[0]);
+  const [skinTextureLevel, setSkinTextureLevel] = useState(skinTextureOptions[0]);
+  const [shotDistanceProfile, setShotDistanceProfile] = useState(shotDistanceOptions[0]);
+  const [lensPackage, setLensPackage] = useState(lensPackageOptions[0]);
+  const [cameraMovementStyle, setCameraMovementStyle] = useState(cameraMotionOptions[0]);
+  const [firstLastFrameBridge, setFirstLastFrameBridge] = useState(true);
+  const [forbidReadableText, setForbidReadableText] = useState(true);
+  const [storyboardQuality, setStoryboardQuality] = useState<(typeof storyboardQualityOptions)[number]["id"]>("draft");
+  const [storyboardImageSize, setStoryboardImageSize] = useState("1024x576");
+  const [storyboardBudgetUsd, setStoryboardBudgetUsd] = useState("5");
   const [latestExport, setLatestExport] = useState<ExportRead | null>(null);
   const [storyboardVersions, setStoryboardVersions] = useState<StoryboardVersion[]>([]);
   const [busy, setBusy] = useState(false);
@@ -413,21 +598,24 @@ export default function ProjectPage() {
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [actionProgress, setActionProgress] = useState(0);
+  const sourceFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const selected = useMemo(
     () => steps.find((step) => step.id === selectedStepId) ?? steps[0] ?? null,
     [selectedStepId, steps]
   );
   const selectedChapter = useMemo(
-    () => chapters.find((chapter) => chapter.id === selectedChapterId) ?? chapters[0] ?? null,
-    [chapters, selectedChapterId]
+    () => pickPreferredChapter(chapters, selected?.step_name, selectedChapterId),
+    [chapters, selected?.step_name, selectedChapterId]
   );
   const storyBible = useMemo(
     () => asRecord(asRecord(project?.style_profile).story_bible),
     [project?.style_profile]
   );
+  const storyBibleVisualStyle = useMemo(() => asRecord(storyBible.visual_style), [storyBible]);
   const storyBibleCharacters = useMemo(() => asStoryBibleEntityList(storyBible.characters), [storyBible]);
   const storyBibleScenes = useMemo(() => asStoryBibleEntityList(storyBible.scenes), [storyBible]);
+  const storyBibleProps = useMemo(() => asStoryBibleEntityList(storyBible.props), [storyBible]);
 
   const selectedOutput = useMemo(() => {
     if (!selected) return {};
@@ -447,6 +635,11 @@ export default function ProjectPage() {
   const selectedStoryboardGallery = useMemo(() => extractStoryboardGallery(selectedOutput), [selectedOutput]);
   const selectedStoryboardFrames = useMemo(() => extractStoryboardFrames(selectedOutput), [selectedOutput]);
   const consistencyPayload = useMemo(() => asRecord(selectedOutput.consistency), [selectedOutput]);
+  const selectedStoryboardParams = useMemo(() => asRecord(selectedOutput.params), [selectedOutput]);
+  const storyboardQualityPreset = useMemo(
+    () => storyboardQualityOptions.find((item) => item.id === storyboardQuality) ?? storyboardQualityOptions[0],
+    [storyboardQuality]
+  );
   const consistencyDetails = useMemo(() => asRecord(consistencyPayload.details), [consistencyPayload]);
   const videoConsistency = useMemo(() => asRecord(selectedOutput.video_consistency), [selectedOutput]);
   const mediaHeroUrl = useMemo(
@@ -467,6 +660,11 @@ export default function ProjectPage() {
   );
   const chapterVideoPreviewUrl = useMemo(
     () => asString(selectedArtifact.preview_url, asString(selectedArtifact.export_url, "")),
+    [selectedArtifact]
+  );
+  const motionValidation = useMemo(() => asRecord(selectedArtifact.motion_validation), [selectedArtifact]);
+  const segmentClipManifest = useMemo(
+    () => asList(selectedArtifact.clip_manifest).map((item) => asRecord(item)),
     [selectedArtifact]
   );
   const chapterConsistencyScores = useMemo(
@@ -655,7 +853,7 @@ export default function ProjectPage() {
       const data = (await res.json()) as Chapter[];
       setChapters(data);
       if (!selectedChapterId && data.length > 0) {
-        setSelectedChapterId(data[0].id);
+        setSelectedChapterId(pickPreferredChapter(data, selected?.step_name, null)?.id ?? data[0].id);
       }
     } finally {
       setChaptersLoading(false);
@@ -810,6 +1008,29 @@ export default function ProjectPage() {
     await runCurrentStep(true);
   }
 
+  function buildStoryboardRunParams() {
+    const budget = Number(storyboardBudgetUsd);
+    return {
+      storyboard_quality: storyboardQuality,
+      size: storyboardImageSize,
+      forbid_readable_text: forbidReadableText,
+      ...(Number.isFinite(budget) && budget > 0 ? { max_total_cost_usd: budget } : {}),
+    };
+  }
+
+  function buildStepParams(options?: { includeChapterId?: boolean }) {
+    if (!selected) return {};
+    const includeChapterId = options?.includeChapterId ?? true;
+    const params: Record<string, unknown> = {};
+    if (chapterScopedSteps.has(selected.step_name) && includeChapterId && selectedChapter) {
+      params.chapter_id = selectedChapter.id;
+    }
+    if (selected.step_name === "storyboard_image") {
+      Object.assign(params, buildStoryboardRunParams());
+    }
+    return params;
+  }
+
   async function runCurrentStep(force = true) {
     if (!projectId || !selected) return;
     setPendingAction(`正在运行：${selected.step_display_name}`);
@@ -823,7 +1044,7 @@ export default function ProjectPage() {
         body: JSON.stringify({
           force,
           chapter_id: chapterScopedSteps.has(selected.step_name) ? selectedChapter?.id ?? null : null,
-          params: chapterScopedSteps.has(selected.step_name) && selectedChapter ? { chapter_id: selectedChapter.id } : {},
+          params: buildStepParams(),
         }),
       });
       if (!res.ok) {
@@ -854,7 +1075,7 @@ export default function ProjectPage() {
       const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/steps/${selected.step_name}/run-all-chapters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ force: true, params: {} }),
+        body: JSON.stringify({ force: true, params: buildStepParams({ includeChapterId: false }) }),
       });
       if (!res.ok) {
         const text = await res.text();
@@ -865,7 +1086,9 @@ export default function ProjectPage() {
       await refreshWorkflowData(selected);
       setActionProgress(100);
       setActionMessage(
-        `批量运行完成：成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。`
+        `批量运行完成：成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。${
+          asNumber(data.total_estimated_cost, 0) > 0 ? ` 本次预计消耗 $${asNumber(data.total_estimated_cost, 0).toFixed(4)}。` : ""
+        }`
       );
     } catch (err) {
       setActionProgress(0);
@@ -886,7 +1109,7 @@ export default function ProjectPage() {
       const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/steps/${selected.step_name}/run-failed-chapters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ force: true, params: {} }),
+        body: JSON.stringify({ force: true, params: buildStepParams({ includeChapterId: false }) }),
       });
       if (!res.ok) {
         const text = await res.text();
@@ -897,7 +1120,9 @@ export default function ProjectPage() {
       await refreshWorkflowData(selected);
       setActionProgress(100);
       setActionMessage(
-        `失败章节重跑完成：成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。`
+        `失败章节重跑完成：成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。${
+          asNumber(data.total_estimated_cost, 0) > 0 ? ` 本次预计消耗 $${asNumber(data.total_estimated_cost, 0).toFixed(4)}。` : ""
+        }`
       );
     } catch (err) {
       setActionProgress(0);
@@ -926,6 +1151,9 @@ export default function ProjectPage() {
         throw new Error(text || "上传失败");
       }
       setUploadFile(null);
+      if (sourceFileInputRef.current) {
+        sourceFileInputRef.current.value = "";
+      }
       await refreshWorkflowData();
       setActionProgress(100);
       setActionMessage("源文件已上传并登记");
@@ -935,6 +1163,26 @@ export default function ProjectPage() {
     } finally {
       setPendingAction(null);
       setBusy(false);
+    }
+  }
+
+  function openSourceFilePicker() {
+    if (busy) return;
+    sourceFileInputRef.current?.click();
+  }
+
+  function handleSourceFileChange(file: File | null) {
+    setUploadFile(file);
+    setError(null);
+    if (file) {
+      setActionMessage(`已选择文件：${file.name}`);
+    }
+  }
+
+  function clearSelectedSourceFile() {
+    setUploadFile(null);
+    if (sourceFileInputRef.current) {
+      sourceFileInputRef.current.value = "";
     }
   }
 
@@ -984,6 +1232,15 @@ export default function ProjectPage() {
             preset_id: stylePresetId,
             custom_style: customStyle,
             custom_directives: customDirectives,
+            director_style: directorStyle,
+            real_light_source_strategy: realLightSourceStrategy,
+            skin_texture_level: skinTextureLevel,
+            shot_distance_profile: shotDistanceProfile,
+            lens_package: lensPackage,
+            camera_movement_style: cameraMovementStyle,
+            first_last_frame_bridge: firstLastFrameBridge,
+            continuity_method: firstLastFrameBridge ? "story_bible + first_last_frame" : "story_bible_only",
+            forbid_readable_text: forbidReadableText,
           },
         }),
       });
@@ -1001,7 +1258,7 @@ export default function ProjectPage() {
 
   async function rebuildStoryBibleReferences() {
     if (!projectId) return;
-    setPendingAction("正在重建 Story Bible 人物/场景参考图...");
+    setPendingAction("正在重建 Story Bible 人物/场景/物品参考图库...");
     setBusy(true);
     setError(null);
     setActionMessage(null);
@@ -1015,10 +1272,41 @@ export default function ProjectPage() {
       }
       await refreshWorkflowData(selected, false);
       setActionProgress(100);
-      setActionMessage("已重建 Story Bible 人物/场景参考图。");
+      setActionMessage("已重建 Story Bible 人物/场景/物品参考图库。");
     } catch (err) {
       setActionProgress(0);
       setError(err instanceof Error ? err.message : "重建 Story Bible 失败");
+    } finally {
+      setPendingAction(null);
+      setBusy(false);
+    }
+  }
+
+  async function regenerateStoryBibleEntity(kind: "characters" | "scenes" | "props", name: string) {
+    if (!projectId) return;
+    const label = kind === "characters" ? "人物" : kind === "scenes" ? "场景" : "道具";
+    setPendingAction(`正在重新生成${label}参考：${name}...`);
+    setBusy(true);
+    setError(null);
+    setActionMessage(null);
+    try {
+      const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/story-bible/regenerate-item`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind, name }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `重新生成${label}参考失败`);
+      }
+      const data = await res.json();
+      setProject(data);
+      await refreshWorkflowData(selected, false);
+      setActionProgress(100);
+      setActionMessage(`已重新生成${label}参考：${name}`);
+    } catch (err) {
+      setActionProgress(0);
+      setError(err instanceof Error ? err.message : `重新生成${label}参考失败`);
     } finally {
       setPendingAction(null);
       setBusy(false);
@@ -1038,12 +1326,17 @@ export default function ProjectPage() {
     setError(null);
     setActionMessage(null);
     try {
+      const mergedParams = {
+        ...asRecord(body.params),
+        ...buildStepParams(),
+      };
       const res = await fetch(`${apiBase}${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...body,
           chapter_id: chapterScopedSteps.has(selected.step_name) ? selectedChapter?.id ?? null : null,
+          params: mergedParams,
         }),
       });
       if (!res.ok) {
@@ -1100,10 +1393,17 @@ export default function ProjectPage() {
     setError(null);
     setActionMessage(null);
     try {
+      const mergedParams = {
+        ...asRecord(body.params),
+        ...buildStepParams({ includeChapterId: false }),
+      };
       const res = await fetch(`${apiBase}${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          ...body,
+          params: mergedParams,
+        }),
       });
       if (!res.ok) {
         const text = await res.text();
@@ -1116,7 +1416,12 @@ export default function ProjectPage() {
       }
       applyBatchChapterStatuses(selected.step_name, data.chapter_results, data.current_step as Step | null);
       setActionProgress(100);
-      setActionMessage(`${successMessage} 成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。`);
+      const batchCost = asNumber(data.total_estimated_cost, 0);
+      setActionMessage(
+        `${successMessage} 成功 ${data.succeeded} 章，失败 ${data.failed} 章，跳过 ${data.skipped} 章。${
+          batchCost > 0 ? ` 本次预计消耗 $${batchCost.toFixed(4)}。` : ""
+        }`
+      );
       if (lightweightApproval) {
         void refreshWorkflowData(selected, false).catch((err) =>
           setError(err instanceof Error ? err.message : "刷新流程数据失败")
@@ -1218,9 +1523,18 @@ export default function ProjectPage() {
 
   useEffect(() => {
     const styleProfile = asRecord(project?.style_profile);
+    const visualStyle = asRecord(asRecord(styleProfile.story_bible).visual_style);
     setStylePresetId(asString(styleProfile.preset_id, "cinematic"));
     setCustomStyle(asString(styleProfile.custom_style, ""));
     setCustomDirectives(asString(styleProfile.custom_directives, ""));
+    setDirectorStyle(asString(visualStyle.director_style, directorStyleOptions[0]));
+    setRealLightSourceStrategy(asString(visualStyle.real_light_source_strategy, realLightSourceOptions[0]));
+    setSkinTextureLevel(asString(visualStyle.skin_texture_level, skinTextureOptions[0]));
+    setShotDistanceProfile(asString(visualStyle.shot_distance_profile, shotDistanceOptions[0]));
+    setLensPackage(asString(visualStyle.lens_package, lensPackageOptions[0]));
+    setCameraMovementStyle(asString(visualStyle.camera_movement_style, cameraMotionOptions[0]));
+    setFirstLastFrameBridge(asBoolean(visualStyle.first_last_frame_bridge, true));
+    setForbidReadableText(asBoolean(visualStyle.forbid_readable_text, true));
   }, [project?.id, project?.updated_at]);
 
   useEffect(() => {
@@ -1259,10 +1573,30 @@ export default function ProjectPage() {
   }, [selected?.id, provider, modelOptions, modelName]);
 
   useEffect(() => {
+    if (selected?.step_name !== "storyboard_image") return;
+    const nextQuality = asString(selectedStoryboardParams.storyboard_quality, "draft");
+    const preset = storyboardQualityOptions.find((item) => item.id === nextQuality) ?? storyboardQualityOptions[0];
+    setStoryboardQuality(preset.id);
+    setStoryboardImageSize(asString(selectedStoryboardParams.size, preset.defaultSize));
+    const nextBudget = asNumber(selectedStoryboardParams.max_total_cost_usd, preset.defaultBudget);
+    setStoryboardBudgetUsd(String(nextBudget));
+  }, [selected?.id, selected?.step_name, selectedChapter?.id, selectedStoryboardParams]);
+
+  useEffect(() => {
     loadStoryboardVersions(selected).catch((err) =>
       setError(err instanceof Error ? err.message : "加载分镜版本失败")
     );
   }, [projectId, selected?.id, selected?.step_name, selectedChapter?.id]);
+
+  useEffect(() => {
+    if (!selected || !chapterScopedSteps.has(selected.step_name) || chapters.length === 0) return;
+    const current = selectedChapterId ? chapters.find((chapter) => chapter.id === selectedChapterId) ?? null : null;
+    if (current && chapterHasRenderableOutput(current, selected.step_name)) return;
+    const preferred = pickPreferredChapter(chapters, selected.step_name, null);
+    if (preferred && preferred.id !== selectedChapterId) {
+      setSelectedChapterId(preferred.id);
+    }
+  }, [chapters, selected?.step_name, selectedChapterId]);
 
   useEffect(() => {
     if (!pendingAction) {
@@ -1282,6 +1616,144 @@ export default function ProjectPage() {
     return () => window.clearInterval(timer);
   }, [pendingAction, actionProgress]);
 
+
+  function renderStoryBibleVariantGrid(variants: StoryBibleAssetView[]) {
+    if (variants.length === 0) return null;
+    return (
+      <div className="storyBibleVariantGrid">
+        {variants.map((variant, index) => {
+          const imageUrl = variant.image_url || variant.thumbnail_url || "";
+          const exportUrl = variant.export_url || imageUrl;
+          return (
+            <article key={`${variant.view_key || variant.view_label}-${index}`} className="storyBibleVariantCard">
+              {imageUrl ? (
+                <img
+                  src={resolveMediaUrl(imageUrl)}
+                  alt={variant.view_label || `参考图 ${index + 1}`}
+                  className="storyBibleVariantPreview"
+                />
+              ) : (
+                <div className="storyBibleVariantPreview framePreviewEmpty">暂无变体</div>
+              )}
+              <div className="storyBibleVariantMeta">
+                <strong>{variant.view_label || variant.view_key || `参考图 ${index + 1}`}</strong>
+                {(variant.provider || variant.model) ? (
+                  <p className="muted" style={{ margin: "6px 0 0" }}>
+                    {clipText(`${variant.provider || ""}${variant.model ? `/${variant.model}` : ""}`.replace(/^\//, ""), 64)}
+                  </p>
+                ) : null}
+              </div>
+              {exportUrl ? (
+                <div className="frameCardFooter">
+                  <a className="downloadLink subtle" href={resolveDownloadUrl(exportUrl)}>
+                    导出该参考图
+                  </a>
+                </div>
+              ) : null}
+            </article>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderStoryBibleEntitySection(
+    title: string,
+    eyebrow: string,
+    items: StoryBibleEntity[],
+    kind: "characters" | "scenes" | "props"
+  ) {
+    if (items.length === 0) return null;
+    return (
+      <div style={{ marginBottom: 16 }}>
+        <p className="eyebrow">{eyebrow}</p>
+        <div className="storyboardGrid">
+          {items.map((item) => {
+            const primaryUrl =
+              kind === "characters"
+                ? item.identity_reference_image_url || item.reference_image_url
+                : kind === "scenes"
+                ? item.scene_reference_image_url || item.reference_image_url
+                : item.prop_reference_image_url || item.reference_image_url;
+            const primaryExportUrl = primaryUrl || "";
+            const variants =
+              kind === "characters"
+                ? item.identity_reference_views
+                : kind === "scenes"
+                ? item.scene_reference_variants
+                : item.prop_reference_views;
+            const variantLabel = kind === "characters" ? "身份四视图" : kind === "scenes" ? "多角度/多光照参考" : "物品多视图";
+            const exportLabel = kind === "characters" ? "导出主参考图" : kind === "scenes" ? "导出主场景图" : "导出主物品图";
+            const variantSummary = variants.length > 0 ? `${variantLabel} · ${variants.length}` : `${variantLabel} · 待重建`;
+            const status = item.reference_generation_status || (variants.length > 0 ? "SUCCEEDED" : "MISSING");
+            const needsAttention = status !== "SUCCEEDED" || variants.length === 0;
+            const description = item.reference_display_description || item.description || item.visual_anchor || "暂无描述";
+            const actionLabel =
+              kind === "characters"
+                ? needsAttention ? "一键重新生成该人物" : "重新生成该人物参考"
+                : kind === "scenes"
+                ? needsAttention ? "一键重新生成该场景" : "重新生成该场景参考"
+                : needsAttention ? "一键重新生成该道具" : "重新生成该道具参考";
+            return (
+              <article key={`${kind}-${item.name}`} className="frameCard">
+                {primaryUrl ? (
+                  <img src={resolveMediaUrl(primaryUrl)} alt={item.name} className="framePreview" />
+                ) : (
+                  <div className="framePreview framePreviewEmpty">暂无参考图</div>
+                )}
+                <div className="frameMeta">
+                  <div className="frameCardHeader" style={{ padding: 0, marginBottom: 10 }}>
+                    <strong>{item.name}</strong>
+                    <span className="pill">{variantSummary}</span>
+                  </div>
+                  <p className="eyebrow" style={{ margin: "4px 0" }}>{title}</p>
+                  <p>{description}</p>
+                  {item.reference_hard_constraints && item.reference_hard_constraints.length > 0 ? (
+                    <p className="muted" style={{ marginBottom: 8 }}>
+                      硬约束：{item.reference_hard_constraints.join(" / ")}
+                    </p>
+                  ) : null}
+                  {needsAttention ? (
+                    <p className="muted" style={{ marginBottom: 8 }}>
+                      当前状态：{status === "MISSING" ? "未生成" : status === "PARTIAL" ? "部分缺失" : status === "FAILED" ? "生成失败" : status}
+                    </p>
+                  ) : null}
+                  {item.reference_generation_error ? (
+                    <p className="muted" style={{ marginBottom: 8 }}>
+                      失败原因：{item.reference_generation_error}
+                    </p>
+                  ) : null}
+                  {variants.length === 0 && primaryUrl ? (
+                    <p className="muted" style={{ marginBottom: 0 }}>
+                      当前项目仍在使用旧版单图参考资产；点击“重建参考图库”后会生成完整多视图资产。
+                    </p>
+                  ) : null}
+                </div>
+                {renderStoryBibleVariantGrid(variants)}
+                {primaryExportUrl ? (
+                  <div className="frameCardFooter">
+                    <a className="downloadLink" href={resolveDownloadUrl(primaryExportUrl)}>
+                      {exportLabel}
+                    </a>
+                    <button onClick={() => regenerateStoryBibleEntity(kind, item.name)} disabled={busy}>
+                      {busy && pendingAction?.includes(item.name) ? "处理中..." : actionLabel}
+                    </button>
+                  </div>
+                ) : (
+                  <div className="frameCardFooter">
+                    <button onClick={() => regenerateStoryBibleEntity(kind, item.name)} disabled={busy}>
+                      {busy && pendingAction?.includes(item.name) ? "处理中..." : actionLabel}
+                    </button>
+                  </div>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
   function renderStoryboardFrameList(frames: Record<string, unknown>[]) {
     if (frames.length === 0) {
       return <p className="muted">当前章节还没有可预览的分镜图。</p>;
@@ -1292,6 +1764,8 @@ export default function ProjectPage() {
           const shotIndex = asNumber(frame.shot_index, index + 1);
           const imageUrl = asString(frame.image_url, asString(frame.thumbnail_url, ""));
           const exportUrl = asString(frame.export_url, imageUrl);
+          const textDetection = asRecord(frame.text_detection);
+          const detectedTokens = asList(textDetection.tokens).map((item) => asString(item, "")).filter(Boolean);
           return (
             <article key={`${shotIndex}-${imageUrl || index}`} className="frameCard">
               <div className="frameCardHeader">
@@ -1314,6 +1788,14 @@ export default function ProjectPage() {
                 <p><strong>画面</strong> {asString(frame.visual, asString(frame.summary, "暂无描述"))}</p>
                 <p><strong>动作</strong> {asString(frame.action, "暂无动作描述")}</p>
                 {asString(frame.dialogue, "") !== "" ? <p><strong>对白</strong> {asString(frame.dialogue, "")}</p> : null}
+                {detectedTokens.length > 0 ? (
+                  <p style={{ color: "#d95f23" }}>
+                    <strong>文字检测</strong> 命中 {detectedTokens.join(", ")}
+                  </p>
+                ) : null}
+                {textDetection.enabled === false ? (
+                  <p className="muted"><strong>文字检测</strong> 当前环境未启用 OCR，仍以提示词硬约束为主。</p>
+                ) : null}
               </div>
               <div className="frameCardFooter">
                 {exportUrl ? (
@@ -1375,6 +1857,12 @@ export default function ProjectPage() {
       return (
         <div className="mediaWorkspace">
           <section className="mediaHeroCard">
+            <div className="card" style={{ marginBottom: 12, padding: 12, background: "rgba(217,95,35,0.08)" }}>
+              <strong>硬约束</strong>
+              <p style={{ margin: "6px 0 0" }}>
+                当前分镜图必须无字幕、无文字、无 Logo、无水印；若 OCR 检出可读文字，将直接判定失败并要求重生。
+              </p>
+            </div>
             <div className="mediaHeroHeader">
               <div>
                 <p className="eyebrow">当前章节分镜总览</p>
@@ -1463,6 +1951,12 @@ export default function ProjectPage() {
       return (
         <div className="mediaWorkspace">
           <section className="mediaHeroCard">
+            <div className="card" style={{ marginBottom: 12, padding: 12, background: "rgba(217,95,35,0.08)" }}>
+              <strong>校核重点</strong>
+              <p style={{ margin: "6px 0 0" }}>
+                除章节内部人物/场景连续性外，分镜校核会继续收口章节边界的首尾帧衔接；不相关的文学辅助章节默认跳过。
+              </p>
+            </div>
             <div className="mediaHeroHeader">
               <div>
                 <p className="eyebrow">章节分镜一致性校核</p>
@@ -1571,6 +2065,18 @@ export default function ProjectPage() {
       return (
         <div className="mediaWorkspace">
           <section className="mediaHeroCard">
+            <div className="card" style={{ marginBottom: 12, padding: 12, background: "rgba(217,95,35,0.08)" }}>
+              <strong>硬约束</strong>
+              <p style={{ margin: "6px 0 0" }}>
+                视频片段必须输出真实运动，而不是静态停留；当前已启用首尾帧桥接提示词，优先约束章节边界连续性。
+              </p>
+            </div>
+            <div className="card" style={{ marginBottom: 12, padding: 12 }}>
+              <strong>章节级生成</strong>
+              <p style={{ margin: "6px 0 0" }}>
+                第 7 步现在按章节生成视频片段。先在左侧选择章节，再点击上方“生成当前章节视频片段”；也可以批量对多个章节生成演示片段。
+              </p>
+            </div>
             <div className="mediaHeroHeader">
               <div>
                 <p className="eyebrow">当前章节视频片段</p>
@@ -1599,10 +2105,39 @@ export default function ProjectPage() {
                 <strong>{asNumber(videoConsistency.score, 0)}</strong>
               </div>
               <div className="metric">
+                <span className="metricLabel">生成模式</span>
+                <strong style={{ fontSize: 16 }}>{asString(selectedArtifact.artifact_mode, "-")}</strong>
+              </div>
+              <div className="metric">
                 <span className="metricLabel">来源模型</span>
                 <strong style={{ fontSize: 16 }}>{selected.model_provider}/{selected.model_name}</strong>
               </div>
+              <div className="metric">
+                <span className="metricLabel">运动校验</span>
+                <strong style={{ fontSize: 16 }}>{asBoolean(motionValidation.passed, false) ? "通过" : "未通过"}</strong>
+              </div>
             </div>
+            {(() => {
+              const continuityPackage = asRecord(selectedArtifact.continuity_package);
+              if (!asBoolean(continuityPackage.enabled, false)) return null;
+              const currentFirst = asRecord(continuityPackage.current_first_frame);
+              const previousLast = asRecord(continuityPackage.previous_last_frame);
+              return (
+                <div className="diffList" style={{ marginTop: 12 }}>
+                  <div className="diffItem">
+                    连续性方法：{asString(continuityPackage.method, "story_bible + first_last_frame")}
+                  </div>
+                  <div className="diffItem">
+                    当前章节首帧：镜头 {asString(currentFirst.shot_index, "-")} · {asString(currentFirst.summary, "暂无摘要")}
+                  </div>
+                  {asString(previousLast.chapter_title, "") ? (
+                    <div className="diffItem">
+                      上一章节末帧：{asString(previousLast.chapter_title)} · 镜头 {asString(previousLast.shot_index, "-")}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })()}
             {Object.keys(dimensions).length > 0 ? (
               <div className="diffList">
                 {Object.entries(dimensions).map(([key, value]) => (
@@ -1610,6 +2145,17 @@ export default function ProjectPage() {
                     {dimensionLabel(key)}: {asString(value)}
                   </div>
                 ))}
+              </div>
+            ) : null}
+            {Object.keys(motionValidation).length > 0 ? (
+              <div className="diffList" style={{ marginTop: 12 }}>
+                <div className="diffItem">平均帧差：{asNumber(motionValidation.mean_frame_delta, 0).toFixed(2)}</div>
+                <div className="diffItem">最大帧差：{asNumber(motionValidation.max_frame_delta, 0).toFixed(2)}</div>
+                <div className="diffItem">采样帧数：{asString(motionValidation.sample_count, "-")}</div>
+                <div className="diffItem">阈值：{asNumber(motionValidation.threshold, 0).toFixed(2)}</div>
+                {!asBoolean(motionValidation.passed, false) ? (
+                  <div className="diffItem">告警：当前片段运动幅度过低，建议重跑视频生成。</div>
+                ) : null}
               </div>
             ) : null}
           </section>
@@ -1627,6 +2173,31 @@ export default function ProjectPage() {
             </div>
             {renderStoryboardFrameList(selectedStoryboardFrames)}
           </section>
+          {segmentClipManifest.length > 0 ? (
+            <section className="card mediaGalleryCard">
+              <div className="mediaSectionHeader">
+                <div>
+                  <p className="eyebrow">镜头片段清单</p>
+                  <h4>章节视频由这些镜头片段组成</h4>
+                </div>
+                <span className="pill">共 {segmentClipManifest.length} 段</span>
+              </div>
+              <div className="diffList">
+                {segmentClipManifest.map((clip, index) => (
+                  <div key={`${asString(clip.shot_index, String(index))}-${index}`} className="diffItem" style={{ display: "grid", gap: 4 }}>
+                    <strong>镜头 {asString(clip.shot_index, String(index + 1))}</strong>
+                    <span>模式：{asString(clip.mode, "-")}</span>
+                    <span>时长：{asString(clip.duration_sec, "-")}s</span>
+                    {asString(clip.motion_directive, "") ? <span>运镜：{asString(clip.motion_directive)}</span> : null}
+                    {asString(clip.fallback_reason, "") ? <span>回退原因：{clipText(asString(clip.fallback_reason), 140)}</span> : null}
+                    {asString(clip.preview_url, "") ? (
+                      <a className="downloadLink subtle" href={resolveDownloadUrl(asString(clip.preview_url))}>导出该镜头片段</a>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
           {renderExecutionStatsBlock()}
         </div>
       );
@@ -1812,13 +2383,54 @@ export default function ProjectPage() {
 
       <section className="card" data-testid="source-documents-section">
         <h3>输入源文件（PDF/TXT）</h3>
-        <div className="row">
+        <input
+          ref={sourceFileInputRef}
+          type="file"
+          accept=".pdf,.txt"
+          onChange={(e) => handleSourceFileChange(e.target.files?.[0] ?? null)}
+          data-testid="source-document-file-input"
+          style={{ display: "none" }}
+        />
+        <div
+          className="uploadPicker"
+          role="button"
+          tabIndex={0}
+          onClick={openSourceFilePicker}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openSourceFilePicker();
+            }
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            handleSourceFileChange(event.dataTransfer.files?.[0] ?? null);
+          }}
+          data-testid="source-document-picker"
+          aria-label="选择或拖入 PDF/TXT 文件"
+        >
+          <strong>{uploadFile ? "已选择源文件" : "选择文件或拖入这里"}</strong>
+          <span className="muted">
+            {uploadFile ? uploadFile.name : "支持 PDF、TXT；点击打开系统文件选择器"}
+          </span>
+        </div>
+        <div className="row" style={{ marginTop: 10 }}>
           <input
-            type="file"
-            accept=".pdf,.txt"
-            onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)}
-            data-testid="source-document-file-input"
+            value={uploadFile?.name ?? ""}
+            readOnly
+            placeholder="尚未选择文件"
+            aria-label="当前选择的源文件"
+            style={{ flex: "1 1 320px" }}
           />
+          <button type="button" onClick={openSourceFilePicker} disabled={busy} data-testid="source-document-open-button">
+            选择文件
+          </button>
+          <button type="button" onClick={clearSelectedSourceFile} disabled={busy || !uploadFile}>
+            清除
+          </button>
           <button onClick={uploadSourceDocument} disabled={busy || !uploadFile} data-testid="source-document-upload-button">
             上传并登记
           </button>
@@ -1888,7 +2500,7 @@ export default function ProjectPage() {
             保存风格设定
           </button>
           <button onClick={rebuildStoryBibleReferences} disabled={busy}>
-            重建人物/场景参考图
+            重建参考图库
           </button>
         </div>
         <textarea
@@ -1905,87 +2517,141 @@ export default function ProjectPage() {
           placeholder="补充风格约束：镜头语言、配色、材质、人物设计、运动节奏"
           style={{ width: "100%", marginTop: 10 }}
         />
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+            gap: 12,
+            marginTop: 12,
+          }}
+        >
+          <label>
+            导演风格
+            <select value={directorStyle} onChange={(e) => setDirectorStyle(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
+              {directorStyleOptions.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            真实光源管理
+            <select
+              value={realLightSourceStrategy}
+              onChange={(e) => setRealLightSourceStrategy(e.target.value)}
+              style={{ width: "100%", marginTop: 6 }}
+            >
+              {realLightSourceOptions.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            肌肤纹理
+            <select value={skinTextureLevel} onChange={(e) => setSkinTextureLevel(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
+              {skinTextureOptions.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            景别策略
+            <select value={shotDistanceProfile} onChange={(e) => setShotDistanceProfile(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
+              {shotDistanceOptions.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            镜头组
+            <select value={lensPackage} onChange={(e) => setLensPackage(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
+              {lensPackageOptions.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            运镜风格
+            <select
+              value={cameraMovementStyle}
+              onChange={(e) => setCameraMovementStyle(e.target.value)}
+              style={{ width: "100%", marginTop: 6 }}
+            >
+              {cameraMotionOptions.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="row" style={{ gap: 20, marginTop: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input
+              type="checkbox"
+              checked={firstLastFrameBridge}
+              onChange={(e) => setFirstLastFrameBridge(e.target.checked)}
+            />
+            启用首尾帧桥接
+          </label>
+          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input
+              type="checkbox"
+              checked={forbidReadableText}
+              onChange={(e) => setForbidReadableText(e.target.checked)}
+            />
+            强制分镜禁字
+          </label>
+        </div>
         <p className="muted" style={{ marginBottom: 0 }}>
-          预设风格会被注入 Story Bible，并自动进入剧本、分镜图、视频生成阶段的提示词。
+          预设风格会被注入 Story Bible，并自动进入剧本、分镜图、视频生成阶段的提示词。当前项目默认启用首尾帧桥接与分镜禁字硬约束。
         </p>
-        {(storyBibleCharacters.length > 0 || storyBibleScenes.length > 0) ? (
+        <div className="card" style={{ marginTop: 12, padding: 12 }}>
+          <p className="eyebrow" style={{ marginTop: 0 }}>当前影视控制摘要</p>
+          <p style={{ marginBottom: 6 }}>导演风格：{asString(storyBibleVisualStyle.director_style, directorStyle)}</p>
+          <p style={{ marginBottom: 6 }}>真实光源管理：{asString(storyBibleVisualStyle.real_light_source_strategy, realLightSourceStrategy)}</p>
+          <p style={{ marginBottom: 6 }}>肌肤纹理：{asString(storyBibleVisualStyle.skin_texture_level, skinTextureLevel)}</p>
+          <p style={{ marginBottom: 6 }}>景别策略：{asString(storyBibleVisualStyle.shot_distance_profile, shotDistanceProfile)}</p>
+          <p style={{ marginBottom: 6 }}>镜头组：{asString(storyBibleVisualStyle.lens_package, lensPackage)}</p>
+          <p style={{ marginBottom: 6 }}>运镜风格：{asString(storyBibleVisualStyle.camera_movement_style, cameraMovementStyle)}</p>
+          <p style={{ marginBottom: 0 }}>
+            连续性方法：{asString(storyBibleVisualStyle.continuity_method, firstLastFrameBridge ? "story_bible + first_last_frame" : "story_bible_only")}
+          </p>
+        </div>
+        {(() => {
+          const safety = asRecord(storyBible.safety_preprocess);
+          const changedCount = asNumber(safety.changed_count, 0);
+          if (!changedCount) return null;
+          return (
+            <div className="card" style={{ marginTop: 12, padding: 12 }}>
+              <p className="eyebrow" style={{ marginTop: 0 }}>Story Bible 前置安全改写</p>
+              <p style={{ marginBottom: 6 }}>{asString(safety.summary, "已执行参考图安全预处理。")}</p>
+              <p className="muted" style={{ marginBottom: 0 }}>
+                已改写 {changedCount} 个参考项，避免人物/场景/物品参考图因敏感视觉表述直接生成失败。
+              </p>
+            </div>
+          );
+        })()}
+        {(storyBibleCharacters.length > 0 || storyBibleScenes.length > 0 || storyBibleProps.length > 0) ? (
           <div style={{ marginTop: 18 }}>
             <div className="mediaSectionHeader">
               <div>
                 <p className="eyebrow">全局锚点</p>
-                <h4>人物身份肖像与场景参考图</h4>
+                <h4>人物身份肖像、场景参考与关键物品图库</h4>
               </div>
             </div>
-            {storyBibleCharacters.length > 0 ? (
-              <div style={{ marginBottom: 16 }}>
-                <p className="eyebrow">角色身份肖像锚点</p>
-                <div className="storyboardGrid">
-                  {storyBibleCharacters.map((item) => (
-                    <article key={`character-${item.name}`} className="frameCard">
-                      {(item.identity_reference_image_url || item.reference_image_url) ? (
-                        <img
-                          src={resolveMediaUrl(item.identity_reference_image_url || item.reference_image_url || "")}
-                          alt={item.name}
-                          className="framePreview"
-                        />
-                      ) : (
-                        <div className="framePreview framePreviewEmpty">暂无参考图</div>
-                      )}
-                      <div className="frameMeta">
-                        <p><strong>{item.name}</strong></p>
-                        <p className="eyebrow" style={{ margin: "4px 0" }}>身份肖像参考</p>
-                        <p>{asString(item.description, item.visual_anchor ?? "暂无描述")}</p>
-                      </div>
-                      {(item.identity_reference_image_url || item.reference_image_url) ? (
-                        <div className="frameCardFooter">
-                          <a
-                            className="downloadLink"
-                            href={resolveDownloadUrl(item.identity_reference_image_url || item.reference_image_url || "")}
-                          >
-                            导出身份肖像参考图
-                          </a>
-                        </div>
-                      ) : null}
-                    </article>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            {storyBibleScenes.length > 0 ? (
-              <div>
-                <p className="eyebrow">场景锚点</p>
-                <div className="storyboardGrid">
-                  {storyBibleScenes.map((item) => (
-                    <article key={`scene-${item.name}`} className="frameCard">
-                      {(item.scene_reference_image_url || item.reference_image_url) ? (
-                        <img
-                          src={resolveMediaUrl(item.scene_reference_image_url || item.reference_image_url || "")}
-                          alt={item.name}
-                          className="framePreview"
-                        />
-                      ) : (
-                        <div className="framePreview framePreviewEmpty">暂无参考图</div>
-                      )}
-                      <div className="frameMeta">
-                        <p><strong>{item.name}</strong></p>
-                        <p className="eyebrow" style={{ margin: "4px 0" }}>场景参考</p>
-                        <p>{asString(item.description, item.visual_anchor ?? "暂无描述")}</p>
-                      </div>
-                      {(item.scene_reference_image_url || item.reference_image_url) ? (
-                        <div className="frameCardFooter">
-                          <a
-                            className="downloadLink"
-                            href={resolveDownloadUrl(item.scene_reference_image_url || item.reference_image_url || "")}
-                          >
-                            导出场景参考图
-                          </a>
-                        </div>
-                      ) : null}
-                    </article>
-                  ))}
-                </div>
-              </div>
-            ) : null}
+            {renderStoryBibleEntitySection("身份肖像参考", "角色身份肖像锚点", storyBibleCharacters, "characters")}
+            {renderStoryBibleEntitySection("场景空间参考", "场景锚点", storyBibleScenes, "scenes")}
+            {renderStoryBibleEntitySection("关键物品参考", "重要物品图库", storyBibleProps, "props")}
           </div>
         ) : null}
       </section>
@@ -2095,7 +2761,13 @@ export default function ProjectPage() {
                   disabled={busy || !selected}
                   data-testid="run-current-step-all-chapters-button"
                 >
-                  {busy && pendingAction?.includes("批量运行") ? "批量运行中..." : "对当前所有章节运行当前阶段"}
+                  {busy && pendingAction?.includes("批量运行")
+                    ? "批量运行中..."
+                    : selected.step_name === "storyboard_image"
+                    ? "对当前所有章节运行当前阶段（按成本设定）"
+                    : selected.step_name === "segment_video"
+                    ? "对当前所有章节生成视频片段"
+                    : "对当前所有章节运行当前阶段"}
                 </button>
               ) : null}
               {selected && chapterScopedSteps.has(selected.step_name) && failedChapterItems.length > 0 ? (
@@ -2104,7 +2776,11 @@ export default function ProjectPage() {
                   disabled={busy || !selected}
                   data-testid="run-current-step-failed-chapters-button"
                 >
-                  {busy && pendingAction?.includes("失败章节") ? "重跑中..." : `对失败章节运行当前阶段（${failedChapterItems.length}）`}
+                  {busy && pendingAction?.includes("失败章节")
+                    ? "重跑中..."
+                    : selected.step_name === "segment_video"
+                    ? `对失败章节重生成视频片段（${failedChapterItems.length}）`
+                    : `对失败章节运行当前阶段（${failedChapterItems.length}）${selected.step_name === "storyboard_image" ? " · 按成本设定" : ""}`}
                 </button>
               ) : null}
               {selected?.step_name === "stitch_subtitle_tts" ? (
@@ -2113,11 +2789,94 @@ export default function ProjectPage() {
                 </button>
               ) : (
                 <button onClick={() => runCurrentStep(true)} disabled={busy || !selected} data-testid="run-current-step-button">
-                  {busy && pendingAction?.includes("正在运行") ? pendingAction : "运行当前阶段"}
+                  {busy && pendingAction?.includes("正在运行")
+                    ? pendingAction
+                    : selected?.step_name === "storyboard_image"
+                    ? "运行当前阶段（按成本设定）"
+                    : selected?.step_name === "segment_video"
+                    ? "生成当前章节视频片段"
+                    : "运行当前阶段"}
                 </button>
               )}
             </div>
           </div>
+          {selected?.step_name === "storyboard_image" ? (
+            <div className="card" style={{ padding: 12, marginBottom: 12 }} data-testid="storyboard-cost-panel">
+              <strong>分镜出图成本控制</strong>
+              <p className="muted" style={{ marginTop: 8, marginBottom: 10 }}>
+                当前默认推荐使用“草稿”模式。批量运行达到预算上限后会自动停止，避免继续烧钱。
+              </p>
+              <div className="modelSelectorStack">
+                <label>
+                  成本模式
+                  <select
+                    className="fullWidthControl"
+                    value={storyboardQuality}
+                    onChange={(e) => {
+                      const nextPreset =
+                        storyboardQualityOptions.find((item) => item.id === e.target.value) ?? storyboardQualityOptions[0];
+                      setStoryboardQuality(nextPreset.id);
+                      setStoryboardImageSize(nextPreset.defaultSize);
+                      setStoryboardBudgetUsd(String(nextPreset.defaultBudget));
+                    }}
+                    disabled={busy}
+                    data-testid="storyboard-quality-select"
+                  >
+                    {storyboardQualityOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}：{option.description}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  输出尺寸
+                  <select
+                    className="fullWidthControl"
+                    value={storyboardImageSize}
+                    onChange={(e) => setStoryboardImageSize(e.target.value)}
+                    disabled={busy}
+                    data-testid="storyboard-size-select"
+                  >
+                    {storyboardImageSizeOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  批量预算上限（美元）
+                  <input
+                    className="fullWidthControl"
+                    type="number"
+                    min="1"
+                    step="0.5"
+                    value={storyboardBudgetUsd}
+                    onChange={(e) => setStoryboardBudgetUsd(e.target.value)}
+                    disabled={busy}
+                    data-testid="storyboard-budget-input"
+                  />
+                </label>
+              </div>
+              <p className="muted modelSelectionHint" style={{ marginTop: 8, marginBottom: 6 }}>
+                当前配置：{storyboardQualityPreset.label} / {storyboardImageSize} / 批量预算 ${asNumber(storyboardBudgetUsd, storyboardQualityPreset.defaultBudget).toFixed(1)}
+              </p>
+              {/(gpt-5-image|gemini-3)/i.test(modelName) ? (
+                <p style={{ color: "#d95f23", margin: 0 }}>
+                  当前模型偏贵。若只是先看剧情和构图，建议改用 `google/gemini-2.5-flash-image`。
+                </p>
+              ) : (
+                <p className="muted" style={{ margin: 0 }}>
+                  {storyboardQualityPreset.id === "draft"
+                    ? "草稿模式会限制为低分辨率、少参考图、单模型 fallback，优先控制成本。"
+                    : storyboardQualityPreset.id === "balanced"
+                    ? "均衡模式会使用 720p 和单模型策略，在画质与成本之间折中。"
+                    : "精修模式会放宽分辨率与 fallback，适合少量精选章节，不适合大批量连跑。"}
+                </p>
+              )}
+            </div>
+          ) : null}
           {selected && chapterScopedSteps.has(selected.step_name) && failedChapterItems.length > 0 ? (
             <div className="card" style={{ padding: 12, marginBottom: 12 }}>
               <strong>当前阶段有 {failedChapterItems.length} 个失败章节</strong>

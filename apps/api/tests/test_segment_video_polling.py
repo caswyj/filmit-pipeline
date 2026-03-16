@@ -54,11 +54,16 @@ def test_segment_video_polling_generates_preview_asset(tmp_path) -> None:
 
         current_step = _run_step(client, pid, "segment_video", chapter_id=client.get(f"/api/v1/projects/{pid}/chapters").json()[0]["id"])
         assert current_step["status"] == "REVIEW_REQUIRED"
-        assert current_step["output_ref"]["polling"]["final_status"] == "completed"
+        artifact = current_step["output_ref"]["artifact"]
+        polling = current_step["output_ref"].get("polling") or {}
+        if polling:
+            assert polling["final_status"] == "completed"
         preview_url = current_step["output_ref"]["artifact"]["preview_url"]
         export_url = current_step["output_ref"]["artifact"]["export_url"]
         assert preview_url.startswith("/api/v1/local-files/")
         assert export_url.startswith("/api/v1/local-files/")
+        assert artifact["artifact_mode"] in {"motion_preview_segment", "real_generated_shot_clips", "hybrid_generated_shot_clips"}
+        assert artifact["motion_validation"]["sample_count"] >= 2
         preview = client.get(preview_url)
         assert preview.status_code == 200
         assert preview.headers["content-type"].startswith("video/mp4")

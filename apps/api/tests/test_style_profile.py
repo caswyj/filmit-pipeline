@@ -30,6 +30,10 @@ def test_style_presets_and_story_bible_are_injected(tmp_path) -> None:
         assert created.status_code == 201
         pid = created.json()["id"]
         assert created.json()["style_profile"]["preset_id"] == "cyberpunk"
+        visual_style = created.json()["style_profile"]["story_bible"]["visual_style"]
+        assert visual_style["director_style"] == "现代商业电影"
+        assert visual_style["forbid_readable_text"] is True
+        assert visual_style["first_last_frame_bridge"] is True
 
         upload = client.post(
             f"/api/v1/projects/{pid}/source-documents",
@@ -42,4 +46,5 @@ def test_style_presets_and_story_bible_are_injected(tmp_path) -> None:
         current_step = run.json()["current_step"]
         assert current_step["input_ref"]["style_profile"]["preset_id"] == "cyberpunk"
         assert current_step["input_ref"]["story_bible"]["visual_style"]["custom_style"] == "废土宗教机械感"
+        assert current_step["input_ref"]["story_bible"]["visual_style"]["director_style"] == "现代商业电影"
         assert "风格圣经约束" in current_step["output_ref"]["prompt"]["style"]

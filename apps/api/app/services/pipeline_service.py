@@ -7,6 +7,7 @@ import io
 import json
 import math
 import re
+import shutil
 import tempfile
 import subprocess
 import textwrap
@@ -56,13 +57,229 @@ LOCAL_CHAPTER_MAX_CHARS = 12_000
 REFERENCE_IMAGE_MAX_EDGE = 640
 REFERENCE_IMAGE_JPEG_QUALITY = 78
 REFERENCE_IMAGE_INLINE_BYTES = 250_000
-STORYBOARD_REFERENCE_IMAGE_LIMIT = 3
+STORYBOARD_REFERENCE_IMAGE_LIMIT = 4
 STORYBOARD_IMAGE_FALLBACK_LIMIT = 3
+STORYBOARD_SHOT_RETRY_LIMIT = 3
+STORYBOARD_TEXT_RETRY_LIMIT = 2
+DEFAULT_STORYBOARD_QUALITY = "draft"
+DEFAULT_STORYBOARD_IMAGE_SIZE = "1024x576"
+DEFAULT_STORYBOARD_BATCH_BUDGET_USD = 5.0
+STORYBOARD_QUALITY_PROFILES = {
+    "draft": {
+        "size": "1024x576",
+        "reference_image_limit": 2,
+        "model_fallback_limit": 1,
+        "shot_retry_limit": 2,
+        "batch_budget_usd": 5.0,
+    },
+    "balanced": {
+        "size": "1280x720",
+        "reference_image_limit": 3,
+        "model_fallback_limit": 1,
+        "shot_retry_limit": 2,
+        "batch_budget_usd": 8.0,
+    },
+    "quality": {
+        "size": "1536x1024",
+        "reference_image_limit": 4,
+        "model_fallback_limit": 2,
+        "shot_retry_limit": 3,
+        "batch_budget_usd": 15.0,
+    },
+}
+STORYBOARD_TEXT_OCR_LANG = "eng+chi_sim"
+STORY_BIBLE_CHARACTER_VIEWS = [
+    ("front", "正面"),
+    ("left", "左侧"),
+    ("right", "右侧"),
+    ("back", "背面"),
+]
+STORY_BIBLE_SCENE_VIEWS = [
+    ("establishing_day", "建立镜-日景"),
+    ("establishing_night", "建立镜-夜景"),
+    ("side_angle_warm", "侧角度-暖光"),
+    ("side_angle_cool", "侧角度-冷光"),
+]
+STORY_BIBLE_PROP_VIEWS = [
+    ("front", "正面"),
+    ("three_quarter", "三分之四角度"),
+    ("side", "侧面"),
+    ("top", "俯视"),
+]
+STORY_BIBLE_REFERENCE_CARD_LIMITS = {
+    "characters": 8,
+    "scenes": 8,
+    "props": 8,
+}
+STORY_BIBLE_CHARACTER_NEUTRAL_WARDROBE = (
+    "统一浅色中性日常服：浅米色、浅灰或浅卡其纯色上衣与长裤，无图案、无配饰、无外套变化；"
+    "同一人物四视图必须保持完全相同的服装颜色与款式，便于后续替换其他服装。"
+)
+STORY_BIBLE_CHARACTER_REFERENCE_HARD_CONSTRAINTS = [
+    "纯白背景",
+    "统一浅色中性日常服",
+    "四视图服装完全一致",
+    "日常静止状态",
+    "不带道具",
+    "不带场景",
+]
+STORY_BIBLE_CHILD_MARKERS = (
+    "婴儿",
+    "婴孩",
+    "幼儿",
+    "幼子",
+    "男童",
+    "女童",
+    "小孩",
+    "孩子",
+    " toddler",
+    " child",
+)
+STORY_BIBLE_TEEN_MARKERS = ("少年", "少女", "teen", "青少年")
+STORY_BIBLE_ELDER_MARKERS = ("老人", "老年", "年迈", "老太太", "老太", "老妇", "老头", "elderly", "senior")
+STORY_BIBLE_TRANSIENT_CHARACTER_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"燕麦粥|鸡蛋|早餐|食物|汤|牛奶|咖啡|茶",
+        r"递给|端着|捂着嘴|尖叫|跑开|吐|模仿学语|边吃边|说脏话|偷笑|照看孩子|情绪转为|发出威胁",
+        r"抹满|沾满|弄得到处都是|购物|开车带",
+    )
+]
+STORY_BIBLE_TRANSIENT_SCENE_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"燕麦粥|鸡蛋|早餐|食物|尸体|血迹|购物袋",
+        r"轻松愉快转为混乱|被.*砸中|逃窜|等待.*回来",
+    )
+]
+STORY_BIBLE_TRANSIENT_PROP_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"被用作|最后|逃窜|共同放飞|乱画|窒息危险|抹得到处都是|吐回碗里",
+    )
+]
+STORY_BIBLE_PROP_EXCLUSION_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"燕麦粥|鸡蛋|早餐|食物|汤|面包|牛奶|咖啡|茶|饮料",
+    )
+]
+STORY_BIBLE_PROP_TO_SCENE_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"港口|城市|小镇|村庄|村落|王国|宫殿|岛上|岛屿|海上|山谷|山洞|树林|森林|墓地|房子|宅子|房间|市场|街道|学校|医院|田地|草场",
+    )
+]
+STORY_BIBLE_SCENE_EXCLUSION_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"轿车|汽车|旅行轿车|卡车|货车|巴士|公交车|火车|自行车|摩托车|三轮车|轮椅|工具包|手提箱|笼子",
+    )
+]
+STORY_BIBLE_CHARACTER_APPEARANCE_HINTS = (
+    "深金黄色头发",
+    "深金黄色",
+    "金发",
+    "黑发",
+    "棕发",
+    "白发",
+    "灰发",
+    "银发",
+    "短发",
+    "长发",
+    "卷发",
+    "灰毛",
+    "黄绿色眼睛",
+    "蓝眼睛",
+    "棕眼睛",
+    "褐色眼睛",
+    "绿眼睛",
+    "瘦削体型",
+    "幼儿体型",
+    "高个子",
+    "高个",
+    "圆脸",
+    "雀斑",
+    "络腮胡",
+    "胡须",
+)
+STORY_BIBLE_CHARACTER_ROLE_HINT_PATTERNS = (
+    r"[\u4e00-\u9fffA-Za-z·]{2,5}的(?:宠物猫|宠物狗|幼子|幼女|儿子|女儿|妻子|丈夫|母亲|父亲|姐姐|哥哥|弟弟|妹妹)",
+    r"(?:年迈|老年|中年|青年|年轻)?(?:邻居|医生|老师|警官|典狱长|老人|少女|少年|男孩|女孩|男童|女童)",
+    r"(?:老太太|老先生|老妇人|老头)",
+    r"(?:宠物猫|家猫|宠物狗|家犬)",
+)
+STORY_BIBLE_FEMALE_MARKERS = (
+    "妻子",
+    "母亲",
+    "妈妈",
+    "女儿",
+    "姐姐",
+    "妹妹",
+    "老太太",
+    "老妇人",
+    "女人",
+    "女性",
+    "女孩",
+    "女童",
+    "她",
+    "她的",
+    "女士",
+    "太太",
+    "小姐",
+    "姑娘",
+    "奶奶",
+    "外婆",
+)
+STORY_BIBLE_MALE_MARKERS = (
+    "丈夫",
+    "父亲",
+    "爸爸",
+    "儿子",
+    "哥哥",
+    "弟弟",
+    "老头",
+    "老人",
+    "男人",
+    "男性",
+    "男孩",
+    "男童",
+    "他",
+    "他的",
+    "先生",
+    "爷爷",
+    "外公",
+)
 CONSISTENCY_REFERENCE_CHARACTER_LIMIT = 3
 CONSISTENCY_REFERENCE_SCENE_LIMIT = 2
 CONSISTENCY_CURRENT_FRAME_LIMIT = 4
 CONSISTENCY_NEIGHBOR_FRAME_LIMIT = 2
 CONSISTENCY_BATCH_CONCURRENCY = 3
+STORY_BIBLE_REFERENCE_SENSITIVE_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"裸体|裸露|赤裸|裸身|nude|nudity|topless|bottomless",
+        r"乳罩|胸罩|bra|lingerie|内衣|内裤|underwear|pant(?:y|ies)",
+        r"半透明|透视|see[- ]?through|sheer",
+        r"血肉模糊|肠子|尸块|断肢|剖开|开膛|剥皮|爆浆|gore|disembowel|mutilat",
+        r"儿童裸露|未成年.*裸|minor.*nude",
+    )
+]
+STORYBOARD_TEXT_TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9'_-]{3,}")
+STORYBOARD_TEXT_IGNORE_TOKENS = {
+    "iii",
+    "ii",
+    "iv",
+    "vi",
+    "vii",
+    "viii",
+    "mm",
+    "ooo",
+    "llll",
+    "www",
+}
+VIDEO_MOTION_SAMPLE_COUNT = 6
+VIDEO_MOTION_MIN_MEAN_DELTA = 3.0
 STORYBOARD_IMAGE_SEXUAL_RISK_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -336,6 +553,7 @@ class PipelineService:
             "succeeded": run_results["succeeded"],
             "failed": run_results["failed"],
             "skipped": run_results["skipped"],
+            "total_estimated_cost": run_results["total_estimated_cost"],
             "chapter_results": run_results["results"],
             "current_step": run_results["last_step"] or current_step,
         }
@@ -385,6 +603,7 @@ class PipelineService:
             "succeeded": run_results["succeeded"],
             "failed": run_results["failed"],
             "skipped": run_results["skipped"],
+            "total_estimated_cost": run_results["total_estimated_cost"],
             "chapter_results": run_results["results"],
             "current_step": run_results["last_step"] or current_step,
         }
@@ -412,6 +631,15 @@ class PipelineService:
         concurrency = self._batch_step_concurrency(step_name)
         eligible_ids = {chapter.id for chapter in eligible_chapters}
         fatal_error = False
+        batch_budget_exhausted = False
+        total_estimated_cost = 0.0
+        storyboard_profile = self._storyboard_quality_profile(params) if step_name == "storyboard_image" else None
+        max_total_cost_usd = self._coerce_positive_float(
+            params.get("max_total_cost_usd"),
+            default=float((storyboard_profile or {}).get("batch_budget_usd") or DEFAULT_STORYBOARD_BATCH_BUDGET_USD)
+            if step_name == "storyboard_image"
+            else None,
+        )
 
         for chapter in chapters:
             title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
@@ -423,6 +651,7 @@ class PipelineService:
                         "chapter_title": title,
                         "status": "SKIPPED",
                         "detail": "该章节属于前置/附录元内容，当前阶段已自动跳过。",
+                        "estimated_cost": 0.0,
                     }
                 )
                 continue
@@ -434,6 +663,7 @@ class PipelineService:
                         "chapter_title": title,
                         "status": "SKIPPED",
                         "detail": "前置阶段尚未通过，已跳过。",
+                        "estimated_cost": 0.0,
                     }
                 )
                 continue
@@ -448,6 +678,7 @@ class PipelineService:
                         "detail": str(skipped_detail_template or "当前状态为 {status}，不是失败章节，已跳过。").format(
                             status=chapter_status
                         ),
+                        "estimated_cost": 0.0,
                     }
                 )
                 continue
@@ -459,6 +690,7 @@ class PipelineService:
                         "chapter_title": title,
                         "status": "SKIPPED",
                         "detail": skipped_detail or "当前章节该阶段已通过，已跳过。",
+                        "estimated_cost": 0.0,
                     }
                 )
                 continue
@@ -470,6 +702,7 @@ class PipelineService:
                         "chapter_title": title,
                         "status": "SKIPPED",
                         "detail": skipped_detail or "当前章节该阶段已通过，已跳过。",
+                        "estimated_cost": 0.0,
                     }
                 )
                 continue
@@ -481,13 +714,26 @@ class PipelineService:
                         "chapter_title": title,
                         "status": "SKIPPED",
                         "detail": fatal_skip_detail,
+                        "estimated_cost": 0.0,
+                    }
+                )
+                continue
+            if batch_budget_exhausted:
+                skipped += 1
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": f"已达到当前批量预算上限 ${max_total_cost_usd:.2f}，剩余章节已停止运行。",
+                        "estimated_cost": 0.0,
                     }
                 )
                 continue
 
         pending_chapters = [chapter for chapter in chapters if chapter.id in eligible_ids]
         for index in range(0, len(pending_chapters), concurrency):
-            if fatal_error:
+            if fatal_error or batch_budget_exhausted:
                 break
             window = pending_chapters[index : index + concurrency]
             task_results = await asyncio.gather(
@@ -514,18 +760,28 @@ class PipelineService:
                         "chapter_title": title,
                         "status": "FAILED",
                         "detail": detail,
+                        "estimated_cost": 0.0,
                     }
                     if self._is_fatal_batch_error(task_result):
                         fatal_error = True
                 else:
                     last_step = self._get_step(project.id, task_result["step_id"])
+                    chapter_cost = self._coerce_positive_float(task_result.get("estimated_cost"), default=0.0) or 0.0
+                    total_estimated_cost += chapter_cost
                     succeeded += 1
                     result_map[chapter.id] = {
                         "chapter_id": chapter.id,
                         "chapter_title": title,
                         "status": task_result["status"],
                         "detail": rerun_detail,
+                        "estimated_cost": round(chapter_cost, 6),
                     }
+                    if (
+                        step_name == "storyboard_image"
+                        and max_total_cost_usd is not None
+                        and total_estimated_cost >= max_total_cost_usd
+                    ):
+                        batch_budget_exhausted = True
             results = [result_map[item.id] for item in chapters if item.id in result_map]
 
         if fatal_error:
@@ -541,6 +797,23 @@ class PipelineService:
                         "chapter_title": title,
                         "status": "SKIPPED",
                         "detail": fatal_skip_detail,
+                        "estimated_cost": 0.0,
+                    }
+                )
+        elif batch_budget_exhausted:
+            executed_ids = {item["chapter_id"] for item in results if item["status"] != "SKIPPED"}
+            for chapter in chapters:
+                if chapter.id in executed_ids or chapter.id not in eligible_ids:
+                    continue
+                title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+                skipped += 1
+                results.append(
+                    {
+                        "chapter_id": chapter.id,
+                        "chapter_title": title,
+                        "status": "SKIPPED",
+                        "detail": f"已达到当前批量预算上限 ${max_total_cost_usd:.2f}，剩余章节已停止运行。",
+                        "estimated_cost": 0.0,
                     }
                 )
 
@@ -549,6 +822,7 @@ class PipelineService:
             "succeeded": succeeded,
             "failed": failed,
             "skipped": skipped,
+            "total_estimated_cost": round(total_estimated_cost, 6),
             "last_step": last_step,
         }
 
@@ -576,7 +850,15 @@ class PipelineService:
                 force=force,
                 params={**params, "chapter_id": chapter_id},
             )
-            return {"chapter_id": chapter_id, "step_id": step.id, "status": step.status}
+            chapter = svc._get_chapter(chapter_id)
+            stage_output = svc._chapter_stage_chain(chapter).get(step_name) or {}
+            execution_stats = (stage_output.get("output") or {}).get("execution_stats") or {}
+            return {
+                "chapter_id": chapter_id,
+                "step_id": step.id,
+                "status": step.status,
+                "estimated_cost": self._coerce_positive_float(execution_stats.get("estimated_cost"), default=0.0) or 0.0,
+            }
         finally:
             db.close()
 
@@ -628,6 +910,10 @@ class PipelineService:
             "succeeded": succeeded,
             "failed": failed,
             "skipped": skipped,
+            "total_estimated_cost": round(
+                sum(self._coerce_positive_float(item.get("estimated_cost"), default=0.0) or 0.0 for item in results),
+                6,
+            ),
             "chapter_results": results,
             "current_step": current_step,
         }
@@ -1124,6 +1410,38 @@ class PipelineService:
             self.db.scalars(select(Asset).where(Asset.project_id == project_id).order_by(Asset.created_at.desc())).all()
         )
 
+    def hydrate_project_story_bible_reference_assets(self, project: Project, *, persist: bool = True) -> Project:
+        style_profile = normalize_style_profile(project.style_profile)
+        story_bible = deepcopy(style_profile.get("story_bible") or {})
+        if not isinstance(story_bible, dict):
+            return project
+
+        changed = False
+        for group in ("characters", "scenes", "props"):
+            items = story_bible.get(group)
+            if not isinstance(items, list):
+                continue
+            hydrated_items: list[dict[str, Any]] = []
+            for raw in items:
+                if not isinstance(raw, dict):
+                    hydrated_items.append(raw)
+                    continue
+                hydrated = self._hydrate_story_bible_reference_item_from_disk(project, group, raw)
+                changed = changed or hydrated != raw
+                hydrated_items.append(hydrated)
+            story_bible[group] = hydrated_items
+
+        if not changed:
+            return project
+
+        style_profile["story_bible"] = story_bible
+        project.style_profile = style_profile
+        self.db.add(project)
+        if persist:
+            self.db.commit()
+            self.db.refresh(project)
+        return project
+
     async def rebuild_story_bible_references(self, project: Project) -> Project:
         chapter_step = self.db.scalar(
             select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == "chapter_chunking")
@@ -1139,6 +1457,50 @@ class PipelineService:
         chapter_step.output_ref = {
             **deepcopy(chapter_step.output_ref or {}),
             "story_bible": refs,
+            "story_bible_rebuilt_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.db.add(chapter_step)
+        self.db.add(project)
+        self.db.commit()
+        self.db.refresh(project)
+        return project
+
+    async def regenerate_story_bible_entity_reference(self, project: Project, *, kind: str, name: str) -> Project:
+        if kind not in {"characters", "scenes", "props"}:
+            raise ValueError("invalid Story Bible entity kind")
+        chapter_step = self.db.scalar(
+            select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == "chapter_chunking")
+        )
+        if not chapter_step:
+            raise ValueError("chapter_chunking step not found")
+        style_profile = normalize_style_profile(project.style_profile)
+        story_bible = deepcopy(style_profile.get("story_bible") or {})
+        items = story_bible.get(kind)
+        if not isinstance(items, list) or not items:
+            raise ValueError("Story Bible references are not ready yet")
+        target_index = next(
+            (
+                index
+                for index, raw in enumerate(items)
+                if isinstance(raw, dict) and str(raw.get("name") or "").strip() == str(name or "").strip()
+            ),
+            None,
+        )
+        if target_index is None:
+            raise ValueError(f"Story Bible item not found: {name}")
+        target = items[target_index]
+        if not isinstance(target, dict):
+            raise ValueError(f"Story Bible item not found: {name}")
+        target = self._canonicalize_story_bible_reference_item(target, kind=kind[:-1] if kind.endswith("s") else kind)
+        target = self._sanitize_story_bible_reference_item(target, kind=kind[:-1] if kind.endswith("s") else kind)
+        await self._render_story_bible_reference_item(project, chapter_step, kind, target, target_index)
+        items[target_index] = target
+        story_bible[kind] = items
+        style_profile["story_bible"] = story_bible
+        project.style_profile = style_profile
+        chapter_step.output_ref = {
+            **deepcopy(chapter_step.output_ref or {}),
+            "story_bible": story_bible,
             "story_bible_rebuilt_at": datetime.now(timezone.utc).isoformat(),
         }
         self.db.add(chapter_step)
@@ -1823,6 +2185,7 @@ class PipelineService:
             artifact.setdefault("preview_url", preview_url)
             artifact["export_url"] = preview_url
             artifact.setdefault("mime_type", "video/mp4")
+            artifact["motion_validation"] = self._analyze_video_motion(Path(storage_key))
             return artifact
 
         preview_url = artifact.get("preview_url")
@@ -1834,12 +2197,30 @@ class PipelineService:
                     artifact.update(remote_asset)
                     artifact["preview_url"] = remote_asset.get("preview_url") or remote_asset.get("export_url")
                     artifact["export_url"] = remote_asset.get("export_url")
+                    artifact["motion_validation"] = self._analyze_video_motion(remote_path)
                     return artifact
 
         frame_paths = self._collect_storyboard_frame_paths_for_chapter(chapter)
         if frame_paths:
             output_path = self._generated_project_dir(project.id, step.step_name) / f"{self._chapter_media_prefix(chapter)}-attempt-{step.attempt}.mp4"
-            self._render_storyboard_slideshow(project, frame_paths, output_path, duration_sec=self._chapter_segment_duration(project, chapter))
+            shots = self._chapter_segment_shots(project, chapter) if chapter is not None else []
+            if shots:
+                _, _ = self._generate_motion_preview_segment_artifact(
+                    project,
+                    step,
+                    chapter,
+                    str(artifact.get("provider") or "local"),
+                    str(artifact.get("model") or "motion-preview"),
+                    str(artifact.get("task_prompt") or ""),
+                    str(artifact.get("style_directive") or ""),
+                    continuity_package=deepcopy(artifact.get("continuity_package") or {}),
+                    shots=shots,
+                    fallback_reason="provider output was not playable; rebuilt as motion preview",
+                )
+                regenerated = self._generated_project_dir(project.id, step.step_name) / f"{self._chapter_media_prefix(chapter)}-attempt-{step.attempt}.mp4"
+                output_path = regenerated if regenerated.exists() else output_path
+            else:
+                self._render_storyboard_slideshow(project, frame_paths, output_path, duration_sec=self._chapter_segment_duration(project, chapter))
             artifact.update(
                 {
                     "summary": str(artifact.get("summary") or "已根据当前章节分镜生成可预览片段。"),
@@ -1847,7 +2228,8 @@ class PipelineService:
                     "storage_key": str(output_path),
                     "preview_url": self._to_local_file_url(output_path),
                     "export_url": self._to_local_file_url(output_path),
-                    "artifact_mode": "chapter_storyboard_preview",
+                    "artifact_mode": "motion_preview_segment" if shots else "chapter_storyboard_preview",
+                    "motion_validation": self._analyze_video_motion(output_path),
                 }
             )
             return artifact
@@ -2057,6 +2439,14 @@ class PipelineService:
         output = deepcopy(stage.get("output") or {})
         artifact = deepcopy(output.get("artifact") or {})
         shots = artifact.get("shots")
+        if self._shot_payloads_need_reparse(shots):
+            parsed = self._build_shot_detail_payload(
+                self._get_project(chapter.project_id),
+                chapter,
+                artifact_text=str(artifact.get("text") or ""),
+            )
+            if parsed.get("shots"):
+                shots = parsed.get("shots")
         if not isinstance(shots, list):
             return []
         project = self._get_project(chapter.project_id)
@@ -2076,6 +2466,7 @@ class PipelineService:
                         "action": str(shot.get("action") or ""),
                         "dialogue": str(shot.get("dialogue") or ""),
                         "characters": list(shot.get("characters") or []) if isinstance(shot.get("characters"), list) else [],
+                        "props": list(shot.get("props") or []) if isinstance(shot.get("props"), list) else [],
                         "scene": str(shot.get("scene") or ""),
                         "scene_hint": str(shot.get("scene_hint") or ""),
                         "continuity_anchor": str(shot.get("continuity_anchor") or ""),
@@ -2103,6 +2494,13 @@ class PipelineService:
                 matching_text,
                 chapter=chapter,
                 limit=3,
+            )
+        if not (enriched.get("props") or []):
+            enriched["props"] = self._extract_shot_entities(
+                story_bible.get("props") if isinstance(story_bible, dict) else [],
+                matching_text,
+                chapter=chapter,
+                limit=2,
             )
         scene_value = str(enriched.get("scene") or "").strip()
         scene_hint = str(enriched.get("scene_hint") or "").strip()
@@ -2141,6 +2539,8 @@ class PipelineService:
                     merged[key] = deepcopy(source_shot[key])
             if not (merged.get("characters") or []):
                 merged["characters"] = list(source_shot.get("characters") or [])
+            if not (merged.get("props") or []):
+                merged["props"] = list(source_shot.get("props") or [])
             if not str(merged.get("scene") or "").strip():
                 merged["scene"] = str(source_shot.get("scene") or "")
             if not str(merged.get("scene_hint") or "").strip():
@@ -2187,6 +2587,7 @@ class PipelineService:
                     "action": str(frame.get("action") or source_shot.get("action") or ""),
                     "dialogue": str(frame.get("dialogue") or source_shot.get("dialogue") or ""),
                     "characters": list(frame.get("characters") or source_shot.get("characters") or []) if isinstance(frame.get("characters") or source_shot.get("characters") or [], list) else [],
+                    "props": list(frame.get("props") or source_shot.get("props") or []) if isinstance(frame.get("props") or source_shot.get("props") or [], list) else [],
                     "scene": str(frame.get("scene") or source_shot.get("scene") or ""),
                     "scene_hint": str(frame.get("scene_hint") or source_shot.get("scene_hint") or ""),
                     "continuity_anchor": str(frame.get("continuity_anchor") or source_shot.get("continuity_anchor") or ""),
@@ -2210,8 +2611,8 @@ class PipelineService:
         return {
             "frame_count": len(frames) if isinstance(frames, list) else 0,
             "frames": deepcopy(frames) if isinstance(frames, list) else [],
-            "contact_sheet_url": artifact.get("thumbnail_url"),
-            "contact_sheet_storage_key": artifact.get("storage_key"),
+            "contact_sheet_url": artifact.get("thumbnail_url") or artifact.get("image_url") or artifact.get("export_url"),
+            "contact_sheet_storage_key": artifact.get("storage_key") or artifact.get("contact_sheet_storage_key"),
             "gallery_export_url": artifact.get("gallery_export_url"),
             "gallery_export_key": artifact.get("gallery_export_key"),
             "cover_image_url": artifact.get("cover_image_url"),
@@ -3184,6 +3585,8 @@ class PipelineService:
                 artifact["preview_url"] = self._to_local_file_url(file_path)
                 artifact["export_url"] = self._to_local_file_url(file_path)
                 artifact["downloaded"] = True
+                if file_path.suffix.lower() == ".mp4":
+                    artifact["motion_validation"] = self._analyze_video_motion(file_path)
                 output["artifact"] = artifact
                 output["polling"]["final_status"] = artifact.get("status")
                 return output
@@ -3960,13 +4363,35 @@ class PipelineService:
         context = self._build_storyboard_consistency_context(project, chapter)
         context["video_artifact"] = deepcopy(output.get("artifact") or {})
         report = score_consistency(context, threshold=max(1, settings.consistency_threshold - 5))
+        artifact = deepcopy(output.get("artifact") or {})
+        motion_validation = deepcopy(artifact.get("motion_validation") or {})
+        motion_score = None
+        if isinstance(motion_validation, dict) and motion_validation:
+            try:
+                mean_delta = float(motion_validation.get("mean_frame_delta") or 0.0)
+            except (TypeError, ValueError):
+                mean_delta = 0.0
+            if motion_validation.get("passed"):
+                motion_score = min(100, max(70, round(mean_delta * 16)))
+            else:
+                motion_score = max(20, round(mean_delta * 10))
+        dimensions = deepcopy(report.dimensions)
+        score = report.score
+        details = deepcopy(report.details)
+        if motion_score is not None:
+            dimensions["motion_dynamicity"] = motion_score
+            score = round((report.score * 4 + motion_score) / 5)
+            details["motion_validation"] = motion_validation
+            if not motion_validation.get("passed"):
+                score = min(score, max(1, settings.consistency_threshold - 6))
+                details["motion_warning"] = "当前视频片段运动幅度过低，更接近静态停留，需要重跑视频生成。"
         return {
             "scope": "chapter_video_clips",
             "chapter_id": chapter.id,
-            "score": report.score,
-            "dimensions": report.dimensions,
+            "score": score,
+            "dimensions": dimensions,
             "threshold": max(1, settings.consistency_threshold - 5),
-            "details": report.details,
+            "details": details,
         }
 
     def _build_storyboard_consistency_context(self, project: Project, chapter: ChapterChunk | None) -> dict[str, Any]:
@@ -4512,8 +4937,9 @@ class PipelineService:
             script_payload = self._build_chapter_script_payload(project, chapter)
             artifact.update(script_payload)
         elif step.step_name == "shot_detailing" and chapter is not None:
-            shot_payload = self._build_shot_detail_payload(project, chapter)
-            artifact.update(shot_payload)
+            shot_payload = self._build_shot_detail_payload(project, chapter, artifact_text=str(artifact.get("text") or ""))
+            if shot_payload.get("shots"):
+                artifact.update(shot_payload)
         elif step.step_name == "stitch_subtitle_tts":
             manifest = self._build_final_cut_segment_manifest(project)
             plan = self._build_final_cut_narration_plan(project, manifest=manifest)
@@ -4541,7 +4967,9 @@ class PipelineService:
         story_bible = deepcopy(style_profile.get("story_bible") or {})
         story_bible["characters"] = story_bible_refs["characters"]
         story_bible["scenes"] = story_bible_refs["scenes"]
+        story_bible["props"] = story_bible_refs.get("props", [])
         story_bible["reference_digest"] = story_bible_refs["reference_digest"]
+        story_bible["safety_preprocess"] = story_bible_refs.get("safety_preprocess", {})
         style_profile["story_bible"] = story_bible
         project.style_profile = style_profile
         self.db.add(project)
@@ -4550,7 +4978,9 @@ class PipelineService:
         artifact["story_bible"] = {
             "characters": story_bible_refs["characters"],
             "scenes": story_bible_refs["scenes"],
+            "props": story_bible_refs.get("props", []),
             "reference_digest": story_bible_refs["reference_digest"],
+            "safety_preprocess": story_bible_refs.get("safety_preprocess", {}),
         }
         output["artifact"] = artifact
         return output
@@ -4572,7 +5002,9 @@ class PipelineService:
         story_bible = deepcopy(style_profile.get("story_bible") or {})
         story_bible["characters"] = story_bible_refs["characters"]
         story_bible["scenes"] = story_bible_refs["scenes"]
+        story_bible["props"] = story_bible_refs.get("props", [])
         story_bible["reference_digest"] = story_bible_refs["reference_digest"]
+        story_bible["safety_preprocess"] = story_bible_refs.get("safety_preprocess", {})
         style_profile["story_bible"] = story_bible
         project.style_profile = style_profile
         self.db.add(project)
@@ -4594,15 +5026,22 @@ class PipelineService:
 
         characters = self._normalize_story_bible_entities(extracted.get("characters"), kind="character")
         scenes = self._normalize_story_bible_entities(extracted.get("scenes"), kind="scene")
-        if not characters and not scenes:
+        props = self._normalize_story_bible_entities(extracted.get("props"), kind="prop")
+        if not characters and not scenes and not props:
             fallback = self._build_local_story_bible_fallback(project, chapters, chapter_digest)
             characters = self._normalize_story_bible_entities(fallback.get("characters"), kind="character")
             scenes = self._normalize_story_bible_entities(fallback.get("scenes"), kind="scene")
+            props = self._normalize_story_bible_entities(fallback.get("props"), kind="prop")
         characters = self._recount_story_bible_occurrences(characters, chapter_digest)
         scenes = self._recount_story_bible_occurrences(scenes, chapter_digest)
+        props = self._recount_story_bible_occurrences(props, chapter_digest)
         characters = self._filter_story_bible_entities_by_occurrence(characters, kind="character", chapter_digest=chapter_digest)
         scenes = self._filter_story_bible_entities_by_occurrence(scenes, kind="scene", chapter_digest=chapter_digest)
-        if not self._story_bible_entities_quality_ok(characters, kind="character") or not self._story_bible_entities_quality_ok(scenes, kind="scene"):
+        props = self._filter_story_bible_entities_by_occurrence(props, kind="prop", chapter_digest=chapter_digest)
+        if (
+            not self._story_bible_entities_quality_ok(characters, kind="character")
+            or not self._story_bible_entities_quality_ok(scenes, kind="scene")
+        ):
             fallback = self._build_local_story_bible_fallback(project, chapters, chapter_digest)
             if not self._story_bible_entities_quality_ok(characters, kind="character"):
                 fallback_characters = self._normalize_story_bible_entities(fallback.get("characters"), kind="character")
@@ -4616,21 +5055,44 @@ class PipelineService:
                     scenes = fallback_scenes
                 else:
                     scenes = []
+            if not props:
+                fallback_props = self._normalize_story_bible_entities(fallback.get("props"), kind="prop")
+                if fallback_props:
+                    props = fallback_props
         characters = self._recount_story_bible_occurrences(characters, chapter_digest)
         scenes = self._recount_story_bible_occurrences(scenes, chapter_digest)
+        props = self._recount_story_bible_occurrences(props, chapter_digest)
         characters = self._filter_story_bible_entities_by_occurrence(characters, kind="character", chapter_digest=chapter_digest)
         scenes = self._filter_story_bible_entities_by_occurrence(scenes, kind="scene", chapter_digest=chapter_digest)
-        if not characters and not scenes:
+        props = self._filter_story_bible_entities_by_occurrence(props, kind="prop", chapter_digest=chapter_digest)
+        characters, scenes, props = self._refine_story_bible_entities_from_source(characters, scenes, props, chapters, chapter_digest)
+        if not characters and not scenes and not props:
             return {}
 
+        characters, scenes, props = self._canonicalize_story_bible_reference_entities(characters, scenes, props)
+        characters, scenes, props, safety_report = self._sanitize_story_bible_reference_entities(characters, scenes, props)
+        prop_changes = [
+            {"kind": "prop", "name": item.get("name"), "reasons": item.get("reference_safety_reasons")}
+            for item in props
+            if isinstance(item, dict) and item.get("reference_safety_reasons")
+        ]
+        if prop_changes:
+            changed_items = list(safety_report.get("changed_items") or [])
+            changed_items.extend(prop_changes[:12])
+            safety_report["changed_items"] = changed_items[:12]
+            safety_report["changed_count"] = int(safety_report.get("changed_count") or 0) + len(prop_changes)
+            safety_report["summary"] = f"已对 {safety_report['changed_count']} 个 Story Bible 参考项执行敏感内容改写。"
+
         try:
-            await self._generate_story_bible_reference_images(project, step, characters, scenes)
+            await self._generate_story_bible_reference_images(project, step, characters, scenes, props)
         except Exception:  # noqa: BLE001
             pass
         return {
             "characters": characters,
             "scenes": scenes,
+            "props": props,
             "reference_digest": chapter_digest[:12],
+            "safety_preprocess": safety_report,
         }
 
     async def _extract_story_bible_entities_with_model(
@@ -4652,14 +5114,18 @@ class PipelineService:
                 "严格返回 JSON 对象，不要返回 markdown，不要解释，不要输出代码块。\n"
                 "JSON 结构必须是："
                 '{"characters":[{"name":"","aliases":[],"description":"","visual_anchor":"","wardrobe_anchor":"","priority":1,"evidence":""}],'
-                '"scenes":[{"name":"","aliases":[],"description":"","visual_anchor":"","mood":"","priority":1,"evidence":""}]}\n'
+                '"scenes":[{"name":"","aliases":[],"description":"","visual_anchor":"","mood":"","priority":1,"evidence":""}],'
+                '"props":[{"name":"","aliases":[],"description":"","visual_anchor":"","material_anchor":"","usage_context":"","priority":1,"evidence":""}]}\n'
                 "要求：\n"
-                "1) name 必须来自章节原文（或 name_candidates），不允许出现未提及的人名/地名。\n"
-                "2) characters 保留本章最关键人物，最多 6 个；scenes 保留本章关键场景，最多 6 个。\n"
+                "1) name 必须来自章节原文（或 name_candidates），不允许出现未提及的人名/地名/物品名。\n"
+                "2) characters 保留本章最关键人物，最多 6 个；scenes 保留本章关键场景，最多 6 个；props 保留跨镜头会反复出现或有剧情功能的重要物品，最多 6 个。\n"
                 "3) aliases 最多 3 个，必须是原文中的同一实体别称。\n"
                 "4) evidence 给出原文中的短语证据（10~30字）。\n"
                 "5) 忽略书名、作者、目录、前言等元信息。\n"
-                "6) description/visual_anchor 要可用于后续分镜一致性控制。"
+                "6) characters 的 description/visual_anchor 必须优先保留稳定身份信息：年龄段、性别线索、亲属或职业关系、发色、体型、显著外貌特征；不要写当前章节的临时动作、食物污渍、台词、情绪爆发、镜头事件。\n"
+                "7) scenes 只保留稳定空间信息：地点类型、建筑/地形结构、材质、光照逻辑；交通工具、可移动载具和可手持物不要放进 scenes。\n"
+                "8) characters 的 wardrobe_anchor 只写中性、可复用、非剧情化服装，不要写本章临时服装或污渍。\n"
+                "9) props 只保留跨镜头会反复出现、适合单独建库的明确物品，不要食物、早餐、一次性消耗品。"
             )
             req = ProviderRequest(
                 step="script",
@@ -4672,7 +5138,7 @@ class PipelineService:
             text = str(response.output.get("text") or response.output.get("summary") or "").strip()
             parsed = self._extract_json_object(text)
             if not isinstance(parsed, dict):
-                return {"characters": [], "scenes": []}
+                return {"characters": [], "scenes": [], "props": []}
             parsed["chapter_ids"] = [chapter_input.get("chapter_id")]
             parsed["chapter_titles"] = [chapter_input.get("title")]
             return parsed
@@ -4686,6 +5152,7 @@ class PipelineService:
         chapter_entities = await asyncio.gather(*(guarded_extract(item) for item in chapter_inputs), return_exceptions=True)
         collected_characters: list[dict[str, Any]] = []
         collected_scenes: list[dict[str, Any]] = []
+        collected_props: list[dict[str, Any]] = []
         for chapter_input, entity_block in zip(chapter_inputs, chapter_entities):
             if isinstance(entity_block, Exception):
                 continue
@@ -4696,6 +5163,7 @@ class PipelineService:
                 candidate["chapter_ids"] = [chapter_input["chapter_id"]]
                 candidate["chapter_titles"] = [chapter_input["title"]]
                 candidate["occurrence_count"] = int(candidate.get("occurrence_count") or 1)
+                candidate["evidence"] = str(candidate.get("evidence") or "").strip()
                 collected_characters.append(candidate)
             for item in entity_block.get("scenes") or []:
                 if not isinstance(item, dict):
@@ -4704,20 +5172,33 @@ class PipelineService:
                 candidate["chapter_ids"] = [chapter_input["chapter_id"]]
                 candidate["chapter_titles"] = [chapter_input["title"]]
                 candidate["occurrence_count"] = int(candidate.get("occurrence_count") or 1)
+                candidate["evidence"] = str(candidate.get("evidence") or "").strip()
                 collected_scenes.append(candidate)
+            for item in entity_block.get("props") or []:
+                if not isinstance(item, dict):
+                    continue
+                candidate = deepcopy(item)
+                candidate["chapter_ids"] = [chapter_input["chapter_id"]]
+                candidate["chapter_titles"] = [chapter_input["title"]]
+                candidate["occurrence_count"] = int(candidate.get("occurrence_count") or 1)
+                candidate["evidence"] = str(candidate.get("evidence") or "").strip()
+                collected_props.append(candidate)
 
         consolidated = await self._consolidate_story_bible_entities_with_model(
             project,
             collected_characters,
             collected_scenes,
+            collected_props,
         )
         if isinstance(consolidated, dict):
             collected_characters = list(consolidated.get("characters") or collected_characters)
             collected_scenes = list(consolidated.get("scenes") or collected_scenes)
+            collected_props = list(consolidated.get("props") or collected_props)
 
         return {
             "characters": self._dedupe_story_bible_entities(collected_characters, kind="character"),
             "scenes": self._dedupe_story_bible_entities(collected_scenes, kind="scene"),
+            "props": self._dedupe_story_bible_entities(collected_props, kind="prop"),
         }
 
     async def _consolidate_story_bible_entities_with_model(
@@ -4725,8 +5206,9 @@ class PipelineService:
         project: Project,
         characters: list[dict[str, Any]],
         scenes: list[dict[str, Any]],
+        props: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        if not characters and not scenes:
+        if not characters and not scenes and not props:
             return None
         provider, model = self._resolve_binding(project, "story_scripting", "script")
         if provider == "local":
@@ -4740,6 +5222,7 @@ class PipelineService:
                 "description": str(item.get("description") or ""),
                 "visual_anchor": str(item.get("visual_anchor") or ""),
                 "wardrobe_anchor": str(item.get("wardrobe_anchor") or ""),
+                "evidence": str(item.get("evidence") or ""),
                 "chapter_ids": list(item.get("chapter_ids") or [])[:8],
                 "chapter_titles": list(item.get("chapter_titles") or [])[:8],
                 "occurrence_count": int(item.get("occurrence_count") or 1),
@@ -4754,6 +5237,7 @@ class PipelineService:
                 "description": str(item.get("description") or ""),
                 "visual_anchor": str(item.get("visual_anchor") or ""),
                 "mood": str(item.get("mood") or ""),
+                "evidence": str(item.get("evidence") or ""),
                 "chapter_ids": list(item.get("chapter_ids") or [])[:8],
                 "chapter_titles": list(item.get("chapter_titles") or [])[:8],
                 "occurrence_count": int(item.get("occurrence_count") or 1),
@@ -4761,7 +5245,23 @@ class PipelineService:
             for item in scenes[:220]
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         ]
-        if not compact_characters and not compact_scenes:
+        compact_props = [
+            {
+                "name": str(item.get("name") or ""),
+                "aliases": list(item.get("aliases") or [])[:4],
+                "description": str(item.get("description") or ""),
+                "visual_anchor": str(item.get("visual_anchor") or ""),
+                "material_anchor": str(item.get("material_anchor") or ""),
+                "usage_context": str(item.get("usage_context") or ""),
+                "evidence": str(item.get("evidence") or ""),
+                "chapter_ids": list(item.get("chapter_ids") or [])[:8],
+                "chapter_titles": list(item.get("chapter_titles") or [])[:8],
+                "occurrence_count": int(item.get("occurrence_count") or 1),
+            }
+            for item in props[:220]
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        if not compact_characters and not compact_scenes and not compact_props:
             return None
 
         prompt = (
@@ -4772,13 +5272,18 @@ class PipelineService:
             '{"characters":[{"name":"","aliases":[],"description":"","visual_anchor":"","wardrobe_anchor":"","priority":1,'
             '"chapter_ids":[],"chapter_titles":[],"occurrence_count":1}],'
             '"scenes":[{"name":"","aliases":[],"description":"","visual_anchor":"","mood":"","priority":1,'
+            '"chapter_ids":[],"chapter_titles":[],"occurrence_count":1}],'
+            '"props":[{"name":"","aliases":[],"description":"","visual_anchor":"","material_anchor":"","usage_context":"","priority":1,'
             '"chapter_ids":[],"chapter_titles":[],"occurrence_count":1}]}\n'
             "规则：\n"
             "1) 将同一实体不同称呼合并（例如昵称/全名/职务称呼）。\n"
             "2) name 使用最可辨识、最稳定的主称呼；aliases 留其余称呼。\n"
-            "3) 角色和场景分别最多保留 8 个，按 occurrence_count 与叙事重要性排序。\n"
+            "3) 角色、场景、物品分别最多保留 8 个，按 occurrence_count 与叙事重要性排序。\n"
             "4) chapter_ids/chapter_titles 保留并集；occurrence_count 使用合并后总出现次数。\n"
-            "5) 删除明显无效实体：书名、作者名、指代词（如“他说”）、元信息短语。"
+            "5) 删除明显无效实体：书名、作者名、指代词（如“他说”）、元信息短语。\n"
+            "6) 最终 description/visual_anchor 必须保留稳定身份信息：年龄段、性别线索、亲属或职业关系、发色、体型等；不得把妻子/母亲写成男性，也不得把儿童写成成年人。\n"
+            "7) 最终 description/visual_anchor 必须是中性、稳定、可长期复用的参考描述，不要食物、剧情动作、脏污、临时情绪和一次性事件。\n"
+            "8) props 只保留具有明确外观特征或材质特征的重要物件，删除食物、早餐、一次性消耗品。"
         )
         req = ProviderRequest(
             step="script",
@@ -4787,6 +5292,7 @@ class PipelineService:
                 "project_name": project.name,
                 "characters": compact_characters,
                 "scenes": compact_scenes,
+                "props": compact_props,
             },
             prompt=prompt,
             params={"temperature": 0.05, "max_tokens": 1800},
@@ -4799,7 +5305,7 @@ class PipelineService:
         parsed = self._extract_json_object(text)
         if not isinstance(parsed, dict):
             return None
-        if not isinstance(parsed.get("characters"), list) and not isinstance(parsed.get("scenes"), list):
+        if not any(isinstance(parsed.get(key), list) for key in ("characters", "scenes", "props")):
             return None
         return parsed
 
@@ -4952,6 +5458,10 @@ class PipelineService:
                 banned_chars = {"的", "了", "我", "你", "他", "她", "它", "这", "那", "有", "没", "不", "又", "都", "和", "在"}
                 if any(char in banned_chars for char in value):
                     return False
+        if kind == "prop":
+            generic_prop_noise = {"东西", "物品", "道具", "某物", "它", "他们", "她们", "一些", "很多", "一切", "全部"}
+            if value in generic_prop_noise:
+                return False
         return True
 
     def _story_bible_entities_quality_ok(self, items: list[dict[str, Any]], *, kind: str) -> bool:
@@ -5125,6 +5635,16 @@ class PipelineService:
             if count:
                 scene_counts[keyword] = count
 
+        prop_keywords = [
+            "猫", "卡车", "汽车", "钥匙", "刀", "枪", "戒指", "照片", "录音机", "录音带", "书", "信", "棺材", "药瓶", "手电筒",
+            "鞋", "项链", "玩具", "镜子", "轮椅", "墓碑", "十字架", "纸条", "盒子",
+        ]
+        prop_counts: dict[str, int] = {}
+        for keyword in prop_keywords:
+            count = source_text.count(keyword)
+            if count:
+                prop_counts[keyword] = count
+
         characters = [
             {
                 "name": name,
@@ -5147,9 +5667,22 @@ class PipelineService:
             for index, (name, count) in enumerate(sorted(scene_counts.items(), key=lambda item: (-item[1], item[0]))[:6])
             if count >= 1
         ]
+        props = [
+            {
+                "name": name,
+                "description": f"{name} 是故事中的关键物品，需要在后续镜头中保持形体、材质和磨损状态一致。",
+                "visual_anchor": f"{name}，独立物品设定图，保持稳定轮廓、材质、尺寸感。",
+                "material_anchor": "保持表面材质、颜色、结构细节和新旧程度一致。",
+                "usage_context": "作为关键道具反复出现，需便于跨镜头 continuity。",
+                "priority": index + 1,
+            }
+            for index, (name, count) in enumerate(sorted(prop_counts.items(), key=lambda item: (-item[1], item[0]))[:6])
+            if count >= 1
+        ]
         return {
             "characters": self._dedupe_story_bible_entities(characters, kind="character"),
             "scenes": self._dedupe_story_bible_entities(scenes, kind="scene"),
+            "props": self._dedupe_story_bible_entities(props, kind="prop"),
         }
 
     def _dedupe_story_bible_entities(self, items: list[dict[str, Any]], *, kind: str) -> list[dict[str, Any]]:
@@ -5182,6 +5715,7 @@ class PipelineService:
                     "aliases": [],
                     "description": str(raw.get("description") or ""),
                     "visual_anchor": str(raw.get("visual_anchor") or raw.get("description") or ""),
+                    "evidence": str(raw.get("evidence") or ""),
                     "priority": int(raw.get("priority") or (len(buckets) + 1)),
                     "chapter_ids": list(dict.fromkeys(raw.get("chapter_ids") or [])),
                     "chapter_titles": list(dict.fromkeys(raw.get("chapter_titles") or [])),
@@ -5202,6 +5736,7 @@ class PipelineService:
             match_bucket["_alias_keys"].update(alias_keys)
             match_bucket["description"] = self._choose_longer_text(match_bucket.get("description"), raw.get("description"))
             match_bucket["visual_anchor"] = self._choose_longer_text(match_bucket.get("visual_anchor"), raw.get("visual_anchor"))
+            match_bucket["evidence"] = self._choose_longer_text(match_bucket.get("evidence"), raw.get("evidence"))
             if kind == "character":
                 match_bucket["wardrobe_anchor"] = self._choose_longer_text(match_bucket.get("wardrobe_anchor"), raw.get("wardrobe_anchor"))
             else:
@@ -5230,6 +5765,7 @@ class PipelineService:
                 "aliases": sorted(alias_list, key=lambda value: (len(value), value), reverse=True)[:6],
                 "description": bucket.get("description") or "",
                 "visual_anchor": bucket.get("visual_anchor") or "",
+                "evidence": bucket.get("evidence") or "",
                 "priority": int(bucket.get("priority") or 999),
                 "chapter_ids": list(dict.fromkeys(bucket.get("chapter_ids") or [])),
                 "chapter_titles": list(dict.fromkeys(bucket.get("chapter_titles") or [])),
@@ -5332,6 +5868,521 @@ class PipelineService:
         right_text = str(right or "").strip()
         return right_text if len(right_text) > len(left_text) else left_text
 
+    def _refine_story_bible_entities_from_source(
+        self,
+        characters: list[dict[str, Any]],
+        scenes: list[dict[str, Any]],
+        props: list[dict[str, Any]],
+        chapters: list[ChapterChunk],
+        chapter_digest: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        cleaned_characters = self._clean_story_bible_character_aliases(characters)
+        refined_characters = [self._refine_story_bible_character_from_source(item, chapters, chapter_digest) for item in cleaned_characters]
+        refined_scenes = [self._refine_story_bible_scene_from_source(item, chapters, chapter_digest) for item in scenes]
+        refined_props = [self._refine_story_bible_prop_from_source(item, chapters, chapter_digest) for item in props]
+        return refined_characters, refined_scenes, refined_props
+
+    def _clean_story_bible_character_aliases(self, characters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        generic_aliases = {"老太太", "老先生", "老人", "医生", "大夫", "母亲", "父亲", "女儿", "儿子", "姐姐", "哥哥", "弟弟", "妹妹"}
+        primary_names: set[str] = set()
+        given_names: set[str] = set()
+        for item in characters:
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            primary_names.add(name)
+            if "·" in name:
+                given_names.add(name.split("·", 1)[0].strip())
+            else:
+                given_names.add(name)
+        cleaned_items: list[dict[str, Any]] = []
+        for raw in characters:
+            item = deepcopy(raw)
+            name = str(item.get("name") or "").strip()
+            own_given = name.split("·", 1)[0].strip() if "·" in name else name
+            surname = name.split("·")[-1].strip() if "·" in name else ""
+            aliases = []
+            for alias in item.get("aliases") or []:
+                value = str(alias or "").strip()
+                if not value or value in generic_aliases:
+                    continue
+                if surname and value == surname:
+                    continue
+                if "·" in name and value != own_given:
+                    continue
+                if value != name and value in primary_names:
+                    continue
+                if value != own_given and value in given_names:
+                    continue
+                aliases.append(value)
+            item["aliases"] = list(dict.fromkeys(aliases))[:6]
+            cleaned_items.append(item)
+        return cleaned_items
+
+    def _refine_story_bible_character_from_source(
+        self,
+        item: dict[str, Any],
+        chapters: list[ChapterChunk],
+        chapter_digest: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        refined = deepcopy(item)
+        if self._story_bible_character_is_animal(refined):
+            return refined
+        evidence_snippets = self._story_bible_entity_evidence_snippets(refined, chapters, chapter_digest)
+        evidence_text = " ".join(evidence_snippets)
+        if evidence_text:
+            refined["evidence"] = self._choose_longer_text(refined.get("evidence"), evidence_text)
+        source_text = "\n".join(self._chapter_body_text(chapter) for chapter in chapters if self._chapter_body_text(chapter))
+        structured_source = " ".join(
+            str(refined.get(field) or "")
+            for field in ("reference_source_excerpt", "description", "visual_anchor")
+        ).strip()
+        structured_profile = self._extract_character_reference_profile(structured_source)
+        raw_profile = self._extract_character_profile_from_source_text(refined, source_text)
+        profile = self._merge_character_profiles(refined, structured_profile, raw_profile)
+        role_hint = str(profile.get("role_hint") or "").strip()
+        age_hint = str(profile.get("age_hint") or "").strip()
+        appearance_hint = str(profile.get("appearance_hint") or "").strip()
+        gender = self._infer_character_gender(
+            " ".join(
+                part
+                for part in (structured_source, evidence_text, refined.get("description"), refined.get("visual_anchor"))
+                if str(part or "").strip()
+            ),
+            role_hint=role_hint,
+            age_hint=age_hint,
+        )
+        age_hint = self._normalize_character_age_hint(age_hint, gender=gender)
+        role_hint = self._normalize_character_role_hint(role_hint, name=str(refined.get("name") or "").strip(), gender=gender)
+        if role_hint in {"女性", "男性"} and age_hint:
+            role_hint = ""
+        description_parts: list[str] = []
+        for part in (role_hint, age_hint, appearance_hint):
+            value = str(part or "").strip()
+            if not value:
+                continue
+            if any(value == existing or value in existing or existing in value for existing in description_parts):
+                continue
+            description_parts.append(value)
+        if description_parts:
+            refined["description"] = "，".join(description_parts[:4])
+        if role_hint or appearance_hint:
+            visual_parts: list[str] = []
+            if role_hint:
+                visual_parts.append(role_hint)
+            if age_hint:
+                visual_parts.append(age_hint)
+            if appearance_hint:
+                visual_parts.append(appearance_hint)
+            refined["visual_anchor"] = "，".join(dict.fromkeys(visual_parts))
+        if gender == "female":
+            refined["gender_hint"] = "female"
+        elif gender == "male":
+            refined["gender_hint"] = "male"
+        identity_source = "；".join(part for part in (role_hint, age_hint, appearance_hint) if str(part or "").strip())
+        if identity_source:
+            refined["reference_source_excerpt"] = identity_source[:240]
+        elif evidence_text:
+            refined["reference_source_excerpt"] = evidence_text[:240]
+        return refined
+
+    def _refine_story_bible_scene_from_source(
+        self,
+        item: dict[str, Any],
+        chapters: list[ChapterChunk],
+        chapter_digest: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        refined = deepcopy(item)
+        evidence_text = self._story_bible_entity_evidence_text(refined, chapters, chapter_digest)
+        if evidence_text:
+            refined["evidence"] = self._choose_longer_text(refined.get("evidence"), evidence_text)
+        cleaned_description = self._strip_story_bible_transient_text(
+            str(refined.get("description") or ""),
+            kind="scene",
+        )
+        cleaned_anchor = self._strip_story_bible_transient_text(
+            str(refined.get("visual_anchor") or ""),
+            kind="scene",
+        )
+        if cleaned_description:
+            refined["description"] = cleaned_description[:220]
+        if cleaned_anchor:
+            refined["visual_anchor"] = cleaned_anchor[:220]
+        return refined
+
+    def _refine_story_bible_prop_from_source(
+        self,
+        item: dict[str, Any],
+        chapters: list[ChapterChunk],
+        chapter_digest: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        refined = deepcopy(item)
+        evidence_text = self._story_bible_entity_evidence_text(refined, chapters, chapter_digest)
+        if evidence_text:
+            refined["evidence"] = self._choose_longer_text(refined.get("evidence"), evidence_text)
+        cleaned_description = self._strip_story_bible_transient_text(
+            str(refined.get("description") or ""),
+            kind="prop",
+        )
+        cleaned_anchor = self._strip_story_bible_transient_text(
+            " ".join(str(refined.get(field) or "") for field in ("visual_anchor", "material_anchor")),
+            kind="prop",
+        )
+        if cleaned_description:
+            refined["description"] = cleaned_description[:220]
+        if cleaned_anchor:
+            refined["visual_anchor"] = cleaned_anchor[:220]
+        return refined
+
+    def _extract_character_profile_from_source_text(self, item: dict[str, Any], source_text: str) -> dict[str, str]:
+        search_terms = self._story_bible_entity_search_terms(item)
+        role_hint = self._extract_character_relation_from_source_text(source_text, search_terms)
+        age_hint, age_bucket = self._extract_character_age_from_source_text(source_text, search_terms, role_hint)
+        appearance_hint = self._extract_character_appearance_from_source_text(source_text, search_terms)
+        return {
+            "role_hint": role_hint,
+            "age_hint": age_hint,
+            "age_bucket": age_bucket,
+            "appearance_hint": appearance_hint,
+        }
+
+    def _merge_character_profiles(
+        self,
+        item: dict[str, Any],
+        structured_profile: dict[str, str],
+        raw_profile: dict[str, str],
+    ) -> dict[str, str]:
+        suspicious_structured = self._character_profile_source_is_suspicious(item)
+        role_hint = str(structured_profile.get("role_hint") or "").strip()
+        age_hint = str(structured_profile.get("age_hint") or "").strip()
+        appearance_hint = str(structured_profile.get("appearance_hint") or "").strip()
+        age_bucket = str(structured_profile.get("age_bucket") or "").strip()
+        if suspicious_structured or not role_hint:
+            role_hint = str(raw_profile.get("role_hint") or role_hint).strip()
+        if suspicious_structured or (not age_hint and not role_hint):
+            age_hint = str(raw_profile.get("age_hint") or age_hint).strip()
+            age_bucket = str(raw_profile.get("age_bucket") or age_bucket).strip()
+        if suspicious_structured or not appearance_hint:
+            appearance_hint = str(raw_profile.get("appearance_hint") or appearance_hint).strip()
+        if role_hint and any(token in role_hint for token in ("妻子", "丈夫", "母亲", "父亲", "医生", "老师", "邻居")):
+            if age_hint in {"男孩", "女孩", "男童", "女童", "幼儿", "婴儿"}:
+                age_hint = ""
+                age_bucket = ""
+        return {
+            "role_hint": role_hint,
+            "age_hint": age_hint,
+            "age_bucket": age_bucket,
+            "appearance_hint": appearance_hint,
+        }
+
+    def _character_profile_source_is_suspicious(self, item: dict[str, Any]) -> bool:
+        name = str(item.get("name") or "").strip()
+        given = name.split("·", 1)[0].strip() if "·" in name else name
+        source = " ".join(str(item.get(field) or "") for field in ("reference_source_excerpt", "description", "aliases")).strip()
+        if not source:
+            return False
+        if given and any(f"{given}的{token}" in source for token in ("丈夫", "妻子", "父亲", "母亲")):
+            return True
+        if any(token in source for token in ("乍得", "克兰道尔")) and "诺尔玛" in given and "诺尔玛" not in source:
+            return True
+        return False
+
+    def _extract_character_profile_from_snippets(self, item: dict[str, Any], snippets: list[str]) -> dict[str, str]:
+        search_terms = self._story_bible_entity_search_terms(item)
+        role_hint = self._extract_character_relation_from_snippets(snippets, search_terms)
+        age_hint, age_bucket = self._extract_character_age_from_snippets(snippets, search_terms, role_hint)
+        source_text = " ".join(snippets)
+        appearance_terms = self._extract_character_reference_appearance_terms(source_text)
+        appearance_hint = "，".join(appearance_terms[:3])
+        return {
+            "role_hint": role_hint,
+            "age_hint": age_hint,
+            "age_bucket": age_bucket,
+            "appearance_hint": appearance_hint,
+        }
+
+    def _extract_character_relation_from_source_text(self, source_text: str, search_terms: list[str]) -> str:
+        candidates: list[str] = []
+        for term in search_terms:
+            for owner, role in re.findall(
+                rf"([\u4e00-\u9fffA-Za-z·]{{2,5}})的(妻子|丈夫|母亲|父亲|姐姐|哥哥|弟弟|妹妹|女儿|儿子|宠物猫|宠物狗)\s*{re.escape(term)}",
+                source_text,
+            ):
+                owner_clean = self._clean_story_bible_relation_owner(owner)
+                if owner_clean:
+                    candidates.append(f"{owner_clean}的{role}")
+            for role in ("妻子", "丈夫", "母亲", "父亲", "姐姐", "哥哥", "弟弟", "妹妹", "女儿", "儿子", "宠物猫", "宠物狗"):
+                if re.search(rf"{role}\s*{re.escape(term)}(?=[，。！？!?\s]|$)", source_text):
+                    candidates.append(role)
+            if re.search(rf"(?:这是我|是我)(妻子|丈夫|母亲|父亲|女儿|儿子)\s*{re.escape(term)}", source_text):
+                role = re.search(rf"(?:这是我|是我)(妻子|丈夫|母亲|父亲|女儿|儿子)\s*{re.escape(term)}", source_text).group(1)
+                candidates.append(role)
+            if re.search(rf"(?:娶了|妻子是)\s*{re.escape(term)}", source_text):
+                candidates.append("妻子")
+            for profession in ("医生", "老师", "警官", "典狱长", "邻居"):
+                if re.search(rf"{re.escape(term)}(?:是|作为|身为)?[^，。！？!\n的]{{0,2}}{profession}", source_text) or re.search(
+                    rf"{profession}(?:是|为)?[^，。！？!\n的]{{0,2}}{re.escape(term)}",
+                    source_text,
+                ):
+                    candidates.append(profession)
+        cleaned: list[str] = []
+        for candidate in candidates:
+            value = self._normalize_character_role_hint(candidate)
+            if not value:
+                continue
+            if any(value == existing or value in existing or existing in value for existing in cleaned):
+                continue
+            cleaned.append(value)
+        return "，".join(cleaned[:2])
+
+    def _extract_character_age_from_source_text(
+        self,
+        source_text: str,
+        search_terms: list[str],
+        role_hint: str = "",
+    ) -> tuple[str, str]:
+        explicit_terms = (
+            "男童",
+            "女童",
+            "男孩",
+            "女孩",
+            "婴儿",
+            "幼儿",
+            "幼子",
+            "幼女",
+            "少女",
+            "少年",
+            "老太太",
+            "老先生",
+            "老妇人",
+            "老头",
+            "老年女性",
+            "老年男性",
+            "中年女性",
+            "中年男性",
+            "中年医生",
+            "年迈邻居",
+            "年迈老人",
+            "老邻居",
+        )
+        for term in search_terms:
+            for explicit in explicit_terms:
+                if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,18}}{explicit}", source_text) or re.search(
+                    rf"{explicit}[^。！？!\n]{{0,8}}{re.escape(term)}",
+                    source_text,
+                ):
+                    return explicit, self._infer_character_age_bucket(explicit)
+            if re.search(rf"(?:小儿子|儿子)\s*{re.escape(term)}", source_text):
+                return "男孩", "child"
+            if re.search(rf"(?:小女儿|女儿|姐姐)\s*{re.escape(term)}", source_text):
+                return "女孩", "child"
+            if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,18}}步入中年", source_text) or re.search(
+                rf"{re.escape(term)}[^。！？!\n]{{0,18}}年近中年",
+                source_text,
+            ):
+                return "中年成人", "adult"
+        if role_hint:
+            return self._extract_character_reference_age_hint(role_hint, role_hint)
+        return "", ""
+
+    def _extract_character_appearance_from_source_text(self, source_text: str, search_terms: list[str]) -> str:
+        appearances: list[str] = []
+        for term in search_terms:
+            for token in STORY_BIBLE_CHARACTER_APPEARANCE_HINTS:
+                if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,18}}{re.escape(token)}", source_text) or re.search(
+                    rf"{re.escape(token)}[^。！？!\n]{{0,8}}{re.escape(term)}",
+                    source_text,
+                ):
+                    if token not in appearances:
+                        appearances.append(token)
+        return "，".join(appearances[:3])
+
+    def _extract_character_relation_from_snippets(self, snippets: list[str], search_terms: list[str]) -> str:
+        relation_words = ("妻子", "丈夫", "母亲", "父亲", "姐姐", "哥哥", "弟弟", "妹妹", "女儿", "儿子", "宠物猫", "宠物狗")
+        profession_words = ("医生", "老师", "警官", "典狱长", "邻居")
+        candidates: list[str] = []
+        for snippet in snippets:
+            text = str(snippet or "")
+            for owner, role in re.findall(r"([\u4e00-\u9fffA-Za-z·]{2,5})的(妻子|丈夫|母亲|父亲|姐姐|哥哥|弟弟|妹妹|女儿|儿子|宠物猫|宠物狗)", text):
+                owner_clean = self._clean_story_bible_relation_owner(owner)
+                if owner_clean:
+                    candidates.append(f"{owner_clean}的{role}")
+            for term in search_terms:
+                for role in relation_words:
+                    if re.search(rf"{role}\s*{re.escape(term)}(?=[，。！？!?\s]|$)", text):
+                        candidates.append(role)
+                if re.search(rf"(?:娶了|妻子是)\s*{re.escape(term)}", text):
+                    candidates.append("妻子")
+                if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,12}}医生", text):
+                    candidates.append("医生")
+                if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,12}}邻居", text):
+                    candidates.append("邻居")
+                if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,12}}宠物猫", text):
+                    candidates.append("宠物猫")
+                if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,12}}宠物狗", text):
+                    candidates.append("宠物狗")
+            for word in profession_words:
+                if word in text:
+                    candidates.append(word)
+        cleaned: list[str] = []
+        for candidate in candidates:
+            value = self._normalize_character_role_hint(candidate)
+            if not value:
+                continue
+            if any(value == existing or value in existing or existing in value for existing in cleaned):
+                continue
+            cleaned.append(value)
+        return "，".join(cleaned[:2])
+
+    def _extract_character_age_from_snippets(
+        self,
+        snippets: list[str],
+        search_terms: list[str],
+        role_hint: str = "",
+    ) -> tuple[str, str]:
+        targeted_patterns = (
+            r"(男童|女童|男孩|女孩|婴儿|幼儿|幼子|幼女|少女|少年|老太太|老先生|老妇人|老头|老年女性|老年男性|中年女性|中年男性|中年医生|年迈邻居|年迈老人|老邻居)",
+            r"(约?[一二三四五六七八九十两0-9]+岁(?:左右)?(?:的)?(?:男童|女童|男孩|女孩|婴儿|幼儿))",
+        )
+        for snippet in snippets:
+            text = str(snippet or "")
+            for term in search_terms:
+                for pattern in targeted_patterns:
+                    match = re.search(rf"{re.escape(term)}[^。！？!\n]{{0,18}}{pattern}", text)
+                    if match:
+                        value = str(match.group(1) or "").strip()
+                        bucket = self._infer_character_age_bucket(value)
+                        return value, bucket
+                    match = re.search(rf"{pattern}[^。！？!\n]{{0,8}}{re.escape(term)}", text)
+                    if match:
+                        value = str(match.group(1) or "").strip()
+                        bucket = self._infer_character_age_bucket(value)
+                        return value, bucket
+                if re.search(rf"(?:儿子|女儿|小儿子|小女儿)\s*{re.escape(term)}", text):
+                    if "女儿" in text or "小女儿" in text:
+                        return "女孩", "child"
+                    return "男孩", "child"
+                if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,18}}中年", text):
+                    return "中年成人", "adult"
+                if re.search(rf"{re.escape(term)}[^。！？!\n]{{0,18}}年迈", text):
+                    return "年迈老人", "elder"
+        if role_hint:
+            return self._extract_character_reference_age_hint(role_hint, role_hint)
+        return "", ""
+
+    def _clean_story_bible_relation_owner(self, owner: str) -> str:
+        value = str(owner or "").strip("，,。；; ")
+        value = re.sub(r"^(?:作为|身为)", "", value).strip()
+        if len(value) < 2 or len(value) > 5:
+            return ""
+        if any(token in value for token in ("和", "以及", "他们", "她们", "孩子", "家人", "大家", "自己")):
+            return ""
+        return value
+
+    def _story_bible_entity_evidence_text(
+        self,
+        item: dict[str, Any],
+        chapters: list[ChapterChunk],
+        chapter_digest: list[dict[str, Any]],
+        *,
+        snippet_limit: int = 8,
+    ) -> str:
+        return " ".join(self._story_bible_entity_evidence_snippets(item, chapters, chapter_digest, snippet_limit=snippet_limit))
+
+    def _story_bible_entity_evidence_snippets(
+        self,
+        item: dict[str, Any],
+        chapters: list[ChapterChunk],
+        chapter_digest: list[dict[str, Any]],
+        *,
+        snippet_limit: int = 8,
+    ) -> list[str]:
+        terms = self._story_bible_entity_search_terms(item)
+        if not terms:
+            return [str(item.get("evidence") or "").strip()] if str(item.get("evidence") or "").strip() else []
+        snippets: list[str] = []
+        for chapter in chapters:
+            body = self._chapter_body_text(chapter)
+            if not body:
+                continue
+            snippets.extend(self._story_bible_text_snippets_for_terms(body, terms, per_term=2))
+        if len(snippets) < snippet_limit:
+            for chapter in chapter_digest:
+                text = f"{chapter.get('summary', '')}\n{chapter.get('context', chapter.get('excerpt', ''))}"
+                if not text:
+                    continue
+                snippets.extend(self._story_bible_text_snippets_for_terms(text, terms, per_term=1))
+        if not snippets and item.get("evidence"):
+            snippets.append(str(item.get("evidence") or "").strip())
+        deduped: list[str] = []
+        for snippet in snippets:
+            value = re.sub(r"\s+", " ", str(snippet or "")).strip("，,。；; ")
+            if not value:
+                continue
+            if any(value == existing or value in existing or existing in value for existing in deduped):
+                continue
+            deduped.append(value)
+        deduped.sort(key=self._story_bible_evidence_snippet_score, reverse=True)
+        return deduped[:snippet_limit]
+
+    def _story_bible_entity_search_terms(self, item: dict[str, Any]) -> list[str]:
+        raw_terms = self._story_bible_aliases(item)
+        primary_name = str(item.get("name") or "").strip()
+        surname_like = primary_name.split("·")[-1].strip() if "·" in primary_name else ""
+        expanded: list[str] = []
+        for term in raw_terms:
+            value = str(term or "").strip()
+            if not value:
+                continue
+            if surname_like and value == surname_like:
+                continue
+            expanded.append(value)
+            if "·" in value:
+                first = value.split("·", 1)[0].strip()
+                if len(first) >= 2:
+                    expanded.append(first)
+            elif " " in value:
+                first = value.split(" ", 1)[0].strip()
+                if len(first) >= 2:
+                    expanded.append(first)
+        result: list[str] = []
+        for term in expanded:
+            if term and term not in result:
+                result.append(term)
+        return result[:6]
+
+    def _story_bible_text_snippets_for_terms(self, text: str, terms: list[str], *, per_term: int = 2) -> list[str]:
+        snippets: list[str] = []
+        source = str(text or "")
+        if not source:
+            return snippets
+        for term in terms:
+            pattern = re.compile(rf"[^。！？!?\n]{{0,42}}{re.escape(term)}[^。！？!?\n]{{0,42}}")
+            count = 0
+            for match in pattern.finditer(source):
+                snippet = str(match.group(0) or "").strip()
+                if not snippet:
+                    continue
+                snippets.append(snippet)
+                count += 1
+                if count >= per_term:
+                    break
+        return snippets
+
+    def _story_bible_evidence_snippet_score(self, snippet: str) -> tuple[int, int]:
+        text = str(snippet or "")
+        markers = (
+            "妻子", "丈夫", "母亲", "父亲", "女儿", "儿子", "姐姐", "哥哥", "弟弟", "妹妹",
+            "医生", "邻居", "宠物猫", "宠物狗", "幼儿", "男童", "女童", "女孩", "男孩",
+            "中年", "老年", "年迈", "老太太", "老先生", "金发", "黑发", "深金黄色头发",
+        )
+        score = sum(
+            2 if marker in {"妻子", "丈夫", "母亲", "父亲", "女儿", "儿子", "医生", "邻居", "幼儿", "老太太"} else 1
+            for marker in markers
+            if marker in text
+        )
+        return score, -len(text)
+
     def _normalize_story_bible_entities(self, items: Any, *, kind: str) -> list[dict[str, Any]]:
         if not isinstance(items, list):
             return []
@@ -5353,6 +6404,7 @@ class PipelineService:
                 "name": name,
                 "description": str(raw.get("description") or raw.get("visual_anchor") or "").strip(),
                 "visual_anchor": str(raw.get("visual_anchor") or raw.get("description") or "").strip(),
+                "evidence": str(raw.get("evidence") or "").strip(),
                 "priority": int(raw.get("priority") or (len(normalized) + 1)),
                 "chapter_ids": list(dict.fromkeys(raw.get("chapter_ids") or [])),
                 "chapter_titles": list(dict.fromkeys(raw.get("chapter_titles") or [])),
@@ -5369,6 +6421,9 @@ class PipelineService:
             }
             if kind == "character":
                 base["wardrobe_anchor"] = str(raw.get("wardrobe_anchor") or "保持服装、发型和年龄感稳定一致。").strip()
+            elif kind == "prop":
+                base["material_anchor"] = str(raw.get("material_anchor") or "保持材质、尺寸、磨损状态和关键结构一致。").strip()
+                base["usage_context"] = str(raw.get("usage_context") or "作为关键剧情道具反复出现。").strip()
             else:
                 base["mood"] = str(raw.get("mood") or "保持空间结构、色调和光线一致。").strip()
             normalized.append(base)
@@ -5376,12 +6431,608 @@ class PipelineService:
                 break
         return normalized
 
+    def _canonicalize_story_bible_reference_entities(
+        self,
+        characters: list[dict[str, Any]],
+        scenes: list[dict[str, Any]],
+        props: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        normalized_props: list[dict[str, Any]] = []
+        filtered_scenes: list[dict[str, Any]] = []
+        for item in scenes:
+            if self._story_bible_scene_should_be_prop(item):
+                normalized_props.append(self._scene_reference_item_to_prop(item))
+                continue
+            if self._story_bible_scene_is_reference_worthy(item):
+                filtered_scenes.append(item)
+        for item in props:
+            if self._story_bible_prop_should_be_scene(item):
+                filtered_scenes.append(self._prop_reference_item_to_scene(item))
+                continue
+            normalized_props.append(item)
+        canonical_characters = [self._canonicalize_story_bible_reference_item(item, kind="character") for item in characters]
+        canonical_scenes = [
+            self._canonicalize_story_bible_reference_item(item, kind="scene")
+            for item in self._dedupe_story_bible_entities(filtered_scenes, kind="scene")
+        ]
+        canonical_props = [
+            self._canonicalize_story_bible_reference_item(item, kind="prop")
+            for item in self._dedupe_story_bible_entities(normalized_props, kind="prop")
+            if self._story_bible_prop_is_reference_worthy(item)
+        ]
+        return canonical_characters[: STORY_BIBLE_REFERENCE_CARD_LIMITS["characters"]], canonical_scenes[: STORY_BIBLE_REFERENCE_CARD_LIMITS["scenes"]], canonical_props[: STORY_BIBLE_REFERENCE_CARD_LIMITS["props"]]
+
+    def _canonicalize_story_bible_reference_item(self, item: dict[str, Any], *, kind: str) -> dict[str, Any]:
+        canonical = deepcopy(item)
+        if kind == "character":
+            canonical.update(self._build_character_reference_identity(canonical))
+        elif kind == "scene":
+            canonical.update(self._build_scene_reference_identity(canonical))
+        else:
+            canonical.update(self._build_prop_reference_identity(canonical))
+        canonical["reference_display_description"] = str(canonical.get("description") or canonical.get("visual_anchor") or "").strip()
+        canonical["reference_hard_constraints"] = self._story_bible_reference_hard_constraints(kind, canonical)
+        return canonical
+
+    def _story_bible_prop_is_reference_worthy(self, item: dict[str, Any]) -> bool:
+        name = str(item.get("name") or "").strip()
+        description = " ".join(
+            str(item.get(field) or "")
+            for field in ("description", "visual_anchor", "material_anchor", "usage_context")
+        ).strip()
+        combined = f"{name} {description}".lower()
+        return not any(pattern.search(combined) for pattern in STORY_BIBLE_PROP_EXCLUSION_PATTERNS)
+
+    def _story_bible_prop_should_be_scene(self, item: dict[str, Any]) -> bool:
+        name = str(item.get("name") or "").strip()
+        description = " ".join(
+            str(item.get(field) or "")
+            for field in ("description", "visual_anchor", "material_anchor", "usage_context")
+        ).strip()
+        combined = f"{name} {description}".lower()
+        return any(pattern.search(combined) for pattern in STORY_BIBLE_PROP_TO_SCENE_PATTERNS)
+
+    def _story_bible_scene_is_reference_worthy(self, item: dict[str, Any]) -> bool:
+        name = str(item.get("name") or "").strip()
+        description = " ".join(str(item.get(field) or "") for field in ("description", "visual_anchor", "mood")).strip()
+        combined = f"{name} {description}".lower()
+        return not any(pattern.search(combined) for pattern in STORY_BIBLE_SCENE_EXCLUSION_PATTERNS)
+
+    def _story_bible_scene_should_be_prop(self, item: dict[str, Any]) -> bool:
+        name = str(item.get("name") or "").strip()
+        description = " ".join(str(item.get(field) or "") for field in ("description", "visual_anchor", "mood")).strip()
+        combined = f"{name} {description}".lower()
+        return any(pattern.search(combined) for pattern in STORY_BIBLE_SCENE_EXCLUSION_PATTERNS)
+
+    def _scene_reference_item_to_prop(self, item: dict[str, Any]) -> dict[str, Any]:
+        name = str(item.get("name") or "").strip()
+        description = " ".join(str(item.get(field) or "") for field in ("description", "visual_anchor")).strip()
+        cleaned = self._strip_story_bible_transient_text(description, kind="prop")
+        return {
+            "name": name,
+            "description": cleaned or f"{name} 的独立物品参考，强调稳定轮廓、材质、尺寸与表面状态。",
+            "visual_anchor": str(item.get("visual_anchor") or item.get("description") or "").strip(),
+            "material_anchor": "保持材质、尺寸、磨损状态和关键结构一致。",
+            "usage_context": "作为关键交通工具或可移动物件，需保持外形、颜色与结构连续。",
+            "priority": int(item.get("priority") or 999),
+            "chapter_ids": list(dict.fromkeys(item.get("chapter_ids") or [])),
+            "chapter_titles": list(dict.fromkeys(item.get("chapter_titles") or [])),
+            "occurrence_count": int(item.get("occurrence_count") or 1),
+            "aliases": list(dict.fromkeys(item.get("aliases") or []))[:6],
+        }
+
+    def _prop_reference_item_to_scene(self, item: dict[str, Any]) -> dict[str, Any]:
+        name = str(item.get("name") or "").strip()
+        description = " ".join(
+            str(item.get(field) or "")
+            for field in ("description", "visual_anchor", "usage_context")
+        ).strip()
+        cleaned = self._strip_story_bible_transient_text(description, kind="scene")
+        return {
+            "name": name,
+            "description": cleaned or f"{name} 的稳定空间参考，强调空间结构、地标关系与主光源方向。",
+            "visual_anchor": str(item.get("visual_anchor") or item.get("description") or "").strip(),
+            "mood": "保持空间结构、材质层次与真实光线连续，不加入一次性剧情动作。",
+            "priority": int(item.get("priority") or 999),
+            "chapter_ids": list(dict.fromkeys(item.get("chapter_ids") or [])),
+            "chapter_titles": list(dict.fromkeys(item.get("chapter_titles") or [])),
+            "occurrence_count": int(item.get("occurrence_count") or 1),
+            "aliases": list(dict.fromkeys(item.get("aliases") or []))[:6],
+        }
+
+    def _story_bible_reference_hard_constraints(self, kind: str, item: dict[str, Any]) -> list[str]:
+        if kind == "character":
+            if self._story_bible_character_is_animal(item):
+                return ["纯白背景", "日常静止状态", "四视图毛色与体型一致", "不带道具", "不带场景"]
+            constraints = list(STORY_BIBLE_CHARACTER_REFERENCE_HARD_CONSTRAINTS)
+            age_bucket = str(item.get("reference_age_bucket") or "").strip()
+            if age_bucket == "child":
+                constraints.append("必须明确呈现幼儿或儿童体型与面部比例，绝不能生成成年人")
+            elif age_bucket == "teen":
+                constraints.append("必须呈现青少年比例与气质，绝不能生成中老年角色")
+            elif age_bucket == "elder":
+                constraints.append("必须保留年迈特征、体态与面部年龄感，绝不能生成青年角色")
+            role_hint = str(item.get("reference_role_hint") or "").strip()
+            if role_hint:
+                constraints.append(f"身份锚点：{role_hint}")
+            appearance_hint = str(item.get("reference_appearance_hint") or "").strip()
+            if appearance_hint:
+                constraints.append(f"外貌锚点：{appearance_hint}")
+            return constraints
+        if kind == "scene":
+            return ["无人物", "稳定空间结构", "多角度参考", "真实光源变化", "不含剧情事件文字"]
+        return ["纯白背景", "仅展示物品本体", "多视角一致", "无手持人物", "无可读文字"]
+
+    def _build_character_reference_identity(self, item: dict[str, Any]) -> dict[str, Any]:
+        source_text = self._story_bible_character_reference_source_text(item)
+        profile = self._extract_character_reference_profile(source_text)
+        clean_trait = str(profile.get("identity_label") or "").strip() or str(item.get("name") or "").strip() or "核心角色"
+        if self._story_bible_character_is_animal(item):
+            description = f"{clean_trait}，日常静止状态参考，保留稳定毛色、体型与眼部特征。"
+            visual_anchor = "身份参考图只保留稳定体型、毛发纹理、头部比例与眼睛特征，不带环境与道具。"
+            wardrobe_anchor = "不穿衣物，不带项圈、挂件和额外配饰。"
+            pose = "中性静立姿态或自然四足站立姿态，不做攻击、奔跑或跳跃动作。"
+        else:
+            description = f"{clean_trait}，日常中性状态参考，保留稳定面部结构、年龄感、体型比例与发型。"
+            visual_anchor = (
+                "身份四视图只保留稳定脸型、五官比例、发型、真实肌肤纹理与体态，不含剧情事件痕迹。"
+                f"重点保留：{profile.get('prompt_identity_anchor') or clean_trait}。"
+            )
+            wardrobe_anchor = STORY_BIBLE_CHARACTER_NEUTRAL_WARDROBE
+            pose = "中性站姿，双臂自然下垂，完整着装，不做进食、奔跑、尖叫、打斗等剧情表演。"
+        return {
+            "description": description,
+            "visual_anchor": visual_anchor,
+            "wardrobe_anchor": wardrobe_anchor,
+            "reference_safe_pose": pose,
+            "reference_safe_background": "纯白背景，无任何场景、字幕、水印和道具。",
+            "reference_source_excerpt": source_text[:240],
+            "reference_identity_anchor": str(profile.get("prompt_identity_anchor") or clean_trait).strip(),
+            "reference_role_hint": str(profile.get("role_hint") or "").strip(),
+            "reference_appearance_hint": str(profile.get("appearance_hint") or "").strip(),
+            "reference_age_bucket": str(profile.get("age_bucket") or "").strip(),
+        }
+
+    def _build_scene_reference_identity(self, item: dict[str, Any]) -> dict[str, Any]:
+        name = str(item.get("name") or "").strip()
+        source_text = " ".join(str(item.get(field) or "") for field in ("description", "visual_anchor", "mood")).strip()
+        stable = self._strip_story_bible_transient_text(source_text, kind="scene")
+        if "客厅" in name:
+            description = "家庭客厅空间，沙发、门窗与主要动线关系稳定，适合作为跨章节连续性参考。"
+        elif "卧室" in name or "房间" in name:
+            description = "室内卧室空间，床、壁橱和主要家具关系稳定，强调真实空间尺度与光源位置。"
+        elif "厨房" in name or "餐桌" in name:
+            description = "家庭餐区空间，桌椅与窗光关系稳定，保留家居尺度与真实日间采光。"
+        elif "公路" in name:
+            description = "公路场景，路面、路肩、路障与车辆通行关系稳定，强调昼夜光源与危险交通氛围。"
+        elif "加油站" in name or "餐厅" in name:
+            description = "公路旁加油站餐厅空间，吧台、座位区和临停区域关系稳定，强调室内实用照明与窗外道路环境。"
+        elif "门廊" in name:
+            description = "住宅门廊空间，座椅、栏杆与面向道路的空间关系稳定，适合作为交流场景连续性参考。"
+        elif any(token in name for token in ("墓地", "公墓")):
+            description = "林间墓地空间，石碑、小路与树线关系稳定，强调压抑但真实的自然光与地形纵深。"
+        elif any(token in name for token in ("田", "草地", "树林", "森林")):
+            description = "开阔自然环境，地形与植被结构稳定，强调真实天空光与场地纵深。"
+        elif "小镇" in name:
+            description = "真实小镇环境，街道、住宅和公共空间关系稳定，适合作为建立镜参考。"
+        else:
+            description = self._compact_story_bible_identity_text(stable, max_segments=2) or f"{name} 的稳定空间参考，强调真实布局、材质与光源逻辑。"
+        visual_anchor = "场景参考图只保留稳定空间结构、材质、主光源方向与机位变化，不加入人物与瞬时事件。"
+        return {
+            "description": description,
+            "visual_anchor": visual_anchor,
+            "mood": "真实空间、稳定结构、允许不同角度与不同光照但不改变核心布局。",
+            "reference_safe_background": "仅表现空间本体与真实光源，不出现人物、字幕和剧情事件。",
+            "reference_source_excerpt": source_text[:240],
+        }
+
+    def _build_prop_reference_identity(self, item: dict[str, Any]) -> dict[str, Any]:
+        name = str(item.get("name") or "").strip()
+        source_text = " ".join(
+            str(item.get(field) or "")
+            for field in ("description", "visual_anchor", "material_anchor", "usage_context")
+        ).strip()
+        stable = self._strip_story_bible_transient_text(source_text, kind="prop")
+        summary_text = "；".join(
+            filter(
+                None,
+                (
+                    self._strip_story_bible_transient_text(str(item.get("reference_source_excerpt") or ""), kind="prop"),
+                    self._strip_story_bible_transient_text(str(item.get("description") or ""), kind="prop"),
+                    self._strip_story_bible_transient_text(str(item.get("visual_anchor") or ""), kind="prop"),
+                    self._strip_story_bible_transient_text(str(item.get("evidence") or ""), kind="prop"),
+                ),
+            )
+        )
+        description = self._compact_story_bible_identity_text(summary_text or stable, max_segments=2) or (
+            f"{name} 的独立物品参考，强调稳定轮廓、材质、尺寸与表面状态。"
+        )
+        visual_anchor = "物品参考图只保留本体形体、材质、磨损和关键结构，不加入手持人物或场景。"
+        return {
+            "description": description,
+            "visual_anchor": visual_anchor,
+            "material_anchor": "保持尺寸比例、表面材质、颜色与磨损状态一致。",
+            "usage_context": "仅作为物品本体参考，不包含一次性剧情动作。",
+            "reference_safe_background": "纯白背景，独立展示物品本体。",
+            "reference_source_excerpt": source_text[:240],
+        }
+
+    def _story_bible_character_reference_source_text(self, item: dict[str, Any]) -> str:
+        source_text = " ".join(
+            str(item.get(field) or "")
+            for field in ("reference_source_excerpt", "description", "visual_anchor", "wardrobe_anchor")
+        ).strip()
+        source_text = re.sub(r"保持[^。；;]{0,40}稳定一致。?", "", source_text)
+        source_text = re.sub(r"\s{2,}", " ", source_text).strip()
+        return source_text
+
+    def _extract_character_reference_profile(self, text: str) -> dict[str, str]:
+        source = self._strip_story_bible_transient_text(str(text or ""), kind="character")
+        source = re.sub(r"保持[^。；;]{0,40}稳定一致。?", "", source)
+        source = re.sub(r"\s{2,}", " ", source).strip("，,。；; ")
+
+        role_hint = self._extract_character_reference_role_hint(source)
+        age_phrase, age_bucket = self._extract_character_reference_age_hint(source, role_hint)
+        appearance_terms = self._extract_character_reference_appearance_terms(source)
+        appearance_hint = "，".join(appearance_terms[:3])
+        identity_parts: list[str] = []
+        for part in (role_hint, age_phrase, appearance_hint):
+            value = str(part or "").strip()
+            if not value:
+                continue
+            if any(value == existing or value in existing or existing in value for existing in identity_parts):
+                continue
+            identity_parts.append(value)
+        identity_label = "，".join(identity_parts[:4])
+        prompt_anchor = "；".join(
+            item for item in (
+                role_hint,
+                age_phrase,
+                appearance_hint,
+            )
+            if str(item or "").strip()
+        )
+        return {
+            "role_hint": role_hint,
+            "age_hint": age_phrase,
+            "appearance_hint": appearance_hint,
+            "age_bucket": age_bucket,
+            "identity_label": identity_label,
+            "prompt_identity_anchor": prompt_anchor or identity_label,
+        }
+
+    def _extract_character_reference_role_hint(self, text: str) -> str:
+        source = str(text or "")
+        matches: list[str] = []
+        for pattern in STORY_BIBLE_CHARACTER_ROLE_HINT_PATTERNS:
+            for match in re.finditer(pattern, source):
+                value = str(match.group(0) or "").strip("，,。；; ")
+                if not value:
+                    continue
+                if any(value == existing or value in existing or existing in value for existing in matches):
+                    continue
+                matches = [existing for existing in matches if existing not in value]
+                if value:
+                    matches.append(value)
+        return "，".join(matches[:2])
+
+    def _extract_character_reference_age_hint(self, text: str, role_hint: str = "") -> tuple[str, str]:
+        source = f"{text} {role_hint}".strip()
+        explicit_patterns = (
+            r"(约?[一二三四五六七八九十两0-9]+岁(?:左右)?(?:的)?(?:男童|女童|男孩|女孩|婴儿|幼儿))",
+            r"((?:男童|女童|男孩|女孩|婴儿|幼儿|幼子|幼女))",
+            r"((?:老年男性|老年女性|中年男性|中年女性|青年男性|青年女性|成年男性|成年女性))",
+            r"((?:年迈邻居|年迈老人|老邻居|中年医生|中年男人|中年女人|老太太|老先生|老妇人|老头))",
+        )
+        for pattern in explicit_patterns:
+            match = re.search(pattern, source)
+            if match:
+                value = str(match.group(1) or "").strip()
+                if value:
+                    bucket = self._infer_character_age_bucket(value)
+                    return value, bucket
+        if any(marker in source for marker in STORY_BIBLE_CHILD_MARKERS):
+            if any(token in source for token in ("女童", "女孩", "幼女")):
+                return "年幼女孩", "child"
+            if any(token in source for token in ("男童", "男孩", "幼子")):
+                return "年幼男童", "child"
+            return "年幼儿童", "child"
+        if "女儿" in source:
+            return "年轻女孩", "child"
+        if "儿子" in source:
+            return "年轻男孩", "child"
+        if any(marker in source for marker in STORY_BIBLE_TEEN_MARKERS):
+            if "少女" in source:
+                return "少女", "teen"
+            if "少年" in source:
+                return "少年", "teen"
+            return "青少年", "teen"
+        if any(marker in source for marker in STORY_BIBLE_ELDER_MARKERS):
+            return "年迈老人", "elder"
+        if "中年" in source:
+            return "中年成人", "adult"
+        return "", ""
+
+    def _infer_character_age_bucket(self, text: str) -> str:
+        if any(marker in text for marker in STORY_BIBLE_CHILD_MARKERS):
+            return "child"
+        if any(marker in text for marker in STORY_BIBLE_TEEN_MARKERS):
+            return "teen"
+        if any(marker in text for marker in STORY_BIBLE_ELDER_MARKERS):
+            return "elder"
+        if "中年" in text or "成年" in text:
+            return "adult"
+        return ""
+
+    def _extract_character_reference_appearance_terms(self, text: str) -> list[str]:
+        source = str(text or "")
+        found: list[str] = []
+        for token in STORY_BIBLE_CHARACTER_APPEARANCE_HINTS:
+            if token not in source:
+                continue
+            if any(token == existing or token in existing or existing in token for existing in found):
+                continue
+            found = [existing for existing in found if existing not in token]
+            if token in source:
+                found.append(token)
+        return found
+
+    def _infer_character_gender(self, text: str, *, role_hint: str = "", age_hint: str = "") -> str:
+        source = " ".join(part for part in (text, role_hint, age_hint) if str(part or "").strip())
+        female_score = sum(
+            3 if marker in {"妻子", "母亲", "女儿", "姐姐", "妹妹", "老太太", "女孩", "女童"} else 1
+            for marker in STORY_BIBLE_FEMALE_MARKERS
+            if marker in source and marker not in {"她", "她的"}
+        )
+        male_score = sum(
+            3 if marker in {"丈夫", "父亲", "儿子", "哥哥", "弟弟", "男孩", "男童"} else 1
+            for marker in STORY_BIBLE_MALE_MARKERS
+            if marker in source and marker not in {"他", "他的"}
+        )
+        if female_score > male_score:
+            return "female"
+        if male_score > female_score:
+            return "male"
+        return ""
+
+    def _normalize_character_age_hint(self, age_hint: str, *, gender: str = "") -> str:
+        value = str(age_hint or "").strip()
+        if not value:
+            return value
+        if gender == "female":
+            value = (
+                value.replace("男童", "女童")
+                .replace("男孩", "女孩")
+                .replace("男性", "女性")
+                .replace("男生", "女生")
+            )
+        elif gender == "male":
+            value = (
+                value.replace("女童", "男童")
+                .replace("女孩", "男孩")
+                .replace("女性", "男性")
+                .replace("女生", "男生")
+            )
+        replacements = {
+            ("female", "年轻女孩"): "女孩",
+            ("male", "年轻男孩"): "男孩",
+            ("female", "年幼女孩"): "女童",
+            ("male", "年幼男童"): "男童",
+            ("female", "年幼儿童"): "女童",
+            ("male", "年幼儿童"): "男童",
+            ("female", "老年成人"): "老年女性",
+            ("male", "老年成人"): "老年男性",
+            ("female", "中年成人"): "中年女性",
+            ("male", "中年成人"): "中年男性",
+        }
+        if (gender, value) in replacements:
+            return replacements[(gender, value)]
+        if gender == "female" and value in {"老太太", "老妇人"}:
+            return "老年女性"
+        if gender == "male" and value in {"老先生", "老头"}:
+            return "老年男性"
+        if gender == "female" and value == "年迈老人":
+            return "老年女性"
+        if gender == "male" and value == "年迈老人":
+            return "老年男性"
+        return value
+
+    def _normalize_character_role_hint(self, role_hint: str, *, name: str = "", gender: str = "") -> str:
+        value = str(role_hint or "").strip("，,。；; ")
+        value = re.sub(r"^(?:作为|身为|她是|他是|是个|是位)", "", value).strip("，,。；; ")
+        if not value:
+            if gender == "female":
+                return "女性"
+            if gender == "male":
+                return "男性"
+            return ""
+        if name:
+            value = value.replace(name, "").strip("，,。；; ")
+        if value.startswith("的"):
+            value = value[1:].strip()
+        if gender == "female":
+            replacements = {
+                "母亲": "母亲",
+                "妻子": "妻子",
+                "女儿": "女儿",
+                "姐姐": "姐姐",
+                "妹妹": "妹妹",
+                "老太太": "老年女性",
+            }
+            return replacements.get(value, value or "女性")
+        if gender == "male":
+            replacements = {
+                "父亲": "父亲",
+                "丈夫": "丈夫",
+                "儿子": "儿子",
+                "哥哥": "哥哥",
+                "弟弟": "弟弟",
+                "老人": "老年男性",
+                "老头": "老年男性",
+            }
+            return replacements.get(value, value or "男性")
+        return value
+
+    def _story_bible_character_is_animal(self, item: dict[str, Any]) -> bool:
+        text = " ".join(str(item.get(field) or "") for field in ("name", "description", "visual_anchor")).lower()
+        return any(token in text for token in ("猫", "狗", "犬", "cat", "dog", "pet"))
+
+    def _compact_story_bible_identity_text(self, text: str, *, max_segments: int = 2) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        value = re.sub(
+            r"\s+(?=(保持尺寸比例|保持材质|作为关键剧情道具|物品参考图|场景参考图|仅作为|真实空间|稳定结构|允许不同角度|不同光照))",
+            "；",
+            value,
+        )
+        parts = re.split(r"[。；;]", value)
+        compact: list[str] = []
+        for part in parts:
+            segment = re.sub(r"\s{2,}", " ", str(part or "")).strip("，,、 ")
+            if not segment:
+                continue
+            if any(
+                token in segment
+                for token in (
+                    "参考图",
+                    "只保留",
+                    "仅作为",
+                    "保持尺寸比例",
+                    "保持材质",
+                    "真实空间",
+                    "稳定结构",
+                    "不同角度",
+                    "不同光照",
+                )
+            ):
+                continue
+            if any(segment == existing or segment in existing or existing in segment for existing in compact):
+                continue
+            compact.append(segment)
+            if len(compact) >= max_segments:
+                break
+        return "，".join(compact)
+
+    def _strip_story_bible_transient_text(self, text: str, *, kind: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return value
+        patterns = (
+            STORY_BIBLE_TRANSIENT_CHARACTER_PATTERNS
+            if kind == "character"
+            else STORY_BIBLE_TRANSIENT_SCENE_PATTERNS
+            if kind == "scene"
+            else STORY_BIBLE_TRANSIENT_PROP_PATTERNS
+        )
+        cleaned = value
+        for pattern in patterns:
+            cleaned = pattern.sub("", cleaned)
+        cleaned = re.sub(r"[，,、；;]\s*[，,、；;]+", "，", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip("，,。；; ")
+        return cleaned
+
+    def _sanitize_story_bible_reference_entities(
+        self,
+        characters: list[dict[str, Any]],
+        scenes: list[dict[str, Any]],
+        props: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        sanitized_characters = [self._sanitize_story_bible_reference_item(item, kind="character") for item in characters]
+        sanitized_scenes = [self._sanitize_story_bible_reference_item(item, kind="scene") for item in scenes]
+        sanitized_props = [self._sanitize_story_bible_reference_item(item, kind="prop") for item in (props or [])]
+        changed_items = [
+            {
+                "kind": kind,
+                "name": item.get("name"),
+                "reasons": item.get("reference_safety_reasons"),
+            }
+            for kind, items in (("character", sanitized_characters), ("scene", sanitized_scenes), ("prop", sanitized_props))
+            for item in items
+            if isinstance(item, dict) and item.get("reference_safety_reasons")
+        ]
+        report = {
+            "changed_count": len(changed_items),
+            "changed_items": changed_items[:12],
+            "summary": (
+                f"已对 {len(changed_items)} 个 Story Bible 参考项执行敏感内容改写。"
+                if changed_items
+                else "未发现需要前置改写的 Story Bible 参考项。"
+            ),
+        }
+        return sanitized_characters, sanitized_scenes, sanitized_props, report
+
+    def _sanitize_story_bible_reference_item(self, item: dict[str, Any], *, kind: str) -> dict[str, Any]:
+        sanitized = deepcopy(item)
+        reasons: list[str] = []
+        for field in ("description", "visual_anchor", "wardrobe_anchor", "mood", "material_anchor", "usage_context"):
+            if field not in sanitized:
+                continue
+            safe_text, field_reasons = self._sanitize_story_bible_reference_text(str(sanitized.get(field) or ""), kind=kind, field=field)
+            if field_reasons:
+                reasons.extend(field_reasons)
+                sanitized[f"reference_safe_{field}"] = safe_text
+            else:
+                sanitized[f"reference_safe_{field}"] = self._strip_story_bible_transient_text(str(sanitized.get(field) or "").strip(), kind=kind)
+        if kind == "character":
+            if self._story_bible_character_is_animal(sanitized):
+                sanitized["reference_safe_pose"] = "中性静立姿态或自然四足站立姿态，不带攻击或奔跑动作。"
+                sanitized["reference_safe_wardrobe_anchor"] = "不穿衣物，不带项圈、帽子和任何附加配饰。"
+            else:
+                sanitized["reference_safe_pose"] = "中性站姿，四肢自然放松，完整着装，不带剧情表演。"
+                sanitized["reference_safe_wardrobe_anchor"] = STORY_BIBLE_CHARACTER_NEUTRAL_WARDROBE
+            sanitized["reference_safe_background"] = "纯白背景，无任何场景元素。"
+        elif kind == "prop":
+            sanitized["reference_safe_background"] = "纯白背景，独立展示物品本体，不出现手持人物或场景。"
+        else:
+            sanitized["reference_safe_background"] = "仅表现空间结构与光源逻辑，不强调血腥、尸体或露骨细节。"
+        sanitized["reference_display_description"] = str(
+            sanitized.get("reference_safe_description")
+            or sanitized.get("description")
+            or sanitized.get("visual_anchor")
+            or ""
+        ).strip()
+        sanitized["reference_safety_reasons"] = sorted(dict.fromkeys(reason for reason in reasons if reason))
+        return sanitized
+
+    def _sanitize_story_bible_reference_text(self, text: str, *, kind: str, field: str) -> tuple[str, list[str]]:
+        value = str(text or "").strip()
+        if not value:
+            return value, []
+        reasons: list[str] = []
+        lowered = value.lower()
+        for pattern in STORY_BIBLE_REFERENCE_SENSITIVE_PATTERNS:
+            if pattern.search(lowered):
+                reasons.append(pattern.pattern)
+        if not reasons:
+            return value, []
+        safe = value
+        replacements = (
+            (r"裸体|裸露|赤裸|裸身|nude|nudity|topless|bottomless", "完整着装、仅保留身份识别特征"),
+            (r"乳罩|胸罩|bra|lingerie|内衣|内裤|underwear|pant(?:y|ies)", "中性日常服装"),
+            (r"半透明|透视|see[- ]?through|sheer", "不透明常规服装材质"),
+            (r"血肉模糊|肠子|尸块|断肢|剖开|开膛|剥皮|爆浆|gore|disembowel|mutilat", "冲突后的压抑氛围，避免显式血腥"),
+            (r"儿童裸露|未成年.*裸|minor.*nude", "儿童安全着装、仅保留身份与关系信息"),
+        )
+        for pattern, replacement in replacements:
+            safe = re.sub(pattern, replacement, safe, flags=re.IGNORECASE)
+        safe = self._strip_story_bible_transient_text(safe, kind=kind)
+        safe = re.sub(r"\s{2,}", " ", safe).strip(" ,，。；;")
+        if kind == "character" and field in {"description", "visual_anchor", "wardrobe_anchor"}:
+            safe = f"{safe}；参考图只保留身份特征、发型、年龄感与中性服装。".strip("；")
+        if kind == "scene" and field in {"description", "visual_anchor", "mood"}:
+            safe = f"{safe}；参考图聚焦空间结构、材质与真实光源。".strip("；")
+        if kind == "prop" and field in {"description", "visual_anchor", "material_anchor", "usage_context"}:
+            safe = f"{safe}；参考图只保留物品本体、材质和形体信息。".strip("；")
+        return safe, reasons
+
     async def _generate_story_bible_reference_images(
         self,
         project: Project,
         step: PipelineStep,
         characters: list[dict[str, Any]],
         scenes: list[dict[str, Any]],
+        props: list[dict[str, Any]],
     ) -> None:
         provider, model = self._resolve_binding(project, "storyboard_image", "image")
         if provider == "local":
@@ -5397,12 +7048,38 @@ class PipelineService:
                 return
             model = fallback_models[0]
 
-        async def render_item(category: str, item: dict[str, Any], index: int) -> None:
-            reference_kind = "identity_portrait" if category == "characters" else "scene_board"
-            prompt = self._build_story_bible_reference_prompt(project, category, item, reference_kind=reference_kind)
+        async def render_variant(
+            category: str,
+            item: dict[str, Any],
+            index: int,
+            *,
+            variant_key: str,
+            variant_label: str,
+        ) -> dict[str, Any]:
+            if category == "characters":
+                reference_kind = f"identity-{variant_key}"
+                aspect_ratio = "4:5"
+                size = "1024x1280"
+            elif category == "props":
+                reference_kind = f"prop-{variant_key}"
+                aspect_ratio = "1:1"
+                size = "1024x1024"
+            else:
+                reference_kind = f"scene-{variant_key}"
+                aspect_ratio = "16:9"
+                size = "1536x1024"
+            prompt = self._build_story_bible_reference_prompt(
+                project,
+                category,
+                item,
+                reference_kind=reference_kind,
+                variant_key=variant_key,
+                variant_label=variant_label,
+            )
             request_params = {
-                "aspect_ratio": "4:5" if category == "characters" else "16:9",
-                "size": "1024x1280" if category == "characters" else "1536x1024",
+                "aspect_ratio": aspect_ratio,
+                "size": size,
+                "forbid_readable_text": True,
             }
             _, artifact, _, _ = await self._generate_storyboard_frame_with_fallback(
                 adapter=adapter,
@@ -5417,40 +7094,136 @@ class PipelineService:
                 project,
                 step,
                 category,
-                item["name"],
+                f"{item['name']}-{variant_key}",
                 index + 1,
                 artifact,
                 reference_kind=reference_kind,
             )
-            if category == "characters":
-                item["identity_reference_image_url"] = reference_asset["image_url"]
-                item["identity_reference_storage_key"] = reference_asset["storage_key"]
-                item["identity_reference_provider"] = artifact.get("provider") or provider
-                item["identity_reference_model"] = artifact.get("model") or model
-                item["reference_image_url"] = reference_asset["image_url"]
-                item["reference_storage_key"] = reference_asset["storage_key"]
-                item["reference_provider"] = item["identity_reference_provider"]
-                item["reference_model"] = item["identity_reference_model"]
-            else:
-                item["scene_reference_image_url"] = reference_asset["image_url"]
-                item["scene_reference_storage_key"] = reference_asset["storage_key"]
-                item["scene_reference_provider"] = artifact.get("provider") or provider
-                item["scene_reference_model"] = artifact.get("model") or model
-                item["reference_image_url"] = reference_asset["image_url"]
-                item["reference_storage_key"] = reference_asset["storage_key"]
-                item["reference_provider"] = item["scene_reference_provider"]
-                item["reference_model"] = item["scene_reference_model"]
+            return {
+                "view_key": variant_key,
+                "view_label": variant_label,
+                "provider": artifact.get("provider") or provider,
+                "model": artifact.get("model") or model,
+                **reference_asset,
+            }
 
-        for index, item in enumerate(characters[:4]):
-            try:
-                await render_item("characters", item, index)
-            except Exception:  # noqa: BLE001
-                continue
-        for index, item in enumerate(scenes[:4]):
-            try:
-                await render_item("scenes", item, index)
-            except Exception:  # noqa: BLE001
-                continue
+        async def render_item(category: str, item: dict[str, Any], index: int) -> None:
+            self._reset_story_bible_reference_outputs(item, category)
+            item["reference_generation_status"] = "GENERATING"
+            item["reference_generation_error"] = ""
+            item["reference_variant_expected"] = len(
+                STORY_BIBLE_CHARACTER_VIEWS
+                if category == "characters"
+                else STORY_BIBLE_SCENE_VIEWS
+                if category == "scenes"
+                else STORY_BIBLE_PROP_VIEWS
+            )
+            item["reference_last_generated_at"] = datetime.now(timezone.utc).isoformat()
+            variants = (
+                STORY_BIBLE_CHARACTER_VIEWS
+                if category == "characters"
+                else STORY_BIBLE_SCENE_VIEWS
+                if category == "scenes"
+                else STORY_BIBLE_PROP_VIEWS
+            )
+            rendered_variants: list[dict[str, Any]] = []
+            errors: list[str] = []
+            for variant_key, variant_label in variants:
+                try:
+                    rendered_variants.append(
+                        await render_variant(
+                            category,
+                            item,
+                            index,
+                            variant_key=variant_key,
+                            variant_label=variant_label,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{variant_label}: {str(exc).strip() or 'generation failed'}")
+            if not rendered_variants:
+                item["reference_generation_status"] = "FAILED"
+                item["reference_generation_error"] = "；".join(errors[:4]) or "未能生成任何参考图"
+                item["reference_variant_count"] = 0
+                return
+            primary = rendered_variants[0]
+            if category == "characters":
+                item["identity_reference_views"] = rendered_variants
+                item["identity_reference_image_url"] = primary["image_url"]
+                item["identity_reference_storage_key"] = primary["storage_key"]
+                item["identity_reference_provider"] = primary["provider"]
+                item["identity_reference_model"] = primary["model"]
+            elif category == "scenes":
+                item["scene_reference_variants"] = rendered_variants
+                item["scene_reference_image_url"] = primary["image_url"]
+                item["scene_reference_storage_key"] = primary["storage_key"]
+                item["scene_reference_provider"] = primary["provider"]
+                item["scene_reference_model"] = primary["model"]
+            else:
+                item["prop_reference_views"] = rendered_variants
+                item["prop_reference_image_url"] = primary["image_url"]
+                item["prop_reference_storage_key"] = primary["storage_key"]
+                item["prop_reference_provider"] = primary["provider"]
+                item["prop_reference_model"] = primary["model"]
+            item["reference_image_url"] = primary["image_url"]
+            item["reference_storage_key"] = primary["storage_key"]
+            item["reference_provider"] = primary["provider"]
+            item["reference_model"] = primary["model"]
+            item["reference_variant_count"] = len(rendered_variants)
+            item["reference_generation_status"] = "SUCCEEDED" if len(rendered_variants) == len(variants) else "PARTIAL"
+            item["reference_generation_error"] = "；".join(errors[:4])
+
+        for index, item in enumerate(characters):
+            await render_item("characters", item, index)
+        for index, item in enumerate(scenes):
+            await render_item("scenes", item, index)
+        for index, item in enumerate(props):
+            await render_item("props", item, index)
+
+    async def _render_story_bible_reference_item(
+        self,
+        project: Project,
+        step: PipelineStep,
+        category: str,
+        item: dict[str, Any],
+        index: int,
+    ) -> None:
+        bucket = {
+            "characters": [item],
+            "scenes": [item],
+            "props": [item],
+        }
+        await self._generate_story_bible_reference_images(
+            project,
+            step,
+            bucket["characters"] if category == "characters" else [],
+            bucket["scenes"] if category == "scenes" else [],
+            bucket["props"] if category == "props" else [],
+        )
+
+    def _reset_story_bible_reference_outputs(self, item: dict[str, Any], category: str) -> None:
+        for field in (
+            "reference_image_url",
+            "reference_storage_key",
+            "reference_provider",
+            "reference_model",
+            "identity_reference_image_url",
+            "identity_reference_storage_key",
+            "identity_reference_provider",
+            "identity_reference_model",
+            "scene_reference_image_url",
+            "scene_reference_storage_key",
+            "scene_reference_provider",
+            "scene_reference_model",
+            "prop_reference_image_url",
+            "prop_reference_storage_key",
+            "prop_reference_provider",
+            "prop_reference_model",
+        ):
+            item.pop(field, None)
+        item["identity_reference_views"] = [] if category == "characters" else list(item.get("identity_reference_views") or [])
+        item["scene_reference_variants"] = [] if category == "scenes" else list(item.get("scene_reference_variants") or [])
+        item["prop_reference_views"] = [] if category == "props" else list(item.get("prop_reference_views") or [])
 
     def _build_story_bible_reference_prompt(
         self,
@@ -5459,33 +7232,95 @@ class PipelineService:
         item: dict[str, Any],
         *,
         reference_kind: str,
+        variant_key: str | None = None,
+        variant_label: str | None = None,
     ) -> str:
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
+        safe_description = str(
+            item.get("reference_safe_description")
+            or item.get("description")
+            or item.get("visual_anchor")
+            or ""
+        ).strip()
+        safe_visual_anchor = str(
+            item.get("reference_safe_visual_anchor")
+            or item.get("visual_anchor")
+            or item.get("description")
+            or ""
+        ).strip()
+        source_excerpt = str(item.get("reference_source_excerpt") or "").strip()
+        identity_anchor = str(item.get("reference_identity_anchor") or item.get("reference_role_hint") or "").strip()
         base_lines = [
             f"Project: {project.name}",
             f"Reference type: {reference_kind}",
+            f"Variant: {variant_label or variant_key or reference_kind}",
             f"Name: {item.get('name')}",
-            f"Description: {item.get('description')}",
-            f"Visual anchor: {item.get('visual_anchor')}",
+            f"Description: {safe_description}",
+            f"Visual anchor: {safe_visual_anchor}",
+            f"Identity source evidence: {source_excerpt}",
+            f"Identity anchor: {identity_anchor}",
             f"Base style: {visual_style.get('preset_label') if isinstance(visual_style, dict) else '电影质感'}",
             f"Rendering: {visual_style.get('rendering') if isinstance(visual_style, dict) else '写实电影画面'}",
             f"Lighting: {visual_style.get('lighting') if isinstance(visual_style, dict) else ''}",
+            f"Director style: {visual_style.get('director_style') if isinstance(visual_style, dict) else ''}",
+            f"Real light source strategy: {visual_style.get('real_light_source_strategy') if isinstance(visual_style, dict) else ''}",
+            f"Readable text policy: {'forbidden' if bool(visual_style.get('forbid_readable_text')) else 'avoid'}",
         ]
         if category == "characters":
-            wardrobe_anchor = str(item.get("wardrobe_anchor") or "").strip()
+            wardrobe_anchor = str(item.get("reference_safe_wardrobe_anchor") or item.get("wardrobe_anchor") or "").strip()
+            view_hint = {
+                "front": "full body turnaround, strict front view",
+                "left": "full body turnaround, strict left side profile",
+                "right": "full body turnaround, strict right side profile",
+                "back": "full body turnaround, strict back view",
+            }.get(str(variant_key or "").strip(), "full body turnaround reference")
+            age_bucket = str(item.get("reference_age_bucket") or "").strip()
+            age_rule = ""
+            if age_bucket == "child":
+                age_rule = "Age lock: must read unmistakably as a toddler or young child with child body proportions and child facial structure. Never generate an adult."
+            elif age_bucket == "teen":
+                age_rule = "Age lock: must read as a teenager with adolescent body proportions. Never generate a middle-aged or elderly adult."
+            elif age_bucket == "elder":
+                age_rule = "Age lock: must preserve elderly facial structure, posture and age lines. Never generate a young adult."
             lines = base_lines + [
-                f"Wardrobe anchor: {wardrobe_anchor or 'neutral, timeless, non-scene-specific wardrobe only'}",
-                "Frame: chest-up or waist-up portrait, centered subject, neutral background, no environment storytelling.",
-                "Pose: calm reference pose, looking slightly off-camera or front-facing, no dramatic action.",
-                "Hard constraints: identity portrait only, stable face geometry, stable age impression, stable hairstyle, minimal neutral wardrobe, no props, no scene background, no dramatic lighting gimmicks, no text.",
+                f"Wardrobe anchor: {wardrobe_anchor or STORY_BIBLE_CHARACTER_NEUTRAL_WARDROBE}",
+                f"Frame: {item.get('reference_safe_background') or 'full body reference portrait, centered subject, pure white background, no environment storytelling.'}",
+                f"Pose: {item.get('reference_safe_pose') or 'calm reference pose, front-facing or slight angle, no dramatic action.'}",
+                f"View instruction: {view_hint}",
+                age_rule,
+                "Daily state only: yes. Do not include food, stains, props, dialogue, action beats, emotional climax, or chapter-specific incidents.",
+                "Hard constraints: identity portrait only, stable face geometry, stable age impression, stable hairstyle, plain light-colored everyday clothing kept exactly identical across front/left/right/back views, pure white background, no props, no scene background, no dramatic lighting gimmicks, no readable text, no subtitles, no watermark.",
+            ]
+        elif category == "props":
+            material_anchor = str(item.get("reference_safe_material_anchor") or item.get("material_anchor") or "").strip()
+            usage_context = str(item.get("reference_safe_usage_context") or item.get("usage_context") or "").strip()
+            view_hint = {
+                "front": "front product view",
+                "three_quarter": "three quarter product view",
+                "side": "strict side profile product view",
+                "top": "top-down product view",
+            }.get(str(variant_key or "").strip(), "product reference view")
+            lines = base_lines + [
+                f"Material anchor: {material_anchor or 'preserve material, scale, wear and silhouette'}",
+                f"Usage context: {usage_context}",
+                f"Frame: {item.get('reference_safe_background') or 'isolated object on plain white background.'}",
+                f"View instruction: {view_hint}",
+                "Hard constraints: prop reference only, no character hands, no background set dressing, studio-white background, preserve shape and material identity, no readable text, no subtitles, no watermark.",
             ]
         else:
-            mood = str(item.get("mood") or "").strip()
+            mood = str(item.get("reference_safe_mood") or item.get("mood") or "").strip()
+            view_hint = {
+                "establishing_day": "wide establishing shot, natural day light",
+                "establishing_night": "wide establishing shot, night practical lights",
+                "side_angle_warm": "secondary angle, warm motivated light",
+                "side_angle_cool": "secondary angle, cool motivated light",
+            }.get(str(variant_key or "").strip(), "wide environment board")
             lines = base_lines + [
                 f"Mood: {mood}",
-                "Frame: wide environment board focused on architecture, layout, light, color and atmosphere.",
-                "Hard constraints: scene reference only, no character close-up, no hero pose, emphasize set layout and lighting continuity, no text.",
+                f"Frame: {item.get('reference_safe_background') or 'wide environment board focused on architecture, layout, light, color and atmosphere.'}",
+                f"View instruction: {view_hint}",
+                "Hard constraints: scene reference only, no character close-up, no hero pose, emphasize set layout and lighting continuity, no readable text, no subtitles, no watermark.",
             ]
         return "\n".join(line for line in lines if line and not line.endswith(": "))
 
@@ -5567,13 +7402,20 @@ class PipelineService:
             "summary": f"章节剧本已生成，共 {len(beats)} 个情节点。",
         }
 
-    def _build_shot_detail_payload(self, project: Project, chapter: ChapterChunk) -> dict[str, Any]:
+    def _build_shot_detail_payload(
+        self,
+        project: Project,
+        chapter: ChapterChunk,
+        *,
+        artifact_text: str | None = None,
+    ) -> dict[str, Any]:
+        parsed = self._parse_shot_detail_text(project, chapter, artifact_text or "")
+        if parsed.get("shots"):
+            return parsed
         content = self._chapter_body_text(chapter)
-        words = len(content.split())
-        paragraphs = [item.strip() for item in content.split("\n\n") if item.strip()]
+        shot_count = self._target_chapter_shot_count(project, chapter)
         chapter_count = max(len(self._list_project_chapters(project.id)), 1)
         chapter_budget = max(20, round(project.target_duration_sec / chapter_count))
-        shot_count = max(8, min(24, max(math.ceil(words / 120), math.ceil(chapter_budget / 4), len(paragraphs))))
         flat_text = re.sub(r"\s+", " ", content.replace("\n", " ")).strip()
         sentences = [item.strip(" \t\r\n-—\"'“”‘’") for item in re.split(r"(?<=[。！？!?；;:：.])\s+", flat_text) if item.strip()]
         if not sentences:
@@ -5605,6 +7447,12 @@ class PipelineService:
                     "action": source[:120],
                     "dialogue": (dialogue_match[0] if dialogue_match else source[:90]),
                     "characters": characters,
+                    "props": self._extract_shot_entities(
+                        story_bible.get("props") if isinstance(story_bible, dict) else [],
+                        source,
+                        chapter=chapter,
+                        limit=2,
+                    ),
                     "scene": scenes[0] if scenes else "",
                     "scene_hint": " / ".join(scenes),
                     "continuity_anchor": "保持同一人物外貌、服装和同一场景光线连续一致。",
@@ -5615,6 +7463,155 @@ class PipelineService:
             "shots": shots,
             "summary": f"已细化 {len(shots)} 个分镜镜头。",
         }
+
+    def _parse_shot_detail_text(self, project: Project, chapter: ChapterChunk, text: str) -> dict[str, Any]:
+        source = str(text or "").strip()
+        if not source or "镜头草案" not in source:
+            return {}
+
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        shots: list[dict[str, Any]] = []
+        current_scene = ""
+        current: dict[str, Any] | None = None
+
+        def finalize(raw_shot: dict[str, Any] | None) -> None:
+            if not isinstance(raw_shot, dict):
+                return
+            scene_text = str(raw_shot.get("scene_text") or current_scene or "").strip()
+            action_text = str(raw_shot.get("action_text") or "").strip()
+            dialogue_text = str(raw_shot.get("dialogue_text") or "").strip()
+            composition_text = str(raw_shot.get("composition_text") or "").strip()
+            character_text = str(raw_shot.get("character_text") or "").strip()
+            frame_type = str(raw_shot.get("frame_type") or "中景").strip() or "中景"
+            duration_sec = float(raw_shot.get("duration_sec") or 6.0)
+            character_matching_text = " ".join(part for part in (character_text, action_text, dialogue_text) if part).lower()
+            prop_matching_text = " ".join(
+                part for part in (character_text, action_text, dialogue_text, composition_text) if part
+            ).lower()
+            scene_matching_text = " ".join(
+                part for part in (scene_text, action_text, dialogue_text, composition_text) if part
+            ).lower()
+            characters = self._extract_shot_entities(
+                story_bible.get("characters") if isinstance(story_bible, dict) else [],
+                character_matching_text,
+                chapter=chapter,
+                limit=3,
+            )
+            props = self._extract_shot_entities(
+                story_bible.get("props") if isinstance(story_bible, dict) else [],
+                prop_matching_text,
+                chapter=chapter,
+                limit=2,
+            )
+            scene_candidates = self._extract_shot_entities(
+                story_bible.get("scenes") if isinstance(story_bible, dict) else [],
+                scene_matching_text,
+                chapter=chapter,
+                limit=2,
+            )
+            scene_base = re.sub(r"\s*[\(（].*?[\)）]\s*", "", scene_text).strip(" ，,、")
+            scene_value = scene_candidates[0] if scene_candidates else scene_base
+            scene_hint_parts: list[str] = []
+            for candidate in [scene_base, *scene_candidates]:
+                value = str(candidate or "").strip()
+                if value and value not in scene_hint_parts:
+                    scene_hint_parts.append(value)
+            visual_text = "；".join(part for part in (scene_base, action_text, composition_text) if part)[:220]
+            shot = {
+                "shot_index": len(shots) + 1,
+                "duration_sec": max(2.5, duration_sec),
+                "frame_type": frame_type[:24],
+                "visual": visual_text or action_text[:220] or scene_base[:220],
+                "action": action_text[:220] or visual_text[:220],
+                "dialogue": dialogue_text[:180] or action_text[:120],
+                "characters": characters,
+                "props": props,
+                "scene": scene_value[:120] if scene_value else "",
+                "scene_hint": " / ".join(scene_hint_parts[:3])[:180],
+                "continuity_anchor": "保持同一人物外貌、服装和同一场景光线连续一致。",
+            }
+            shots.append(self._enrich_shot_payload(chapter, shot, story_bible=story_bible))
+
+        for raw_line in source.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("### 场景：") or line.startswith("### 场景:"):
+                current_scene = line.split("：", 1)[1].strip() if "：" in line else line.split(":", 1)[1].strip()
+                continue
+            shot_match = re.match(r"^(\d+)\.\s+\*\*人物\*\*[:：]\s*(.+)$", line)
+            if shot_match:
+                finalize(current)
+                current = {
+                    "character_text": shot_match.group(2).strip(),
+                    "scene_text": current_scene,
+                    "action_text": "",
+                    "dialogue_text": "",
+                    "composition_text": "",
+                    "frame_type": "中景",
+                    "duration_sec": 6.0,
+                }
+                continue
+            if current is None:
+                continue
+            field_match = re.match(r"^\*\*(场景|动作|对白|构图|景别|时长)\*\*[:：]\s*(.+)$", line)
+            if not field_match:
+                continue
+            label = field_match.group(1)
+            value = field_match.group(2).strip()
+            if label == "场景":
+                current["scene_text"] = value
+            elif label == "动作":
+                current["action_text"] = value
+            elif label == "对白":
+                current["dialogue_text"] = value
+            elif label == "构图":
+                current["composition_text"] = value
+            elif label == "景别":
+                current["frame_type"] = value
+            elif label == "时长":
+                duration_match = re.search(r"(\d+(?:\.\d+)?)\s*秒", value)
+                if duration_match:
+                    current["duration_sec"] = float(duration_match.group(1))
+        finalize(current)
+
+        if not shots:
+            return {}
+        target_shot_count = self._target_chapter_shot_count(project, chapter)
+        if len(shots) > target_shot_count:
+            shots = self._sample_structured_shots(shots, target_shot_count)
+        return {
+            "shot_count": len(shots),
+            "shots": shots,
+            "summary": f"已从分镜细化文本中解析 {len(shots)} 个结构化镜头。",
+        }
+
+    def _shot_payloads_need_reparse(self, shots: Any) -> bool:
+        if not isinstance(shots, list) or not shots:
+            return True
+        normalized = [item for item in shots if isinstance(item, dict)]
+        if not normalized:
+            return True
+        scene_rich = sum(1 for item in normalized if str(item.get("scene") or item.get("scene_hint") or "").strip())
+        return scene_rich < max(1, math.ceil(len(normalized) * 0.5))
+
+    def _target_chapter_shot_count(self, project: Project, chapter: ChapterChunk) -> int:
+        content = self._chapter_body_text(chapter)
+        words = len(content.split())
+        paragraphs = [item.strip() for item in content.split("\n\n") if item.strip()]
+        chapter_count = max(len(self._list_project_chapters(project.id)), 1)
+        chapter_budget = max(20, round(project.target_duration_sec / chapter_count))
+        return max(8, min(24, max(math.ceil(words / 120), math.ceil(chapter_budget / 4), len(paragraphs))))
+
+    def _sample_structured_shots(self, shots: list[dict[str, Any]], target_count: int) -> list[dict[str, Any]]:
+        if target_count <= 0 or len(shots) <= target_count:
+            sampled = [deepcopy(item) for item in shots]
+        else:
+            indexes = sorted({round(index * (len(shots) - 1) / max(target_count - 1, 1)) for index in range(target_count)})
+            sampled = [deepcopy(shots[index]) for index in indexes]
+        for index, shot in enumerate(sampled, start=1):
+            shot["shot_index"] = index
+        return sampled
 
     def _chapter_body_text(self, chapter: ChapterChunk) -> str:
         content = chapter.content.strip()
@@ -5630,6 +7627,24 @@ class PipelineService:
     def _storyboard_version_count_for_chapter(self, project_id: str, chapter: ChapterChunk) -> int:
         storyboard_step = self._get_storyboard_step(project_id)
         return len(self.list_storyboard_versions(project_id, storyboard_step.id, chapter_id=chapter.id))
+
+    def _coerce_positive_float(self, value: Any, *, default: float | None = None) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        if parsed < 0:
+            return default
+        return parsed
+
+    def _storyboard_quality_profile(self, params: dict[str, Any] | None) -> dict[str, Any]:
+        raw = ""
+        if isinstance(params, dict):
+            raw = str(params.get("storyboard_quality") or params.get("quality_preset") or "").strip().lower()
+        preset = raw if raw in STORYBOARD_QUALITY_PROFILES else DEFAULT_STORYBOARD_QUALITY
+        profile = deepcopy(STORYBOARD_QUALITY_PROFILES[preset])
+        profile["preset"] = preset
+        return profile
 
     def _dominant_storyboard_model_for_chapter(self, project_id: str, chapter: ChapterChunk) -> str | None:
         model_counts: dict[str, int] = {}
@@ -5664,9 +7679,6 @@ class PipelineService:
             primary_model = available_list[0]
         is_targeted_rework = bool(params.get("auto_revision_prompt")) or bool(params.get("target_shot_indexes"))
         dominant = self._dominant_storyboard_model_for_chapter(project.id, chapter)
-        version_count = self._storyboard_version_count_for_chapter(project.id, chapter)
-        if is_targeted_rework and version_count >= 4 and "openai/gpt-5-image" in available:
-            return "openai/gpt-5-image"
         if is_targeted_rework and dominant and dominant in available:
             return dominant
         return primary_model
@@ -5706,6 +7718,11 @@ class PipelineService:
         total_estimated_cost = 0.0
         generated_frame_count = 0
         render_model = self._preferred_storyboard_model_for_run(project, chapter, provider, model, params)
+        quality_profile = self._storyboard_quality_profile(params)
+        shot_retry_limit = int(quality_profile.get("shot_retry_limit") or STORYBOARD_SHOT_RETRY_LIMIT)
+        reference_image_limit = int(quality_profile.get("reference_image_limit") or STORYBOARD_REFERENCE_IMAGE_LIMIT)
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
         system = (
             f"{system_prompt}\n"
             "你现在是电影分镜美术师。每次只返回一张真实图片，不要返回 markdown、JSON、镜头列表或文字解释。"
@@ -5732,23 +7749,46 @@ class PipelineService:
                 style_directive,
                 auto_revision_prompt=str(params.get("auto_revision_prompt") or "").strip() or None,
             )
-            reference_images = self._story_bible_reference_images_for_shot(project, shot, chapter=chapter)
+            reference_images = self._story_bible_reference_images_for_shot(
+                project,
+                shot,
+                chapter=chapter,
+                limit=reference_image_limit,
+            )
             request_params = {
                 **params,
                 "aspect_ratio": str(params.get("aspect_ratio") or "16:9"),
-                "size": params.get("size") or "1536x1024",
+                "size": params.get("size") or str(quality_profile.get("size") or DEFAULT_STORYBOARD_IMAGE_SIZE),
                 "shot_index": shot_index,
                 "reference_images": reference_images,
+                "storyboard_model_fallback_limit": int(
+                    params.get("storyboard_model_fallback_limit") or quality_profile.get("model_fallback_limit") or STORYBOARD_IMAGE_FALLBACK_LIMIT
+                ),
+                "storyboard_quality": quality_profile.get("preset", DEFAULT_STORYBOARD_QUALITY),
+                "forbid_readable_text": bool(
+                    params.get("forbid_readable_text", visual_style.get("forbid_readable_text", True))
+                ),
             }
-            frame_response, frame_artifact, used_model, cost = await self._generate_storyboard_frame_with_fallback(
-                adapter=adapter,
-                provider=provider,
-                primary_model=render_model,
-                system_prompt=system,
-                image_prompt=image_prompt,
-                request_params=request_params,
-                shot_index=shot_index,
-            )
+            last_frame_error: Exception | None = None
+            for attempt_index in range(1, shot_retry_limit + 1):
+                try:
+                    frame_response, frame_artifact, used_model, cost = await self._generate_storyboard_frame_with_fallback(
+                        adapter=adapter,
+                        provider=provider,
+                        primary_model=render_model,
+                        system_prompt=system,
+                        image_prompt=image_prompt,
+                        request_params=request_params,
+                        shot_index=shot_index,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_frame_error = exc
+                    if attempt_index >= shot_retry_limit:
+                        raise
+                    await asyncio.sleep(0.8 * attempt_index)
+            else:
+                raise ValueError(str(last_frame_error) if last_frame_error else f"storyboard_image failed on shot {shot_index}")
             render_model = used_model or render_model
             total_estimated_cost += cost
             aggregated_usage = self._merge_usage_metrics(aggregated_usage, frame_response.usage)
@@ -5759,6 +7799,7 @@ class PipelineService:
                     "shot_index": shot_index,
                     "prompt": image_prompt,
                     "used_model": used_model,
+                    "shot_attempts": attempt_index,
                     "provider_output": frame_artifact,
                     "usage": frame_response.usage,
                 }
@@ -5781,6 +7822,8 @@ class PipelineService:
                     "provider": frame_artifact.get("provider") or provider,
                     "model": frame_artifact.get("model") or used_model,
                     "artifact_id": frame_artifact.get("artifact_id"),
+                    "shot_attempts": attempt_index,
+                    "text_detection": deepcopy(frame_artifact.get("text_detection") or {}),
                     **frame_asset,
                 }
             )
@@ -5825,39 +7868,553 @@ class PipelineService:
     ) -> tuple[ProviderResponse, float]:
         if chapter is None:
             raise ValueError("segment_video requires a chapter context")
-        reference_images = self._story_bible_reference_images_for_chapter(project, chapter=chapter)
-        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
-        reference_paths = [
-            storage_key
-            for group_name, group in (
-                ("characters", story_bible.get("characters", []) if isinstance(story_bible, dict) else []),
-                ("scenes", story_bible.get("scenes", []) if isinstance(story_bible, dict) else []),
+        continuity_package = self._chapter_boundary_frame_package(project, chapter)
+        shots = self._chapter_segment_shots(project, chapter)
+        if not shots:
+            raise ValueError("segment_video requires storyboard frames before video generation")
+
+        if self._supports_live_segment_video(provider, adapter):
+            return await self._generate_live_segment_video_artifact(
+                project,
+                step,
+                chapter,
+                adapter,
+                provider,
+                model,
+                system_prompt,
+                task_prompt,
+                style_directive,
+                params,
+                continuity_package=continuity_package,
+                shots=shots,
             )
-            for item in group
-            if isinstance(item, dict)
-            for storage_key, _ in [self._story_bible_entity_reference_fields(group_name, item)]
-            if storage_key
-        ]
-        prompt = self._build_segment_video_prompt(project, chapter, task_prompt, style_directive)
-        req = ProviderRequest(
-            step="video",
-            model=model,
-            input={
-                "video_prompt": prompt,
-                "reference_images": reference_images,
-                "chapter": self._serialize_chapter(chapter),
-            },
-            prompt=system_prompt,
-            params={
-                **params,
-                "seconds": int(params.get("seconds") or max(4, round(self._chapter_segment_duration(project, chapter)))),
-                "size": params.get("size") or "1280x720",
-                "input_reference_path": reference_paths[0] if reference_paths else None,
-            },
+
+        return self._generate_motion_preview_segment_artifact(
+            project,
+            step,
+            chapter,
+            provider,
+            model,
+            task_prompt,
+            style_directive,
+            continuity_package=continuity_package,
+            shots=shots,
+            fallback_reason="当前未接入可用的真实视频模型，已回退为带运镜的本地 motion preview。",
         )
-        response = await adapter.invoke(req)
-        estimated_cost = await adapter.estimate_cost(req, response.usage)
-        return response, estimated_cost
+
+    def _chapter_boundary_frame_package(self, project: Project, chapter: ChapterChunk) -> dict[str, Any]:
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
+        enabled = bool(visual_style.get("first_last_frame_bridge", True))
+        package: dict[str, Any] = {
+            "enabled": enabled,
+            "method": visual_style.get("continuity_method") or "story_bible + first_last_frame",
+        }
+        if not enabled:
+            return package
+        chapters = self._list_project_chapters(project.id)
+        current_index = next((index for index, item in enumerate(chapters) if item.id == chapter.id), None)
+        if current_index is None:
+            return package
+
+        def frame_payload(target: ChapterChunk | None, edge: str) -> dict[str, Any] | None:
+            if target is None:
+                return None
+            frames = self._active_storyboard_frames_for_chapter(project.id, target)
+            if not frames:
+                return None
+            shot_index = min(frames) if edge == "first" else max(frames)
+            frame = deepcopy(frames[shot_index])
+            data_url = self._reference_image_data_url(frame.get("storage_key"), frame.get("image_url"))
+            return {
+                "chapter_id": target.id,
+                "chapter_title": str((target.meta or {}).get("title") or f"章节 {target.chapter_index + 1}"),
+                "shot_index": shot_index,
+                "summary": str(frame.get("summary") or frame.get("visual") or ""),
+                "storage_key": frame.get("storage_key"),
+                "image_url": frame.get("image_url"),
+                "data_url": data_url,
+            }
+
+        previous_chapter = chapters[current_index - 1] if current_index > 0 else None
+        next_chapter = chapters[current_index + 1] if current_index + 1 < len(chapters) else None
+        previous_last = frame_payload(previous_chapter, "last")
+        current_first = frame_payload(chapter, "first")
+        current_last = frame_payload(chapter, "last")
+        next_first = frame_payload(next_chapter, "first")
+        package.update(
+            {
+                "previous_last_frame": previous_last,
+                "current_first_frame": current_first,
+                "current_last_frame": current_last,
+                "next_first_frame": next_first,
+                "input_reference_path": (current_first or previous_last or {}).get("storage_key"),
+                "reference_images": [
+                    {"url": item["data_url"], "label": label}
+                    for label, item in (
+                        ("previous-last-frame", previous_last),
+                        ("current-first-frame", current_first),
+                        ("current-last-frame", current_last),
+                    )
+                    if isinstance(item, dict) and isinstance(item.get("data_url"), str) and item["data_url"]
+                ],
+            }
+        )
+        return package
+
+    def _supports_live_segment_video(self, provider: str, adapter: Any) -> bool:
+        if provider != "openai":
+            return False
+        is_configured = getattr(adapter, "is_configured", None)
+        if callable(is_configured):
+            try:
+                return bool(is_configured())
+            except Exception:  # noqa: BLE001
+                return False
+        return adapter.__class__.__name__ != "MockProviderAdapter"
+
+    def _chapter_segment_shots(self, project: Project, chapter: ChapterChunk) -> list[dict[str, Any]]:
+        frames = self._active_storyboard_frames_for_chapter(project.id, chapter)
+        if not frames:
+            return []
+        shot_specs = {int(item.get("shot_index") or 0): deepcopy(item) for item in self._chapter_shots(chapter) if isinstance(item, dict)}
+        ordered_indexes = sorted(index for index in frames.keys() if index > 0)
+        clip_count = max(len(ordered_indexes), 1)
+        default_duration = max(2.0, self._chapter_segment_duration(project, chapter) / clip_count)
+        shots: list[dict[str, Any]] = []
+        for position, shot_index in enumerate(ordered_indexes, start=1):
+            frame = deepcopy(frames[shot_index])
+            spec = deepcopy(shot_specs.get(shot_index) or {})
+            duration_sec = spec.get("duration_sec", frame.get("duration_sec", default_duration))
+            try:
+                duration_sec = float(duration_sec)
+            except (TypeError, ValueError):
+                duration_sec = default_duration
+            merged = {
+                **spec,
+                **frame,
+                "shot_index": shot_index,
+                "duration_sec": round(max(2.0, min(duration_sec, 6.0)), 2),
+                "storage_key": str(frame.get("storage_key") or ""),
+                "image_url": str(frame.get("image_url") or frame.get("thumbnail_url") or ""),
+                "summary": str(frame.get("summary") or spec.get("visual") or ""),
+                "characters": list(spec.get("characters") or frame.get("characters") or []),
+                "props": list(spec.get("props") or frame.get("props") or []),
+                "scene": str(spec.get("scene") or frame.get("scene") or ""),
+                "scene_hint": str(spec.get("scene_hint") or frame.get("scene_hint") or ""),
+                "motion_directive": self._shot_motion_directive(position),
+            }
+            shots.append(merged)
+        return shots
+
+    def _shot_motion_directive(self, position: int) -> str:
+        variants = (
+            "稳定推进，轻微前移",
+            "轻微横向调度，从左向右",
+            "缓慢拉镜，保留空间呼吸感",
+            "稳定跟拍感，轻微右向左平移",
+        )
+        return variants[(position - 1) % len(variants)]
+
+    async def _generate_live_segment_video_artifact(
+        self,
+        project: Project,
+        step: PipelineStep,
+        chapter: ChapterChunk,
+        adapter: Any,
+        provider: str,
+        model: str,
+        system_prompt: str,
+        task_prompt: str,
+        style_directive: str,
+        params: dict[str, Any],
+        *,
+        continuity_package: dict[str, Any],
+        shots: list[dict[str, Any]],
+    ) -> tuple[ProviderResponse, float]:
+        clip_dir = self._generated_project_dir(project.id, step.step_name) / f"{self._chapter_media_prefix(chapter)}-clips-attempt-{step.attempt}"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        clip_paths: list[Path] = []
+        clip_manifest: list[dict[str, Any]] = []
+        aggregated_usage: dict[str, Any] = {}
+        total_estimated_cost = 0.0
+        fallback_count = 0
+        for shot in shots:
+            shot_index = int(shot.get("shot_index") or len(clip_manifest) + 1)
+            clip_path = clip_dir / f"shot-{shot_index:02d}.mp4"
+            try:
+                prompt = self._build_segment_video_shot_prompt(
+                    project,
+                    chapter,
+                    shot,
+                    task_prompt,
+                    style_directive,
+                    continuity_package=continuity_package,
+                )
+                req = ProviderRequest(
+                    step="video",
+                    model=model,
+                    input={
+                        "video_prompt": prompt,
+                        "shot": shot,
+                        "chapter": self._serialize_chapter(chapter),
+                        "continuity_package": continuity_package,
+                    },
+                    prompt=system_prompt,
+                    params={
+                        **params,
+                        "seconds": max(2, int(round(float(shot.get("duration_sec") or 2.0)))),
+                        "size": params.get("size") or "1280x720",
+                        "input_reference_path": str(shot.get("storage_key") or continuity_package.get("input_reference_path") or ""),
+                        "continuity_reference_path": str(continuity_package.get("input_reference_path") or ""),
+                    },
+                )
+                response = await adapter.invoke(req)
+                total_estimated_cost += await adapter.estimate_cost(req, response.usage)
+                aggregated_usage = self._merge_usage_metrics(aggregated_usage, response.usage)
+                artifact = deepcopy(response.output or {})
+                video_id = str(artifact.get("video_id") or artifact.get("artifact_id") or "").strip()
+                if not video_id:
+                    raise ValueError("video provider did not return a job id")
+                await self._poll_single_segment_video_job(adapter, video_id, clip_path)
+                if not self._is_playable_video(clip_path):
+                    raise ValueError("downloaded clip is not playable")
+                clip_paths.append(clip_path)
+                clip_manifest.append(
+                    {
+                        "shot_index": shot_index,
+                        "duration_sec": float(shot.get("duration_sec") or 0),
+                        "mode": "provider_video",
+                        "provider": provider,
+                        "model": model,
+                        "storage_key": str(clip_path),
+                        "preview_url": self._to_local_file_url(clip_path),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                fallback_count += 1
+                self._render_motion_preview_clip(
+                    Path(str(shot.get("storage_key") or "")),
+                    clip_path,
+                    duration_sec=float(shot.get("duration_sec") or 2.0),
+                    motion_mode=self._clip_motion_mode_for_index(shot_index),
+                )
+                clip_paths.append(clip_path)
+                clip_manifest.append(
+                    {
+                        "shot_index": shot_index,
+                        "duration_sec": float(shot.get("duration_sec") or 0),
+                        "mode": "motion_preview_fallback",
+                        "provider": provider,
+                        "model": model,
+                        "storage_key": str(clip_path),
+                        "preview_url": self._to_local_file_url(clip_path),
+                        "fallback_reason": str(exc),
+                    }
+                )
+        final_path = self._generated_project_dir(project.id, step.step_name) / f"{self._chapter_media_prefix(chapter)}-attempt-{step.attempt}.mp4"
+        self._concat_video_segments_reencode(clip_paths, final_path)
+        artifact = {
+            "provider": provider,
+            "step": "video",
+            "model": model,
+            "artifact_mode": "real_generated_shot_clips" if fallback_count == 0 else "hybrid_generated_shot_clips",
+            "summary": (
+                f"已生成 {len(clip_manifest)} 个真实视频镜头并拼接章节片段。"
+                if fallback_count == 0
+                else f"已生成 {len(clip_manifest)} 个镜头片段，其中 {fallback_count} 个因模型失败回退为本地 motion preview。"
+            ),
+            "storage_key": str(final_path),
+            "preview_url": self._to_local_file_url(final_path),
+            "export_url": self._to_local_file_url(final_path),
+            "mime_type": "video/mp4",
+            "continuity_package": continuity_package,
+            "clip_manifest": clip_manifest,
+            "fallback_clip_count": fallback_count,
+        }
+        artifact["motion_validation"] = self._analyze_video_motion(final_path)
+        aggregated_usage["clip_count"] = len(clip_manifest)
+        aggregated_usage["fallback_clip_count"] = fallback_count
+        aggregated_usage["request_count"] = len([item for item in clip_manifest if item.get("mode") == "provider_video"])
+        return ProviderResponse(output=artifact, usage=aggregated_usage, raw={"clip_manifest": clip_manifest}), total_estimated_cost
+
+    async def _poll_single_segment_video_job(self, adapter: Any, video_id: str, output_path: Path) -> None:
+        for _ in range(1, settings.video_poll_max_attempts + 1):
+            status_response = await adapter.get_video_status(video_id)
+            artifact = deepcopy(status_response.output or {})
+            status = str(artifact.get("status") or "").lower()
+            if status in {"completed", "succeeded"}:
+                content, mime_type = await adapter.download_video(video_id)
+                suffix = self._suffix_for_mime_type(mime_type)
+                target_path = output_path if output_path.suffix == suffix else output_path.with_suffix(suffix)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_bytes(content)
+                if target_path != output_path:
+                    if target_path.suffix.lower() != ".mp4":
+                        normalized = output_path.with_suffix(".mp4")
+                        self._transcode_video_clip(target_path, normalized)
+                        try:
+                            target_path.unlink(missing_ok=True)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    else:
+                        target_path.replace(output_path)
+                return
+            if status in {"failed", "cancelled", "canceled"}:
+                raise ValueError(f"segment video generation failed: {artifact.get('status')}")
+            await asyncio.sleep(settings.video_poll_interval_sec)
+        raise ValueError("segment video generation timed out during polling")
+
+    def _generate_motion_preview_segment_artifact(
+        self,
+        project: Project,
+        step: PipelineStep,
+        chapter: ChapterChunk,
+        provider: str,
+        model: str,
+        task_prompt: str,
+        style_directive: str,
+        *,
+        continuity_package: dict[str, Any],
+        shots: list[dict[str, Any]],
+        fallback_reason: str,
+    ) -> tuple[ProviderResponse, float]:
+        clip_dir = self._generated_project_dir(project.id, step.step_name) / f"{self._chapter_media_prefix(chapter)}-motion-attempt-{step.attempt}"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        clip_paths: list[Path] = []
+        clip_manifest: list[dict[str, Any]] = []
+        for shot in shots:
+            shot_index = int(shot.get("shot_index") or len(clip_manifest) + 1)
+            frame_path = Path(str(shot.get("storage_key") or ""))
+            if not frame_path.exists():
+                continue
+            clip_path = clip_dir / f"shot-{shot_index:02d}.mp4"
+            self._render_motion_preview_clip(
+                frame_path,
+                clip_path,
+                duration_sec=float(shot.get("duration_sec") or 2.0),
+                motion_mode=self._clip_motion_mode_for_index(shot_index),
+            )
+            clip_paths.append(clip_path)
+            clip_manifest.append(
+                {
+                    "shot_index": shot_index,
+                    "duration_sec": float(shot.get("duration_sec") or 0),
+                    "mode": "motion_preview",
+                    "storage_key": str(clip_path),
+                    "preview_url": self._to_local_file_url(clip_path),
+                    "visual": str(shot.get("visual") or ""),
+                    "motion_directive": str(shot.get("motion_directive") or ""),
+                }
+            )
+        if not clip_paths:
+            raise ValueError("motion preview fallback could not find storyboard frames")
+        final_path = self._generated_project_dir(project.id, step.step_name) / f"{self._chapter_media_prefix(chapter)}-attempt-{step.attempt}.mp4"
+        self._concat_video_segments_reencode(clip_paths, final_path)
+        artifact = {
+            "provider": provider,
+            "step": "video",
+            "model": model,
+            "artifact_mode": "motion_preview_segment",
+            "summary": "已基于章节分镜生成带运镜的 motion preview，可用于首轮节奏和连续性审看。",
+            "storage_key": str(final_path),
+            "preview_url": self._to_local_file_url(final_path),
+            "export_url": self._to_local_file_url(final_path),
+            "mime_type": "video/mp4",
+            "continuity_package": continuity_package,
+            "clip_manifest": clip_manifest,
+            "fallback_reason": fallback_reason,
+            "task_prompt": task_prompt,
+            "style_directive": style_directive,
+        }
+        artifact["motion_validation"] = self._analyze_video_motion(final_path)
+        usage = {
+            "clip_count": len(clip_manifest),
+            "request_count": 0,
+            "fallback_clip_count": len(clip_manifest),
+        }
+        return ProviderResponse(output=artifact, usage=usage, raw={"clip_manifest": clip_manifest, "local_fallback": True}), 0.0
+
+    def _clip_motion_mode_for_index(self, shot_index: int) -> str:
+        variants = ("push_in", "pan_right", "push_out", "pan_left")
+        return variants[(max(shot_index, 1) - 1) % len(variants)]
+
+    def _render_motion_preview_clip(
+        self,
+        frame_path: Path,
+        output_path: Path,
+        *,
+        duration_sec: float,
+        motion_mode: str,
+    ) -> None:
+        if not frame_path.exists():
+            raise ValueError(f"frame image does not exist: {frame_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_count = max(int(round(max(duration_sec, 1.6) * 24)), 36)
+        zoom_base = 1.10
+        zoom_step = max((zoom_base - 1.0) / max(frame_count - 1, 1), 0.0012)
+        if motion_mode == "push_out":
+            z_expr = f"max(1.0,{zoom_base:.3f}-on*{zoom_step:.6f})"
+            x_expr = "iw/2-(iw/zoom/2)"
+            y_expr = "ih/2-(ih/zoom/2)"
+        elif motion_mode == "pan_left":
+            z_expr = "1.07"
+            x_expr = f"max((iw-iw/zoom)*(1-on/{max(frame_count - 1, 1)}),0)"
+            y_expr = "ih/2-(ih/zoom/2)"
+        elif motion_mode == "pan_right":
+            z_expr = "1.07"
+            x_expr = f"min((iw-iw/zoom)*(on/{max(frame_count - 1, 1)}),iw-iw/zoom)"
+            y_expr = "ih/2-(ih/zoom/2)"
+        else:
+            z_expr = f"min(1.0+on*{zoom_step:.6f},{zoom_base:.3f})"
+            x_expr = "iw/2-(iw/zoom/2)"
+            y_expr = "ih/2-(ih/zoom/2)"
+        vf = (
+            "scale=1600:900:force_original_aspect_ratio=increase,"
+            "crop=1600:900,"
+            f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frame_count}:s=1280x720:fps=24,"
+            "format=yuv420p"
+        )
+        cmd = [
+            self._ffmpeg_executable(),
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            str(frame_path),
+            "-vf",
+            vf,
+            "-t",
+            f"{max(duration_sec, 1.6):.3f}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise ValueError(f"ffmpeg motion preview failed: {completed.stderr.strip()}")
+
+    def _concat_video_segments_reencode(self, segment_paths: list[Path], output_path: Path) -> None:
+        if not segment_paths:
+            raise ValueError("no segment paths to concat")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        concat_file = output_path.with_suffix(".concat.txt")
+        concat_file.write_text(
+            "\n".join(f"file '{path.as_posix()}'" for path in segment_paths),
+            encoding="utf-8",
+        )
+        cmd = [
+            self._ffmpeg_executable(),
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise ValueError(f"ffmpeg concat reencode failed: {completed.stderr.strip()}")
+
+    def _transcode_video_clip(self, source_path: Path, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            self._ffmpeg_executable(),
+            "-y",
+            "-i",
+            str(source_path),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise ValueError(f"ffmpeg transcode clip failed: {completed.stderr.strip()}")
+
+    def _analyze_video_motion(self, video_path: Path) -> dict[str, Any]:
+        if not self._is_playable_video(video_path):
+            return {
+                "passed": False,
+                "sample_count": 0,
+                "mean_frame_delta": 0.0,
+                "max_frame_delta": 0.0,
+                "reason": "video_unplayable",
+            }
+        duration = self._probe_media_duration(video_path) or 0.0
+        sample_count = max(VIDEO_MOTION_SAMPLE_COUNT, 3)
+        interval = max(duration / max(sample_count - 1, 1), 0.5) if duration > 0 else 0.5
+        with tempfile.TemporaryDirectory(prefix="n2v-motion-") as temp_dir:
+            pattern = str(Path(temp_dir) / "frame-%03d.png")
+            cmd = [
+                self._ffmpeg_executable(),
+                "-y",
+                "-i",
+                str(video_path),
+                "-vf",
+                f"fps=1/{interval:.3f},scale=320:-1",
+                pattern,
+            ]
+            completed = subprocess.run(cmd, capture_output=True, text=True)
+            if completed.returncode != 0:
+                return {
+                    "passed": False,
+                    "sample_count": 0,
+                    "mean_frame_delta": 0.0,
+                    "max_frame_delta": 0.0,
+                    "reason": "frame_sampling_failed",
+                }
+            frame_paths = sorted(Path(temp_dir).glob("frame-*.png"))
+            if len(frame_paths) < 2:
+                return {
+                    "passed": False,
+                    "sample_count": len(frame_paths),
+                    "mean_frame_delta": 0.0,
+                    "max_frame_delta": 0.0,
+                    "reason": "insufficient_samples",
+                }
+            from PIL import Image, ImageChops, ImageStat
+
+            deltas: list[float] = []
+            previous = None
+            for frame_path in frame_paths:
+                with Image.open(frame_path) as image:
+                    current = image.convert("RGB")
+                    if previous is not None:
+                        diff = ImageChops.difference(previous, current)
+                        stats = ImageStat.Stat(diff)
+                        channel_mean = sum(stats.mean) / max(len(stats.mean), 1)
+                        deltas.append(round(channel_mean, 4))
+                    previous = current.copy()
+            mean_delta = round(sum(deltas) / max(len(deltas), 1), 4) if deltas else 0.0
+            max_delta = round(max(deltas), 4) if deltas else 0.0
+            passed = mean_delta >= VIDEO_MOTION_MIN_MEAN_DELTA or max_delta >= VIDEO_MOTION_MIN_MEAN_DELTA * 1.35
+            return {
+                "passed": passed,
+                "sample_count": len(frame_paths),
+                "mean_frame_delta": mean_delta,
+                "max_frame_delta": max_delta,
+                "threshold": VIDEO_MOTION_MIN_MEAN_DELTA,
+                "reason": "ok" if passed else "motion_too_static",
+            }
 
     async def _invoke_stitch_subtitle_tts_step(
         self,
@@ -6005,14 +8562,34 @@ class PipelineService:
         chapter: ChapterChunk,
         task_prompt: str,
         style_directive: str,
+        *,
+        continuity_package: dict[str, Any] | None = None,
     ) -> str:
         shots = self._chapter_shots(chapter)[:8]
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
+        raw_continuity = continuity_package or {}
+        prompt_continuity = {
+            "enabled": bool(raw_continuity.get("enabled")),
+            "method": raw_continuity.get("method"),
+        }
+        for key in ("previous_last_frame", "current_first_frame", "current_last_frame", "next_first_frame"):
+            raw_frame = raw_continuity.get(key)
+            if not isinstance(raw_frame, dict):
+                continue
+            prompt_continuity[key] = {
+                "chapter_title": raw_frame.get("chapter_title"),
+                "shot_index": raw_frame.get("shot_index"),
+                "summary": raw_frame.get("summary"),
+            }
         shot_summaries = [
             {
                 "shot_index": shot.get("shot_index"),
                 "visual": shot.get("visual"),
                 "action": shot.get("action"),
                 "dialogue": shot.get("dialogue"),
+                "props": shot.get("props"),
+                "continuity_anchor": shot.get("continuity_anchor"),
             }
             for shot in shots
         ]
@@ -6023,11 +8600,95 @@ class PipelineService:
             "shot_summaries": shot_summaries,
             "user_video_directive": task_prompt,
             "style_bible": style_directive,
+            "film_controls": {
+                "director_style": visual_style.get("director_style"),
+                "real_light_source_strategy": visual_style.get("real_light_source_strategy"),
+                "skin_texture_level": visual_style.get("skin_texture_level"),
+                "shot_distance_profile": visual_style.get("shot_distance_profile"),
+                "lens_package": visual_style.get("lens_package"),
+                "camera_movement_style": visual_style.get("camera_movement_style"),
+                "continuity_method": visual_style.get("continuity_method"),
+            },
+            "continuity_package": prompt_continuity,
             "hard_constraints": [
                 "maintain identity consistency with reference images",
                 "maintain location continuity",
                 "keep wardrobe and props stable",
+                "real motion video only, never use static hold-frame slideshow output",
                 "cinematic motion only, no montage collage",
+                "respect first and last frame continuity package when provided",
+                "no readable on-screen text, captions, logos or subtitles",
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _build_segment_video_shot_prompt(
+        self,
+        project: Project,
+        chapter: ChapterChunk,
+        shot: dict[str, Any],
+        task_prompt: str,
+        style_directive: str,
+        *,
+        continuity_package: dict[str, Any] | None = None,
+    ) -> str:
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
+        shot_index = int(shot.get("shot_index") or 1)
+        continuity = continuity_package or {}
+        focus_continuity: dict[str, Any] = {
+            "enabled": bool(continuity.get("enabled")),
+            "method": continuity.get("method"),
+        }
+        if shot_index == 1 and isinstance(continuity.get("previous_last_frame"), dict):
+            focus_continuity["previous_last_frame"] = {
+                "chapter_title": continuity["previous_last_frame"].get("chapter_title"),
+                "summary": continuity["previous_last_frame"].get("summary"),
+            }
+        if isinstance(continuity.get("current_first_frame"), dict):
+            focus_continuity["current_first_frame"] = {
+                "shot_index": continuity["current_first_frame"].get("shot_index"),
+                "summary": continuity["current_first_frame"].get("summary"),
+            }
+        if isinstance(continuity.get("current_last_frame"), dict):
+            focus_continuity["current_last_frame"] = {
+                "shot_index": continuity["current_last_frame"].get("shot_index"),
+                "summary": continuity["current_last_frame"].get("summary"),
+            }
+        payload = {
+            "chapter_title": str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}"),
+            "chapter_summary": str((chapter.meta or {}).get("summary") or self._chapter_body_text(chapter)[:240]),
+            "shot_index": shot_index,
+            "target_duration_sec": round(float(shot.get("duration_sec") or 2.0), 2),
+            "shot": {
+                "frame_type": shot.get("frame_type"),
+                "visual": shot.get("visual"),
+                "action": shot.get("action"),
+                "dialogue": shot.get("dialogue"),
+                "characters": shot.get("characters"),
+                "scene": shot.get("scene"),
+                "scene_hint": shot.get("scene_hint"),
+                "props": shot.get("props"),
+                "continuity_anchor": shot.get("continuity_anchor"),
+                "motion_directive": shot.get("motion_directive"),
+            },
+            "film_controls": {
+                "director_style": visual_style.get("director_style"),
+                "real_light_source_strategy": visual_style.get("real_light_source_strategy"),
+                "skin_texture_level": visual_style.get("skin_texture_level"),
+                "shot_distance_profile": visual_style.get("shot_distance_profile"),
+                "lens_package": visual_style.get("lens_package"),
+                "camera_movement_style": visual_style.get("camera_movement_style"),
+                "continuity_method": visual_style.get("continuity_method"),
+            },
+            "continuity_package": focus_continuity,
+            "style_bible": style_directive,
+            "user_video_directive": task_prompt,
+            "hard_constraints": [
+                "generate real motion video for this single shot, never output a static hold frame",
+                "keep character identity, props, wardrobe and lighting stable against the reference image",
+                "respect the first/last frame continuity package when present",
+                "no readable subtitles, captions, logos or watermarks",
             ],
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -6043,37 +8704,162 @@ class PipelineService:
         request_params: dict[str, Any],
         shot_index: int,
     ) -> tuple[ProviderResponse, dict[str, Any], str, float]:
-        models_to_try = self._storyboard_image_model_candidates(provider, primary_model)
+        class _MissingStoryboardImageError(ValueError):
+            pass
+
+        fallback_limit = int(request_params.get("storyboard_model_fallback_limit") or STORYBOARD_IMAGE_FALLBACK_LIMIT)
+        models_to_try = self._storyboard_image_model_candidates(provider, primary_model, fallback_limit=fallback_limit)
         last_error: Exception | None = None
         for candidate_model in models_to_try:
-            try:
-                req = ProviderRequest(
-                    step="image",
-                    model=candidate_model,
-                    input={"prompt": image_prompt, "reference_images": request_params.get("reference_images", [])},
-                    prompt=system_prompt,
-                    params=request_params,
+            prompt_variants = [image_prompt]
+            if bool(request_params.get("forbid_readable_text", True)):
+                prompt_variants.append(
+                    "\n".join(
+                        [
+                            image_prompt,
+                            "Text correction: absolutely no readable letters, subtitles, captions, signage, logos or watermarks anywhere in frame.",
+                        ]
+                    )
                 )
-                response = await adapter.invoke(req)
-                artifact = deepcopy(response.output or {})
-                if not any(isinstance(artifact.get(key), str) and artifact.get(key) for key in ("image_data_url", "image_base64", "image_url", "thumbnail_url")):
-                    raise ValueError(self._storyboard_missing_image_reason(response, artifact, shot_index))
-                cost = await adapter.estimate_cost(req, response.usage)
-                return response, artifact, candidate_model, cost
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                continue
+            for prompt_variant in prompt_variants[:STORYBOARD_TEXT_RETRY_LIMIT]:
+                try:
+                    req = ProviderRequest(
+                        step="image",
+                        model=candidate_model,
+                        input={"prompt": prompt_variant, "reference_images": request_params.get("reference_images", [])},
+                        prompt=system_prompt,
+                        params=request_params,
+                    )
+                    response = await adapter.invoke(req)
+                    artifact = deepcopy(response.output or {})
+                    if not any(isinstance(artifact.get(key), str) and artifact.get(key) for key in ("image_data_url", "image_base64", "image_url", "thumbnail_url")):
+                        raise _MissingStoryboardImageError(self._storyboard_missing_image_reason(response, artifact, shot_index))
+                    text_detection = self._detect_readable_text_in_image_artifact(artifact)
+                    artifact["text_detection"] = text_detection
+                    if text_detection.get("has_readable_text"):
+                        detected = ", ".join(text_detection.get("tokens") or []) or "readable overlay text"
+                        raise ValueError(f"storyboard_image generated readable text for shot {shot_index}: {detected}")
+                    cost = await adapter.estimate_cost(req, response.usage)
+                    return response, artifact, candidate_model, cost
+                except _MissingStoryboardImageError as exc:
+                    last_error = exc
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    continue
         raise ValueError(str(last_error) if last_error else f"storyboard_image failed on shot {shot_index}")
 
-    def _storyboard_image_model_candidates(self, provider: str, primary_model: str) -> list[str]:
+    def _detect_readable_text_in_image_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
+        if not shutil.which("tesseract"):
+            return {"enabled": False, "has_readable_text": False, "tokens": [], "method": "tesseract_unavailable"}
+        image_bytes = self._image_bytes_from_artifact(artifact)
+        if not image_bytes:
+            return {"enabled": True, "has_readable_text": False, "tokens": [], "method": "no_image_bytes"}
+        ocr_text = self._ocr_text_from_image_bytes(image_bytes)
+        tokens = self._extract_readable_text_tokens(ocr_text)
+        return {
+            "enabled": True,
+            "has_readable_text": bool(tokens),
+            "tokens": tokens[:8],
+            "raw_text": (ocr_text[:180] + "...") if len(ocr_text) > 180 else ocr_text,
+            "method": "tesseract",
+        }
+
+    def _image_bytes_from_artifact(self, artifact: dict[str, Any]) -> bytes | None:
+        image_data_url = artifact.get("image_data_url")
+        image_base64 = artifact.get("image_base64")
+        image_url = artifact.get("image_url") or artifact.get("thumbnail_url")
+        if isinstance(image_data_url, str) and image_data_url.startswith("data:") and ";base64," in image_data_url:
+            try:
+                return base64.b64decode(image_data_url.split(",", 1)[1])
+            except Exception:
+                return None
+        if isinstance(image_base64, str) and image_base64:
+            try:
+                return base64.b64decode(image_base64)
+            except Exception:
+                return None
+        if isinstance(image_url, str) and image_url.startswith(("http://", "https://")):
+            try:
+                import httpx
+
+                response = httpx.get(image_url, timeout=60)
+                response.raise_for_status()
+                return response.content
+            except Exception:
+                return None
+        return None
+
+    def _ocr_text_from_image_bytes(self, image_bytes: bytes) -> str:
+        try:
+            from PIL import Image, ImageOps
+
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                image = ImageOps.exif_transpose(image)
+                image = image.convert("L")
+                image = ImageOps.autocontrast(image)
+                image = image.point(lambda value: 255 if value > 180 else 0)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    temp_path = Path(tmp.name)
+                    image.save(tmp, format="PNG")
+        except Exception:
+            return ""
+        try:
+            completed = subprocess.run(
+                [
+                    "tesseract",
+                    str(temp_path),
+                    "stdout",
+                    "-l",
+                    STORYBOARD_TEXT_OCR_LANG,
+                    "--psm",
+                    "11",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+            if completed.returncode != 0:
+                return ""
+            return completed.stdout.strip()
+        except Exception:
+            return ""
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def _extract_readable_text_tokens(self, text: str) -> list[str]:
+        if not text:
+            return []
+        tokens: list[str] = []
+        for match in STORYBOARD_TEXT_TOKEN_PATTERN.finditer(text):
+            token = match.group(0).strip()
+            normalized = re.sub(r"[_\\-]", "", token).lower()
+            if not normalized or normalized in STORYBOARD_TEXT_IGNORE_TOKENS:
+                continue
+            if len(set(normalized)) == 1 and len(normalized) <= 4:
+                continue
+            is_cjk = bool(re.fullmatch(r"[\u4e00-\u9fff]{2,}", token))
+            if not is_cjk:
+                ascii_token = re.sub(r"[^A-Za-z0-9]", "", token)
+                if not ascii_token:
+                    continue
+                has_digit = any(char.isdigit() for char in ascii_token)
+                is_all_upper = ascii_token.isupper()
+                if len(ascii_token) < 5 and not has_digit and not is_all_upper:
+                    continue
+            tokens.append(token)
+        return list(dict.fromkeys(tokens))
+
+    def _storyboard_image_model_candidates(self, provider: str, primary_model: str, *, fallback_limit: int) -> list[str]:
         if provider != "openrouter":
             return [primary_model]
         catalog = [item for item in self.registry.list_catalog() if item.provider == provider and item.step == "image"]
         available = catalog[0].models if catalog else []
         preferred = [
             primary_model,
-            "openai/gpt-5-image-mini",
+            "google/gemini-2.5-flash-image",
             "google/gemini-3.1-flash-image-preview",
+            "openai/gpt-5-image-mini",
             "google/gemini-3-pro-image-preview",
             "openai/gpt-5-image",
         ]
@@ -6083,7 +8869,7 @@ class PipelineService:
                 candidates.append(item)
         if not candidates:
             candidates.append(primary_model)
-        return candidates[:STORYBOARD_IMAGE_FALLBACK_LIMIT]
+        return candidates[: max(1, fallback_limit)]
 
     def _build_storyboard_image_prompt(
         self,
@@ -6106,6 +8892,12 @@ class PipelineService:
                 str(visual_style.get("rendering") or "").strip(),
                 str(visual_style.get("lighting") or "").strip(),
                 str(visual_style.get("camera_language") or "").strip(),
+                str(visual_style.get("director_style") or "").strip(),
+                str(visual_style.get("real_light_source_strategy") or "").strip(),
+                str(visual_style.get("skin_texture_level") or "").strip(),
+                str(visual_style.get("shot_distance_profile") or "").strip(),
+                str(visual_style.get("lens_package") or "").strip(),
+                str(visual_style.get("camera_movement_style") or "").strip(),
                 keywords,
                 palette,
                 str(visual_style.get("custom_style") or "").strip(),
@@ -6125,12 +8917,22 @@ class PipelineService:
             chapter=chapter,
             allow_fallback=False,
         )
+        related_props = self._story_bible_entities_for_prompt(
+            story_bible.get("props"),
+            shot,
+            chapter=chapter,
+            allow_fallback=False,
+        )
         primary_characters = ", ".join(str(item) for item in (shot.get("characters") or []) if str(item).strip())
+        primary_props = ", ".join(str(item) for item in (shot.get("props") or []) if str(item).strip())
         primary_scene = str(shot.get("scene_hint") or shot.get("scene") or "").strip()
         constraints = [
             "single cinematic storyboard frame",
             "no text overlay",
             "no subtitles",
+            "no captions",
+            "no logos",
+            "no watermarks",
             "no split panels",
             "no comic layout",
             "consistent character identity",
@@ -6162,14 +8964,24 @@ class PipelineService:
             f"Rendering: {visual_style.get('rendering') if isinstance(visual_style, dict) else '写实电影画面'}",
             f"Lighting: {visual_style.get('lighting') if isinstance(visual_style, dict) else ''}",
             f"Camera language: {visual_style.get('camera_language') if isinstance(visual_style, dict) else ''}",
+            f"Director style: {visual_style.get('director_style') if isinstance(visual_style, dict) else ''}",
+            f"Real light source strategy: {visual_style.get('real_light_source_strategy') if isinstance(visual_style, dict) else ''}",
+            f"Skin texture level: {visual_style.get('skin_texture_level') if isinstance(visual_style, dict) else ''}",
+            f"Shot distance profile: {visual_style.get('shot_distance_profile') if isinstance(visual_style, dict) else ''}",
+            f"Lens package: {visual_style.get('lens_package') if isinstance(visual_style, dict) else ''}",
+            f"Camera movement style: {visual_style.get('camera_movement_style') if isinstance(visual_style, dict) else ''}",
+            f"Continuity method: {visual_style.get('continuity_method') if isinstance(visual_style, dict) else ''}",
+            f"First/last frame bridge: {'enabled' if bool(visual_style.get('first_last_frame_bridge')) else 'disabled'}",
             f"Scene description: {safe_visual}",
             f"Character action: {safe_action}",
             f"Dialogue context: {safe_dialogue}",
             f"Shot type: {shot.get('frame_type') or '中景'}",
             f"Primary characters in this shot: {primary_characters}",
+            f"Primary props in this shot: {primary_props}",
             f"Primary scene in this shot: {primary_scene}",
             f"Character reference anchors: {related_characters}",
             f"Scene reference anchors: {related_scenes}",
+            f"Prop reference anchors: {related_props}",
             f"Continuity anchor: {shot.get('continuity_anchor') or ''}",
             f"User image directive: {task_prompt}",
             f"Consistency correction hint: {auto_revision_prompt or ''}",
@@ -6448,6 +9260,13 @@ class PipelineService:
                 str(storage_key).strip() if isinstance(storage_key, str) and str(storage_key).strip() else None,
                 str(image_url).strip() if isinstance(image_url, str) and str(image_url).strip() else None,
             )
+        if group == "props":
+            storage_key = raw.get("prop_reference_storage_key") or raw.get("reference_storage_key")
+            image_url = raw.get("prop_reference_image_url") or raw.get("reference_image_url")
+            return (
+                str(storage_key).strip() if isinstance(storage_key, str) and str(storage_key).strip() else None,
+                str(image_url).strip() if isinstance(image_url, str) and str(image_url).strip() else None,
+            )
         storage_key = raw.get("scene_reference_storage_key") or raw.get("reference_storage_key")
         image_url = raw.get("scene_reference_image_url") or raw.get("reference_image_url")
         return (
@@ -6455,23 +9274,156 @@ class PipelineService:
             str(image_url).strip() if isinstance(image_url, str) and str(image_url).strip() else None,
         )
 
+    def _story_bible_reference_variants_for_group(self, group: str) -> list[tuple[str, str]]:
+        if group == "characters":
+            return list(STORY_BIBLE_CHARACTER_VIEWS)
+        if group == "props":
+            return list(STORY_BIBLE_PROP_VIEWS)
+        return list(STORY_BIBLE_SCENE_VIEWS)
+
+    def _story_bible_reference_kind_for_group(self, group: str, variant_key: str) -> str:
+        if group == "characters":
+            return f"identity-{variant_key}"
+        if group == "props":
+            return f"prop-{variant_key}"
+        return f"scene-{variant_key}"
+
+    def _story_bible_reference_view_field_for_group(self, group: str) -> str:
+        if group == "characters":
+            return "identity_reference_views"
+        if group == "props":
+            return "prop_reference_views"
+        return "scene_reference_variants"
+
+    def _story_bible_reference_primary_fields_for_group(self, group: str) -> tuple[str, str, str, str]:
+        if group == "characters":
+            return (
+                "identity_reference_image_url",
+                "identity_reference_storage_key",
+                "identity_reference_provider",
+                "identity_reference_model",
+            )
+        if group == "props":
+            return (
+                "prop_reference_image_url",
+                "prop_reference_storage_key",
+                "prop_reference_provider",
+                "prop_reference_model",
+            )
+        return (
+            "scene_reference_image_url",
+            "scene_reference_storage_key",
+            "scene_reference_provider",
+            "scene_reference_model",
+        )
+
+    def _locate_story_bible_reference_variant_path(
+        self,
+        project: Project,
+        group: str,
+        name: str,
+        variant_key: str,
+    ) -> Path | None:
+        safe_name = sanitize_component(name)
+        if not safe_name:
+            return None
+        reference_kind = self._story_bible_reference_kind_for_group(group, variant_key)
+        target_dir = project_category_dir(project.id, project.name, "references") / group / reference_kind
+        if not target_dir.exists():
+            return None
+        matches = [
+            path
+            for path in target_dir.glob(f"{reference_kind}-*-{safe_name}*")
+            if path.is_file()
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda path: (path.stat().st_mtime, path.name))
+        return matches[-1]
+
+    def _hydrate_story_bible_reference_item_from_disk(
+        self,
+        project: Project,
+        group: str,
+        item: dict[str, Any],
+    ) -> dict[str, Any]:
+        hydrated = deepcopy(item)
+        name = str(hydrated.get("name") or "").strip()
+        if not name:
+            return hydrated
+
+        view_field = self._story_bible_reference_view_field_for_group(group)
+        existing_views = {
+            str(entry.get("view_key") or "").strip(): deepcopy(entry)
+            for entry in (hydrated.get(view_field) if isinstance(hydrated.get(view_field), list) else [])
+            if isinstance(entry, dict) and str(entry.get("view_key") or "").strip()
+        }
+        resolved_views: list[dict[str, Any]] = []
+        for variant_key, variant_label in self._story_bible_reference_variants_for_group(group):
+            current = existing_views.get(variant_key, {})
+            path = self._locate_story_bible_reference_variant_path(project, group, name, variant_key)
+            if path is None and not current:
+                continue
+            if path is not None:
+                local_url = self._to_local_file_url(path)
+                current.update(
+                    {
+                        "view_key": variant_key,
+                        "view_label": variant_label,
+                        "image_url": local_url,
+                        "thumbnail_url": local_url,
+                        "export_url": local_url,
+                        "storage_key": str(path),
+                    }
+                )
+            else:
+                current.setdefault("view_key", variant_key)
+                current.setdefault("view_label", variant_label)
+            resolved_views.append(current)
+
+        expected = len(self._story_bible_reference_variants_for_group(group))
+        primary_image_field, primary_storage_field, primary_provider_field, primary_model_field = self._story_bible_reference_primary_fields_for_group(group)
+        hydrated[view_field] = resolved_views
+        hydrated["reference_variant_expected"] = expected
+        hydrated["reference_variant_count"] = len(resolved_views)
+        if resolved_views:
+            primary = resolved_views[0]
+            hydrated["reference_generation_status"] = "SUCCEEDED" if len(resolved_views) == expected else "PARTIAL"
+            if len(resolved_views) == expected:
+                hydrated["reference_generation_error"] = ""
+            hydrated["reference_image_url"] = primary.get("image_url") or hydrated.get("reference_image_url")
+            hydrated["reference_storage_key"] = primary.get("storage_key") or hydrated.get("reference_storage_key")
+            hydrated[primary_image_field] = primary.get("image_url") or hydrated.get(primary_image_field)
+            hydrated[primary_storage_field] = primary.get("storage_key") or hydrated.get(primary_storage_field)
+            if primary.get("provider"):
+                hydrated["reference_provider"] = primary.get("provider")
+                hydrated[primary_provider_field] = primary.get("provider")
+            if primary.get("model"):
+                hydrated["reference_model"] = primary.get("model")
+                hydrated[primary_model_field] = primary.get("model")
+        elif not str(hydrated.get("reference_generation_status") or "").strip():
+            hydrated["reference_generation_status"] = "MISSING"
+        return hydrated
+
     def _story_bible_reference_images_for_shot(
         self,
         project: Project,
         shot: dict[str, Any],
         *,
         chapter: ChapterChunk | None = None,
+        limit: int = STORYBOARD_REFERENCE_IMAGE_LIMIT,
     ) -> list[dict[str, Any]]:
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         shot_text = self._story_bible_matching_text(shot)
         selected: list[dict[str, Any]] = []
-        for group in ("characters", "scenes"):
-            allow_fallback = False
+        effective_limit = max(1, int(limit or STORYBOARD_REFERENCE_IMAGE_LIMIT))
+        prioritized_groups = ("characters", "scenes")
+        for group in prioritized_groups:
             candidates = self._extract_shot_entities(
                 story_bible.get(group, []) if isinstance(story_bible, dict) else [],
                 shot_text,
                 chapter=chapter,
-                limit=STORYBOARD_REFERENCE_IMAGE_LIMIT,
+                limit=effective_limit,
             )
             for raw in (story_bible.get(group, []) if isinstance(story_bible, dict) else []):
                 if not isinstance(raw, dict):
@@ -6480,21 +9432,49 @@ class PipelineService:
                 if not name or name not in candidates:
                     continue
                 storage_key, image_url = self._story_bible_entity_reference_fields(group, raw)
-                data_url = self._reference_image_data_url(storage_key, image_url, variant="portrait" if group == "characters" else "full")
+                data_url = self._reference_image_data_url(
+                    storage_key,
+                    image_url,
+                    variant="portrait" if group == "characters" else "full",
+                )
                 if data_url:
                     selected.append({"url": data_url, "label": f"{group}:{name}"})
         if selected:
-            return selected[:STORYBOARD_REFERENCE_IMAGE_LIMIT]
-        return self._story_bible_reference_images_for_chapter(project, chapter=chapter)[:STORYBOARD_REFERENCE_IMAGE_LIMIT]
+            return selected[:effective_limit]
+        # Prop reference images are intentionally excluded from storyboard-image conditioning
+        # when character/scene anchors exist. In practice, object packshots frequently make
+        # OpenRouter image models fall back to text-only responses on wide cinematic shots.
+        for group in ("props",):
+            candidates = self._extract_shot_entities(
+                story_bible.get(group, []) if isinstance(story_bible, dict) else [],
+                shot_text,
+                chapter=chapter,
+                limit=effective_limit,
+            )
+            for raw in (story_bible.get(group, []) if isinstance(story_bible, dict) else []):
+                if not isinstance(raw, dict):
+                    continue
+                name = str(raw.get("name") or "").strip()
+                if not name or name not in candidates:
+                    continue
+                storage_key, image_url = self._story_bible_entity_reference_fields(group, raw)
+                data_url = self._reference_image_data_url(storage_key, image_url, variant="full")
+                if data_url:
+                    selected.append({"url": data_url, "label": f"{group}:{name}"})
+        if selected:
+            return selected[:effective_limit]
+        return self._story_bible_reference_images_for_chapter(project, chapter=chapter, limit=effective_limit)[:effective_limit]
 
     def _story_bible_reference_images_for_chapter(
         self,
         project: Project,
         chapter: ChapterChunk | None = None,
+        limit: int = STORYBOARD_REFERENCE_IMAGE_LIMIT,
     ) -> list[dict[str, Any]]:
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         selected: list[dict[str, Any]] = []
         chapter_text = self._chapter_story_bible_matching_text(chapter)
+        effective_limit = max(1, int(limit or STORYBOARD_REFERENCE_IMAGE_LIMIT))
         for group in ("characters", "scenes"):
             allow_fallback = group == "characters"
             chosen = set(
@@ -6502,7 +9482,7 @@ class PipelineService:
                     story_bible.get(group, []) if isinstance(story_bible, dict) else [],
                     chapter_text,
                     chapter=chapter,
-                    limit=STORYBOARD_REFERENCE_IMAGE_LIMIT,
+                    limit=effective_limit,
                 )
             )
             if not chosen and allow_fallback:
@@ -6512,7 +9492,7 @@ class PipelineService:
                         story_bible.get(group, []) if isinstance(story_bible, dict) else [],
                         chapter_text,
                         chapter=chapter,
-                        limit=STORYBOARD_REFERENCE_IMAGE_LIMIT,
+                        limit=effective_limit,
                         allow_fallback=True,
                     )
                 }
@@ -6526,7 +9506,28 @@ class PipelineService:
                 data_url = self._reference_image_data_url(storage_key, image_url, variant="portrait" if group == "characters" else "full")
                 if data_url:
                     selected.append({"url": data_url, "label": f"{group}:{name}"})
-        return selected[:STORYBOARD_REFERENCE_IMAGE_LIMIT]
+        if selected:
+            return selected[:effective_limit]
+        for group in ("props",):
+            chosen = set(
+                self._extract_shot_entities(
+                    story_bible.get(group, []) if isinstance(story_bible, dict) else [],
+                    chapter_text,
+                    chapter=chapter,
+                    limit=effective_limit,
+                )
+            )
+            for raw in (story_bible.get(group, []) if isinstance(story_bible, dict) else []):
+                if not isinstance(raw, dict):
+                    continue
+                name = str(raw.get("name") or "").strip()
+                if chosen and name not in chosen:
+                    continue
+                storage_key, image_url = self._story_bible_entity_reference_fields(group, raw)
+                data_url = self._reference_image_data_url(storage_key, image_url, variant="full")
+                if data_url:
+                    selected.append({"url": data_url, "label": f"{group}:{name}"})
+        return selected[:effective_limit]
 
     def _build_source_document_input(self, project: Project, step_name: str) -> dict[str, Any]:
         document = self.db.scalar(

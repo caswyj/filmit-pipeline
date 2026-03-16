@@ -28,6 +28,11 @@ class ModelBindingPayload(BaseModel):
     bindings: dict[str, list[dict[str, str]]]
 
 
+class StoryBibleEntityRegeneratePayload(BaseModel):
+    kind: str = Field(pattern="^(characters|scenes|props)$")
+    name: str = Field(min_length=1, max_length=255)
+
+
 class ProjectRead(BaseModel):
     id: str
     name: str

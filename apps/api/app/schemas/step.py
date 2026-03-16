@@ -49,6 +49,7 @@ class BatchStepChapterResultRead(BaseModel):
     chapter_title: str
     status: str
     detail: str
+    estimated_cost: float | None = None
 
 
 class BatchStepRunResponse(BaseModel):
@@ -58,6 +59,7 @@ class BatchStepRunResponse(BaseModel):
     succeeded: int
     failed: int
     skipped: int
+    total_estimated_cost: float = 0.0
     chapter_results: list[BatchStepChapterResultRead]
     current_step: StepRead | None = None
 

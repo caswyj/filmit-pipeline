@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import base64
+import io
+import shutil
+
+import pytest
 from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw, ImageFont
 
 from tests.helpers import fresh_app
 
@@ -68,3 +74,36 @@ def test_storyboard_prompt_softens_explicit_bare_clothing_language(tmp_path) -> 
         assert "PG-13 framing" in first_prompt
         assert "fully clothed adult characters" in first_prompt
 
+
+@pytest.mark.skipif(shutil.which("tesseract") is None, reason="tesseract not installed")
+def test_storyboard_text_detection_flags_readable_overlay(tmp_path) -> None:
+    fresh_app(database_url=f"sqlite:///{tmp_path / 'test_storyboard_text_detection.db'}")
+
+    from app.services.pipeline_service import PipelineService
+
+    image = Image.new("RGB", (480, 200), "white")
+    drawer = ImageDraw.Draw(image)
+    drawer.text((20, 60), "HELLO SUBTITLE", fill="black", font=ImageFont.load_default())
+    image = image.resize((1440, 600))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+
+    service = PipelineService.__new__(PipelineService)
+    detection = service._detect_readable_text_in_image_artifact(
+        {"image_base64": base64.b64encode(buffer.getvalue()).decode("ascii")}
+    )
+
+    assert detection["enabled"] is True
+    assert detection["has_readable_text"] is True
+    assert any("HELLO" in token.upper() or "SUBTITLE" in token.upper() for token in detection["tokens"])
+
+
+def test_storyboard_text_token_extraction_ignores_single_short_ascii_noise(tmp_path) -> None:
+    fresh_app(database_url=f"sqlite:///{tmp_path / 'test_storyboard_text_noise.db'}")
+
+    from app.services.pipeline_service import PipelineService
+
+    service = PipelineService.__new__(PipelineService)
+
+    assert service._extract_readable_text_tokens("Sees") == []
+    assert "EXIT" in service._extract_readable_text_tokens("EXIT")

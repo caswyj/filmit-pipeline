@@ -48,3 +48,25 @@ def test_openrouter_estimate_cost_uses_catalog_pricing_when_provider_cost_missin
     )
 
     assert cost == 0.0023
+
+
+def test_openrouter_image_requests_default_to_small_max_tokens() -> None:
+    adapter = OpenRouterProviderAdapter({})
+    adapter._api_key = "test-key"
+    captured: dict[str, object] = {}
+
+    async def fake_post_json(payload: dict[str, object]) -> dict[str, object]:
+        captured.update(payload)
+        return {"id": "mock", "choices": [{"message": {"content": "", "images": [{"image_url": {"url": "data:image/png;base64,AAAA"}}]}}], "usage": {}}
+
+    adapter._post_json = fake_post_json  # type: ignore[method-assign]
+    req = ProviderRequest(
+        step="image",
+        model="openai/gpt-5-image-mini",
+        input={"prompt": "cinematic ship at sea"},
+        params={},
+    )
+
+    asyncio.run(adapter.invoke(req))
+
+    assert captured["max_tokens"] == 256

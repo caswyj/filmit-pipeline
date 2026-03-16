@@ -213,11 +213,11 @@ class ProviderRegistry:
                                 return item.provider, preferred
                     if step == "image":
                         for preferred in (
-                            "openai/gpt-5-image-mini",
-                            "openai/gpt-5-image",
-                            "google/gemini-3.1-flash-image-preview",
-                            "google/gemini-3-pro-image-preview",
                             "google/gemini-2.5-flash-image",
+                            "google/gemini-3.1-flash-image-preview",
+                            "openai/gpt-5-image-mini",
+                            "google/gemini-3-pro-image-preview",
+                            "openai/gpt-5-image",
                             "openrouter/auto",
                         ):
                             if preferred in item.models:

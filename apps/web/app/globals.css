@@ -182,6 +182,38 @@ a {
   padding-top: 0;
 }
 
+
+.storyBibleVariantGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  padding: 0 14px 14px;
+}
+
+.storyBibleVariantCard {
+  border: 1px solid rgba(21, 35, 59, 0.08);
+  border-radius: 12px;
+  overflow: hidden;
+  background: rgba(245, 243, 236, 0.72);
+}
+
+.storyBibleVariantPreview {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  background: linear-gradient(135deg, rgba(217, 95, 35, 0.08), rgba(21, 35, 59, 0.03));
+}
+
+.storyBibleVariantMeta {
+  padding: 10px 12px 0;
+}
+
+.storyBibleVariantMeta strong {
+  display: block;
+  color: var(--ink);
+}
+
 .downloadLink {
   display: inline-flex;
   align-items: center;
@@ -260,6 +292,24 @@ a {
   gap: 10px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+.uploadPicker {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  padding: 14px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 14px;
+  background: linear-gradient(180deg, #fffdf7 0%, #f7f3ea 100%);
+  cursor: pointer;
+}
+
+.uploadPicker:hover,
+.uploadPicker:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(217, 95, 35, 0.12);
 }
 
 .modelSelectorStack {

@@ -44,7 +44,7 @@ services:
     build:
       context: ./apps/api
       args:
-        PYTHON_BASE_IMAGE: ${N2V_PYTHON_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim}
+        PYTHON_BASE_IMAGE: ${N2V_PYTHON_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim-bookworm}
     env_file:
       - .env
     environment:
@@ -85,7 +85,7 @@ services:
     build:
       context: ./apps/api
       args:
-        PYTHON_BASE_IMAGE: ${N2V_PYTHON_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim}
+        PYTHON_BASE_IMAGE: ${N2V_PYTHON_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim-bookworm}
     env_file:
       - .env
     environment:
@@ -106,7 +106,7 @@ services:
     build:
       context: ./apps/api
       args:
-        PYTHON_BASE_IMAGE: ${N2V_PYTHON_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim}
+        PYTHON_BASE_IMAGE: ${N2V_PYTHON_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim-bookworm}
     env_file:
       - .env
     environment:
