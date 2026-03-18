@@ -1463,6 +1463,208 @@ class PipelineService:
         self.db.commit()
         return result
 
+    async def switch_model_rerun_failed_chapters(self, project: Project, step_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        step = self._get_step(project.id, step_id)
+        if step.step_name not in CHAPTER_SCOPED_STEPS:
+            raise ValueError("switch-model-rerun-failed-chapters is only allowed on chapter-scoped steps")
+        step.model_provider = payload["provider"]
+        step.model_name = payload["model_name"]
+        self.db.add(step)
+        self.db.commit()
+        result = await self.run_step_for_failed_chapters(project, step.step_name, force=True, params=payload.get("params", {}))
+        for item in result["chapter_results"]:
+            if item["status"] != "SKIPPED":
+                self._record_review(project.id, step.id, "chapter", "switch_model_rerun_failed", {**payload, "chapter_id": item["chapter_id"]}, payload["created_by"])
+        self.db.commit()
+        return result
+
+    async def rerun_with_prompt_update(self, project: Project, step_name: str, payload: dict[str, Any]) -> PipelineStep:
+        step = self.db.scalar(select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == step_name))
+        if not step:
+            raise ValueError(f"step not found: {step_name}")
+        prompt_version = self._upsert_prompt_version(
+            project_id=project.id,
+            step_name=step_name,
+            task_prompt=payload["task_prompt"],
+            system_prompt=payload.get("system_prompt"),
+        )
+        self._record_review(
+            project.id,
+            step.id,
+            payload.get("scope_type", "step"),
+            payload.get("action_type", "agent_prompt_refine_rerun"),
+            {**payload, "prompt_version_id": prompt_version.id},
+            payload.get("created_by", "filmit-agent"),
+        )
+        self.db.commit()
+        params = dict(payload.get("params") or {})
+        if payload.get("chapter_id") and step_name in CHAPTER_SCOPED_STEPS:
+            params["chapter_id"] = payload["chapter_id"]
+        return await self.run_specific_step(project, step_name, force=True, params=params)
+
+    async def rerun_all_chapters_with_prompt_update(self, project: Project, step_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        step = self.db.scalar(select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == step_name))
+        if not step:
+            raise ValueError(f"step not found: {step_name}")
+        if step_name not in CHAPTER_SCOPED_STEPS:
+            raise ValueError("rerun-all-chapters-with-prompt-update is only allowed on chapter-scoped steps")
+        prompt_version = self._upsert_prompt_version(
+            project_id=project.id,
+            step_name=step_name,
+            task_prompt=payload["task_prompt"],
+            system_prompt=payload.get("system_prompt"),
+        )
+        self.db.commit()
+        result = await self.run_step_for_all_chapters(project, step_name, force=True, params=payload.get("params", {}))
+        for item in result["chapter_results"]:
+            if item["status"] == "SKIPPED":
+                continue
+            self._record_review(
+                project.id,
+                step.id,
+                "chapter",
+                payload.get("action_type", "agent_prompt_refine_rerun"),
+                {**payload, "chapter_id": item["chapter_id"], "prompt_version_id": prompt_version.id},
+                payload.get("created_by", "filmit-agent"),
+            )
+        self.db.commit()
+        return result
+
+    async def rerun_failed_chapters_with_prompt_update(self, project: Project, step_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        step = self.db.scalar(select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == step_name))
+        if not step:
+            raise ValueError(f"step not found: {step_name}")
+        if step_name not in CHAPTER_SCOPED_STEPS:
+            raise ValueError("rerun-failed-chapters-with-prompt-update is only allowed on chapter-scoped steps")
+        prompt_version = self._upsert_prompt_version(
+            project_id=project.id,
+            step_name=step_name,
+            task_prompt=payload["task_prompt"],
+            system_prompt=payload.get("system_prompt"),
+        )
+        self.db.commit()
+        result = await self.run_step_for_failed_chapters(project, step_name, force=True, params=payload.get("params", {}))
+        for item in result["chapter_results"]:
+            if item["status"] == "SKIPPED":
+                continue
+            self._record_review(
+                project.id,
+                step.id,
+                "chapter",
+                payload.get("action_type", "agent_prompt_refine_rerun_failed"),
+                {**payload, "chapter_id": item["chapter_id"], "prompt_version_id": prompt_version.id},
+                payload.get("created_by", "filmit-agent"),
+            )
+        self.db.commit()
+        return result
+
+    def get_active_prompt_snapshot(self, project_id: str, step_name: str) -> dict[str, Any]:
+        active = self.db.scalar(self._active_prompt_query(project_id, step_name))
+        if not active:
+            system_prompt, task_prompt = self._get_active_prompts(project_id, step_name)
+            active = self.db.scalar(self._active_prompt_query(project_id, step_name))
+            return {
+                "prompt_version_id": getattr(active, "id", None),
+                "system_prompt": system_prompt,
+                "task_prompt": task_prompt,
+                "created_at": getattr(active, "created_at", None),
+            }
+        return {
+            "prompt_version_id": active.id,
+            "system_prompt": active.system_prompt,
+            "task_prompt": active.task_prompt,
+            "created_at": active.created_at,
+        }
+
+    def estimate_step_action_cost(
+        self,
+        project: Project,
+        step_name: str,
+        *,
+        scope_mode: str = "single",
+        chapter_id: str | None = None,
+        provider: str | None = None,
+        model_name: str | None = None,
+    ) -> dict[str, Any]:
+        step = self.db.scalar(select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == step_name))
+        if not step:
+            raise ValueError(f"step not found: {step_name}")
+        bound_provider = provider or step.model_provider or self._resolve_binding(project, step_name, self.step_def_map[step_name].step_type)[0]
+        bound_model = model_name or step.model_name or self._resolve_binding(project, step_name, self.step_def_map[step_name].step_type)[1]
+        if step_name in LOCAL_ONLY_STEPS:
+            return {
+                "estimated_cost": 0.0,
+                "unit_cost": 0.0,
+                "unit_count": 1 if scope_mode == "single" else 0,
+                "currency": "USD",
+                "provider": bound_provider,
+                "model_name": bound_model,
+                "source": "local_fixed_step",
+                "summary": "当前动作对应本地固定步骤，预计不产生模型费用。",
+            }
+
+        unit_count = self._estimate_action_unit_count(project.id, step_name, scope_mode=scope_mode, chapter_id=chapter_id)
+        model_runs = list(
+            self.db.scalars(
+                select(ModelRun)
+                .where(ModelRun.project_id == project.id, ModelRun.step_name == step_name)
+                .order_by(ModelRun.created_at.desc())
+                .limit(24)
+            ).all()
+        )
+        matched = next(
+            (
+                item
+                for item in model_runs
+                if item.provider == bound_provider
+                and item.model_name == bound_model
+                and self._cost_run_matches_scope(item, chapter_id=chapter_id, scope_mode=scope_mode)
+                and float(item.estimated_cost or 0.0) > 0
+            ),
+            None,
+        )
+        fallback = next(
+            (
+                item
+                for item in model_runs
+                if item.provider == bound_provider
+                and item.model_name == bound_model
+                and float(item.estimated_cost or 0.0) > 0
+            ),
+            None,
+        ) or next((item for item in model_runs if float(item.estimated_cost or 0.0) > 0), None)
+        reference_run = matched or fallback
+        if not reference_run:
+            return {
+                "estimated_cost": None,
+                "unit_cost": None,
+                "unit_count": unit_count,
+                "currency": "USD",
+                "provider": bound_provider,
+                "model_name": bound_model,
+                "source": "unavailable",
+                "summary": f"暂时没有足够的历史运行成本来估算 {step_name} 的本次动作费用。",
+            }
+
+        unit_cost = round(float(reference_run.estimated_cost or 0.0), 6)
+        estimated_cost = round(unit_cost * max(unit_count, 1), 6)
+        scope_label = {
+            "single": "单次重跑",
+            "all_chapters": "全章节批量",
+            "failed_chapters": "失败章节批量",
+        }.get(scope_mode, scope_mode)
+        return {
+            "estimated_cost": estimated_cost,
+            "unit_cost": unit_cost,
+            "unit_count": unit_count,
+            "currency": "USD",
+            "provider": bound_provider,
+            "model_name": bound_model,
+            "source": "recent_model_run",
+            "reference_run_id": reference_run.id,
+            "summary": f"基于最近一次 {step_name} 的历史运行估算，{scope_label} 预计费用约 ${estimated_cost:.4f}。",
+        }
+
     def list_steps(self, project_id: str) -> list[PipelineStep]:
         return self._list_steps(project_id)
 
@@ -5666,6 +5868,39 @@ class PipelineService:
         if step_name not in CHAPTER_SCOPED_STEPS:
             return False
         return not self._chapter_participates_in_step(chapter, step_name)
+
+    def _estimate_action_unit_count(self, project_id: str, step_name: str, *, scope_mode: str, chapter_id: str | None) -> int:
+        if step_name not in CHAPTER_SCOPED_STEPS:
+            return 1
+        chapters = self._list_project_chapters(project_id)
+        if scope_mode == "single":
+            return 1 if chapter_id else 1
+        if scope_mode == "failed_chapters":
+            return sum(
+                1
+                for chapter in chapters
+                if not self._should_skip_chapter_for_batch_step(chapter, step_name)
+                and self._chapter_step_status(chapter, step_name) == StepStatus.FAILED.value
+                and self._chapter_dependency_satisfied(project_id, chapter, step_name)
+            )
+        if scope_mode == "all_chapters":
+            return sum(
+                1
+                for chapter in chapters
+                if not self._should_skip_chapter_for_batch_step(chapter, step_name)
+                and self._chapter_dependency_satisfied(project_id, chapter, step_name)
+            )
+        return 1
+
+    def _cost_run_matches_scope(self, run: ModelRun, *, chapter_id: str | None, scope_mode: str) -> bool:
+        request_summary = run.request_summary if isinstance(run.request_summary, dict) else {}
+        params = request_summary.get("params") if isinstance(request_summary.get("params"), dict) else {}
+        run_chapter_id = params.get("chapter_id")
+        if scope_mode == "single" and chapter_id:
+            return run_chapter_id == chapter_id
+        if scope_mode in {"all_chapters", "failed_chapters"}:
+            return bool(run_chapter_id)
+        return True
 
     def _is_fatal_batch_error(self, exc: Exception) -> bool:
         message = str(exc or "").lower()

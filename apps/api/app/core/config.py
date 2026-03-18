@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     volcengine_las_api_key: str | None = None
     volcengine_las_base_url: str = "https://operator.las.cn-shanghai.volces.com/api/v1"
     volcengine_timeout_sec: int = 180
+    agent_provider: str = "openai"
+    agent_model_name: str = "gpt-5-mini"
+    agent_live_model_enabled: bool = True
+    agent_max_output_tokens: int = 900
     video_poll_interval_sec: int = 8
     video_poll_max_attempts: int = 15
 
