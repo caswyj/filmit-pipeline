@@ -1,5 +1,7 @@
 # FilmIt Pipeline
 
+FilmIt Pipeline 是一个面向 AI 漫剧与小说影视化创作的全流程流水线：导入 `PDF/TXT` 小说，自动切章、生成剧本与分镜、联动图像/视频/字幕/配音模型，并在浏览器中提供可人工干预、可回滚、可切换模型的工作台。
+
 本项目当前以 `docs/architecture-v1.1.0.md` 作为技术架构基线：
 
 - `PDF/TXT` 小说输入
@@ -7,6 +9,17 @@
 - 四按钮人工闭环
 - 步骤级模型切换与重跑
 - macOS 本地部署，浏览器访问工作台
+
+## 辛巴达 Demo
+
+《辛巴达航海》项目第 4 章分镜示例：
+
+![辛巴达航海分镜示例](docs/assets/sinbad-storyboard-contact-sheet.png)
+
+视频示例：
+
+- [辛巴达航海 · 第 4 章单镜头 Demo（MP4）](docs/assets/sinbad-shot-demo.mp4)
+- 该示例展示 `分镜出图 -> 视频片段` 的真实媒体链路，分镜图作为 reference 输入，视频由 `Seedance 1.5 Pro` 生成。
 
 ## 目录
 
@@ -65,7 +78,7 @@ docker compose up -d --build api web llm-worker media-worker
 ## 安全说明
 
 - 不要提交 `.env`、本地数据库、浏览器缓存或任何包含真实 API key 的文件。
-- `README.md`、`.env.example` 与代码示例中只使用占位符，例如 `sk-...` 或 `N2V_OPENROUTER_API_KEY=...`。
+- `README.md`、`.env.example` 与代码示例中只使用占位符，例如 `N2V_OPENAI_API_KEY=<your-openai-api-key>`。
 - 当前仓库默认忽略 `.env`、`apps/api/generated/`、`.playwright-cli/`、`*.egg-info/` 等本地生成内容。
 
 ## Playwright 浏览器测试
@@ -108,9 +121,9 @@ npm run playwright:demo-workflow -- --headed --stop-after-step chapter_chunking
 
 ## 文件落盘
 
-当前所有项目相关文件默认统一落盘到：
+当前所有项目相关文件默认统一落盘到 `N2V_GENERATED_DIR` 指向的目录，例如：
 
-- `/Users/wyj/proj/novel-to-video-demo-cases`
+- `/absolute/path/to/novel-to-video-demo-cases`
 
 目录结构按“项目 + 文件类别”组织，例如：
 
@@ -163,7 +176,7 @@ cp .env.example .env
 在 `.env` 中设置：
 
 ```bash
-N2V_OPENAI_API_KEY=sk-...
+N2V_OPENAI_API_KEY=<your-openai-api-key>
 ```
 
 然后重建：
@@ -175,7 +188,7 @@ docker compose up -d --build api web
 说明：
 
 - 若未配置 `N2V_OPENAI_API_KEY`，系统会自动回退到 mock adapter。
-- 分镜图、视频片段、章节脚本等都会写入 `/Users/wyj/proj/novel-to-video-demo-cases`，并通过 `/api/v1/local-files/...` 提供浏览器预览。
+- 分镜图、视频片段、章节脚本等都会写入 `N2V_GENERATED_DIR` 指向的目录，并通过 `/api/v1/local-files/...` 提供浏览器预览。
 - 视频步骤当前已实现“创建任务 -> 轮询状态 -> 下载片段”的主干闭环，轮询参数可通过以下环境变量调整：
 
 ```bash

@@ -12,6 +12,13 @@ class StepRunPayload(BaseModel):
     chapter_id: str | None = None
 
 
+class StepPromptPreviewPayload(BaseModel):
+    params: dict[str, Any] = Field(default_factory=dict)
+    chapter_id: str | None = None
+    system_prompt: str | None = None
+    task_prompt: str | None = None
+
+
 class BatchStepRunPayload(BaseModel):
     force: bool = True
     params: dict[str, Any] = Field(default_factory=dict)
@@ -42,6 +49,27 @@ class ProjectRunResponse(BaseModel):
     project_id: str
     status: str
     current_step: StepRead | None = None
+
+
+class StepPromptPreviewShotRead(BaseModel):
+    shot_index: int
+    title: str
+    motion_directive: str | None = None
+    reference_image_url: str | None = None
+    prompt: str
+
+
+class StepPromptPreviewRead(BaseModel):
+    project_id: str
+    step_name: str
+    chapter_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    prompt_profile: str | None = None
+    prompt_profile_label: str | None = None
+    chapter_prompt: str | None = None
+    shot_prompts: list[StepPromptPreviewShotRead] = Field(default_factory=list)
+    prompt_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class BatchStepChapterResultRead(BaseModel):

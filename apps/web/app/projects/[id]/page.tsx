@@ -79,6 +79,25 @@ type BatchStepRunResponse = {
   current_step: Step | null;
 };
 
+type StepPromptPreview = {
+  project_id: string;
+  step_name: string;
+  chapter_id?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  prompt_profile?: string | null;
+  prompt_profile_label?: string | null;
+  chapter_prompt?: string | null;
+  shot_prompts: Array<{
+    shot_index: number;
+    title: string;
+    motion_directive?: string | null;
+    reference_image_url?: string | null;
+    prompt: string;
+  }>;
+  prompt_summary: Record<string, unknown>;
+};
+
 type ExportRead = {
   id: string;
   status: string;
@@ -225,6 +244,23 @@ const storyboardImageSizeOptions = [
   { value: "1280x720", label: "1280 x 720（推荐均衡）" },
   { value: "1536x1024", label: "1536 x 1024（高成本）" },
 ];
+const videoPromptProfileOptions = [
+  { id: "generic", label: "通用视频模型", description: "适合未明确锁定 provider 的中性提示词结构" },
+  { id: "seedance1_5_pro", label: "Seedance 1.5 Pro", description: "适合火山 Seedance 1.5 Pro，强调 first_frame reference 与单镜头真实运动" },
+  { id: "seedance2", label: "Seedance 2", description: "更短、更具体，强调 reference 起始帧和真实运动" },
+  { id: "sora2", label: "Sora 2", description: "强调时空连续、物理合理和电影镜头语言" },
+  { id: "runway_gen4", label: "Runway Gen-4", description: "强调 reference 构图锚点、镜头节奏和 blocking" },
+  { id: "veo3_1", label: "Veo 3.1", description: "强调写实环境运动、光照变化和结尾帧承接" },
+] as const;
+const videoMotionIntensityOptions = [
+  { id: "low", label: "低", description: "轻动作、克制位移，适合表演和情绪" },
+  { id: "medium", label: "中", description: "中等动作幅度，兼顾主体位移和轻度运镜" },
+  { id: "high", label: "高", description: "强动作或明显运镜，但仍要求主体稳定" },
+] as const;
+const videoAudioModeOptions = [
+  { id: "demo_native_audio", label: "Demo 模式", description: "第 7 步直接生成有声视频片段，第 8 步只保留原生音轨并整理字幕" },
+  { id: "formal_tts", label: "正式成片模式", description: "第 7 步生成静音视频片段，第 8 步统一生成旁白、字幕和配音" },
+] as const;
 
 const stepTypeByName: Record<string, string> = {
   ingest_parse: "chunk",
@@ -426,6 +462,38 @@ function executionCostValue(stats: Record<string, unknown>): number {
   return asNumber(stats.estimated_cost, 0);
 }
 
+function buildVideoPromptEnhancementBlock(options: {
+  profile: string;
+  includeReferenceImage: boolean;
+  includeDialogue: boolean;
+  includeNarration: boolean;
+  motionIntensity: string;
+  audioMode: string;
+  generateAudio: boolean;
+}): string {
+  const profileLabel =
+    videoPromptProfileOptions.find((item) => item.id === options.profile)?.label ?? "通用视频模型";
+  const motionLabel =
+    videoMotionIntensityOptions.find((item) => item.id === options.motionIntensity)?.label ?? "中";
+  const audioModeLabel =
+    videoAudioModeOptions.find((item) => item.id === options.audioMode)?.label ?? "正式成片模式";
+  const lines = [
+    "[Video Model Enhancement]",
+    `- Target profile: ${profileLabel}`,
+    `- Use storyboard frame as reference image input: ${options.includeReferenceImage ? "yes" : "no"}`,
+    `- Include character dialogue basis: ${options.includeDialogue ? "yes" : "no"}`,
+    `- Include narration basis: ${options.includeNarration ? "yes" : "no"}`,
+    `- Motion intensity: ${motionLabel}`,
+    `- Audio mode: ${audioModeLabel}`,
+    `- Generate native model audio: ${options.generateAudio ? "yes" : "no"}`,
+    "- Build the video prompt around character identity, scene, action beat, camera movement, light source logic and continuity anchor.",
+    "- Keep the storyboard frame as the opening composition and identity anchor when reference is enabled.",
+    "- Generate a real moving shot, not a static hold-frame slideshow.",
+    "- No readable subtitles, captions, logos or watermarks.",
+  ];
+  return lines.join("\n");
+}
+
 function extractStoryboardGallery(output: Record<string, unknown>): Record<string, unknown> {
   const gallery = asRecord(output.storyboard_gallery);
   if (Object.keys(gallery).length > 0) return gallery;
@@ -591,6 +659,14 @@ export default function ProjectPage() {
   const [storyboardQuality, setStoryboardQuality] = useState<(typeof storyboardQualityOptions)[number]["id"]>("draft");
   const [storyboardImageSize, setStoryboardImageSize] = useState("1024x576");
   const [storyboardBudgetUsd, setStoryboardBudgetUsd] = useState("5");
+  const [videoPromptProfile, setVideoPromptProfile] = useState<(typeof videoPromptProfileOptions)[number]["id"]>("generic");
+  const [videoUseReferenceImage, setVideoUseReferenceImage] = useState(true);
+  const [videoIncludeDialogue, setVideoIncludeDialogue] = useState(true);
+  const [videoIncludeNarration, setVideoIncludeNarration] = useState(true);
+  const [videoMotionIntensity, setVideoMotionIntensity] = useState<(typeof videoMotionIntensityOptions)[number]["id"]>("medium");
+  const [videoAudioMode, setVideoAudioMode] = useState<(typeof videoAudioModeOptions)[number]["id"]>("formal_tts");
+  const [videoGenerateAudio, setVideoGenerateAudio] = useState(false);
+  const [videoPromptPreview, setVideoPromptPreview] = useState<StepPromptPreview | null>(null);
   const [latestExport, setLatestExport] = useState<ExportRead | null>(null);
   const [storyboardVersions, setStoryboardVersions] = useState<StoryboardVersion[]>([]);
   const [busy, setBusy] = useState(false);
@@ -639,6 +715,18 @@ export default function ProjectPage() {
   const storyboardQualityPreset = useMemo(
     () => storyboardQualityOptions.find((item) => item.id === storyboardQuality) ?? storyboardQualityOptions[0],
     [storyboardQuality]
+  );
+  const selectedVideoPromptProfile = useMemo(
+    () => videoPromptProfileOptions.find((item) => item.id === videoPromptProfile) ?? videoPromptProfileOptions[0],
+    [videoPromptProfile]
+  );
+  const selectedVideoMotionOption = useMemo(
+    () => videoMotionIntensityOptions.find((item) => item.id === videoMotionIntensity) ?? videoMotionIntensityOptions[1],
+    [videoMotionIntensity]
+  );
+  const selectedVideoAudioMode = useMemo(
+    () => videoAudioModeOptions.find((item) => item.id === videoAudioMode) ?? videoAudioModeOptions[1],
+    [videoAudioMode]
   );
   const consistencyDetails = useMemo(() => asRecord(consistencyPayload.details), [consistencyPayload]);
   const videoConsistency = useMemo(() => asRecord(selectedOutput.video_consistency), [selectedOutput]);
@@ -1018,6 +1106,25 @@ export default function ProjectPage() {
     };
   }
 
+  function buildSegmentVideoRunParams() {
+    const generateNativeAudio = videoAudioMode === "demo_native_audio";
+    return {
+      video_prompt_profile: videoPromptProfile,
+      video_use_reference_image: videoUseReferenceImage,
+      video_include_dialogue: videoIncludeDialogue,
+      video_include_narration: videoIncludeNarration,
+      video_motion_intensity: videoMotionIntensity,
+      video_audio_mode: videoAudioMode,
+      generate_audio: generateNativeAudio,
+    };
+  }
+
+  function buildFinalCutRunParams() {
+    return {
+      audio_mode: videoAudioMode,
+    };
+  }
+
   function buildStepParams(options?: { includeChapterId?: boolean }) {
     if (!selected) return {};
     const includeChapterId = options?.includeChapterId ?? true;
@@ -1028,7 +1135,64 @@ export default function ProjectPage() {
     if (selected.step_name === "storyboard_image") {
       Object.assign(params, buildStoryboardRunParams());
     }
+    if (selected.step_name === "segment_video") {
+      Object.assign(params, buildSegmentVideoRunParams());
+    }
+    if (selected.step_name === "stitch_subtitle_tts") {
+      Object.assign(params, buildFinalCutRunParams());
+    }
     return params;
+  }
+
+  function applyVideoPromptEnhancement() {
+    const enhancement = buildVideoPromptEnhancementBlock({
+      profile: videoPromptProfile,
+      includeReferenceImage: videoUseReferenceImage,
+      includeDialogue: videoIncludeDialogue,
+      includeNarration: videoIncludeNarration,
+      motionIntensity: videoMotionIntensity,
+      audioMode: videoAudioMode,
+      generateAudio: videoAudioMode === "demo_native_audio",
+    });
+    const nextPrompt = taskPrompt.includes("[Video Model Enhancement]")
+      ? taskPrompt.replace(/\[Video Model Enhancement\][\s\S]*$/m, enhancement)
+      : `${taskPrompt.trim()}\n\n${enhancement}`.trim();
+    setTaskPrompt(nextPrompt);
+    setActionMessage("已套用视频模型增强提示词模板。");
+  }
+
+  async function previewSegmentVideoPrompt() {
+    if (!projectId || !selected || selected.step_name !== "segment_video" || !selectedChapter) return;
+    setPendingAction("正在生成视频 Prompt 预览...");
+    setBusy(true);
+    setError(null);
+    setActionMessage(null);
+    try {
+      const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/steps/${selected.step_name}/prompt-preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chapter_id: selectedChapter.id,
+          system_prompt: systemPrompt,
+          task_prompt: taskPrompt,
+          params: buildSegmentVideoRunParams(),
+        }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "生成视频 Prompt 预览失败");
+      }
+      const data = (await res.json()) as StepPromptPreview;
+      setVideoPromptPreview(data);
+      setActionProgress(100);
+      setActionMessage(`已生成 ${data.shot_prompts.length} 个镜头的视频 Prompt 预览。`);
+    } catch (err) {
+      setActionProgress(0);
+      setError(err instanceof Error ? err.message : "生成视频 Prompt 预览失败");
+    } finally {
+      setPendingAction(null);
+      setBusy(false);
+    }
   }
 
   async function runCurrentStep(force = true) {
@@ -1445,7 +1609,11 @@ export default function ProjectPage() {
     setError(null);
     setActionMessage(null);
     try {
-      const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/final-cut`, { method: "POST" });
+      const res = await fetch(`${apiBase}/api/v1/projects/${projectId}/final-cut`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: true, params: buildFinalCutRunParams() }),
+      });
       if (!res.ok) {
         const text = await res.text();
         throw new Error(text || "生成成片失败");
@@ -1583,15 +1751,63 @@ export default function ProjectPage() {
   }, [selected?.id, selected?.step_name, selectedChapter?.id, selectedStoryboardParams]);
 
   useEffect(() => {
+    if (selected?.step_name !== "segment_video") return;
+    const nextProfile = asString(selectedStoryboardParams.video_prompt_profile, "generic");
+    const profile =
+      videoPromptProfileOptions.find((item) => item.id === nextProfile) ?? videoPromptProfileOptions[0];
+    const nextMotion = asString(selectedStoryboardParams.video_motion_intensity, "medium");
+    const motion =
+      videoMotionIntensityOptions.find((item) => item.id === nextMotion) ?? videoMotionIntensityOptions[1];
+    setVideoPromptProfile(profile.id);
+    setVideoUseReferenceImage(asBoolean(selectedStoryboardParams.video_use_reference_image, true));
+    setVideoIncludeDialogue(asBoolean(selectedStoryboardParams.video_include_dialogue, true));
+    setVideoIncludeNarration(asBoolean(selectedStoryboardParams.video_include_narration, true));
+    setVideoMotionIntensity(motion.id);
+    const nextAudioMode = asString(
+      selectedStoryboardParams.video_audio_mode,
+      asBoolean(selectedStoryboardParams.generate_audio, false) ? "demo_native_audio" : "formal_tts"
+    );
+    const audioMode =
+      videoAudioModeOptions.find((item) => item.id === nextAudioMode) ?? videoAudioModeOptions[1];
+    setVideoAudioMode(audioMode.id);
+    setVideoGenerateAudio(audioMode.id === "demo_native_audio");
+  }, [selected?.id, selected?.step_name, selectedChapter?.id, selectedStoryboardParams]);
+
+  useEffect(() => {
+    if (selected?.step_name !== "stitch_subtitle_tts") return;
+    const nextAudioMode = asString(
+      selectedStoryboardParams.audio_mode,
+      asString(finalCutSummary.audio_mode, "formal_tts")
+    );
+    const audioMode =
+      videoAudioModeOptions.find((item) => item.id === nextAudioMode) ?? videoAudioModeOptions[1];
+    setVideoAudioMode(audioMode.id);
+    setVideoGenerateAudio(audioMode.id === "demo_native_audio");
+  }, [selected?.id, selected?.step_name, selectedStoryboardParams, finalCutSummary]);
+
+  useEffect(() => {
+    setVideoGenerateAudio(videoAudioMode === "demo_native_audio");
+  }, [videoAudioMode]);
+
+  useEffect(() => {
     loadStoryboardVersions(selected).catch((err) =>
       setError(err instanceof Error ? err.message : "加载分镜版本失败")
     );
   }, [projectId, selected?.id, selected?.step_name, selectedChapter?.id]);
 
   useEffect(() => {
+    setVideoPromptPreview(null);
+  }, [selected?.id, selectedChapter?.id]);
+
+  useEffect(() => {
+    if (selected?.step_name !== "segment_video") return;
+    setVideoPromptPreview(null);
+  }, [selected?.step_name, systemPrompt, taskPrompt, videoPromptProfile, videoUseReferenceImage, videoIncludeDialogue, videoIncludeNarration, videoMotionIntensity, videoAudioMode, videoGenerateAudio]);
+
+  useEffect(() => {
     if (!selected || !chapterScopedSteps.has(selected.step_name) || chapters.length === 0) return;
     const current = selectedChapterId ? chapters.find((chapter) => chapter.id === selectedChapterId) ?? null : null;
-    if (current && chapterHasRenderableOutput(current, selected.step_name)) return;
+    if (current) return;
     const preferred = pickPreferredChapter(chapters, selected.step_name, null);
     if (preferred && preferred.id !== selectedChapterId) {
       setSelectedChapterId(preferred.id);
@@ -2109,6 +2325,14 @@ export default function ProjectPage() {
                 <strong style={{ fontSize: 16 }}>{asString(selectedArtifact.artifact_mode, "-")}</strong>
               </div>
               <div className="metric">
+                <span className="metricLabel">提示词档案</span>
+                <strong style={{ fontSize: 16 }}>{asString(selectedArtifact.prompt_profile_label, asString(selectedArtifact.prompt_profile, "-"))}</strong>
+              </div>
+              <div className="metric">
+                <span className="metricLabel">音频策略</span>
+                <strong style={{ fontSize: 16 }}>{asString(selectedArtifact.audio_mode_label, selectedVideoAudioMode.label)}</strong>
+              </div>
+              <div className="metric">
                 <span className="metricLabel">来源模型</span>
                 <strong style={{ fontSize: 16 }}>{selected.model_provider}/{selected.model_name}</strong>
               </div>
@@ -2153,6 +2377,10 @@ export default function ProjectPage() {
                 <div className="diffItem">最大帧差：{asNumber(motionValidation.max_frame_delta, 0).toFixed(2)}</div>
                 <div className="diffItem">采样帧数：{asString(motionValidation.sample_count, "-")}</div>
                 <div className="diffItem">阈值：{asNumber(motionValidation.threshold, 0).toFixed(2)}</div>
+                <div className="diffItem">reference 输入：{asBoolean(selectedArtifact.reference_image_used, true) ? "已启用" : "未启用"}</div>
+                <div className="diffItem">旁白提示词：{asBoolean(selectedArtifact.narration_basis_included, true) ? "已纳入" : "未纳入"}</div>
+                <div className="diffItem">对话提示词：{asBoolean(selectedArtifact.dialogue_basis_included, true) ? "已纳入" : "未纳入"}</div>
+                <div className="diffItem">原生音轨：{asBoolean(selectedArtifact.native_audio_present, false) ? "已生成" : "未生成"}</div>
                 {!asBoolean(motionValidation.passed, false) ? (
                   <div className="diffItem">告警：当前片段运动幅度过低，建议重跑视频生成。</div>
                 ) : null}
@@ -2246,12 +2474,45 @@ export default function ProjectPage() {
               </div>
               <div className="metric">
                 <span className="metricLabel">旁白音轨</span>
-                <strong style={{ fontSize: 16 }}>{finalCutAudioUrl ? "已生成" : "未生成"}</strong>
+                <strong style={{ fontSize: 16 }}>
+                  {finalCutAudioUrl ? "已生成" : videoAudioMode === "demo_native_audio" ? "已跳过" : "未生成"}
+                </strong>
+              </div>
+              <div className="metric">
+                <span className="metricLabel">音频策略</span>
+                <strong style={{ fontSize: 16 }}>{asString(finalCutSummary.audio_mode_label, selectedVideoAudioMode.label)}</strong>
               </div>
               <div className="metric">
                 <span className="metricLabel">当前模型</span>
                 <strong style={{ fontSize: 16 }}>{selected.model_provider}/{selected.model_name}</strong>
               </div>
+            </div>
+            <div className="card" style={{ padding: 12, marginTop: 12 }}>
+              <strong>成片音频模式</strong>
+              <p className="muted" style={{ marginTop: 8, marginBottom: 10 }}>
+                Demo 模式会直接保留第 7 步原生音轨并跳过 TTS；正式成片模式会统一生成旁白、字幕和配音。
+              </p>
+              <label style={{ display: "block" }}>
+                成片音频策略
+                <select
+                  className="fullWidthControl"
+                  value={videoAudioMode}
+                  onChange={(e) => setVideoAudioMode(e.target.value as (typeof videoAudioModeOptions)[number]["id"])}
+                  disabled={busy}
+                  data-testid="final-cut-audio-mode-select"
+                >
+                  {videoAudioModeOptions.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}：{option.description}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="muted" style={{ marginTop: 8, marginBottom: 0 }}>
+                {asString(finalCutSummary.audio_mode_reason, videoAudioMode === "demo_native_audio"
+                  ? "当前会尝试直接复用第 7 步原生音轨。"
+                  : "当前会在第 8 步统一生成旁白和字幕。")}
+              </p>
             </div>
             {asString(finalCutSummary.narration_writer_model, "") ? (
               <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
@@ -2259,7 +2520,7 @@ export default function ProjectPage() {
               </p>
             ) : null}
             <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
-              一键生成会自动执行本阶段，整理旁白脚本与字幕，然后把全部章节视频片段合成为最终 MP4。
+              一键生成会按照当前音频策略自动执行本阶段：Demo 模式只整理字幕并保留原生音轨；正式成片模式会统一生成旁白、字幕与配音，再合成为最终 MP4。
             </p>
           </section>
           <section className="card mediaGalleryCard">
@@ -2875,6 +3136,159 @@ export default function ProjectPage() {
                     : "精修模式会放宽分辨率与 fallback，适合少量精选章节，不适合大批量连跑。"}
                 </p>
               )}
+            </div>
+          ) : null}
+          {selected?.step_name === "segment_video" ? (
+            <div className="card" style={{ padding: 12, marginBottom: 12 }} data-testid="segment-video-prompt-panel">
+              <strong>视频提示词增强</strong>
+              <p className="muted" style={{ marginTop: 8, marginBottom: 10 }}>
+                将当前分镜图作为 reference 输入，并把人物、动作、旁白、镜头运动和首尾帧桥接一起编入视频模型提示词。
+              </p>
+              <div className="modelSelectorStack">
+                <label>
+                  视频模型提示词档案
+                  <select
+                    className="fullWidthControl"
+                    value={videoPromptProfile}
+                    onChange={(e) => setVideoPromptProfile(e.target.value as (typeof videoPromptProfileOptions)[number]["id"])}
+                    disabled={busy}
+                    data-testid="segment-video-profile-select"
+                  >
+                    {videoPromptProfileOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}：{option.description}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  运动强度
+                  <select
+                    className="fullWidthControl"
+                    value={videoMotionIntensity}
+                    onChange={(e) => setVideoMotionIntensity(e.target.value as (typeof videoMotionIntensityOptions)[number]["id"])}
+                    disabled={busy}
+                    data-testid="segment-video-motion-select"
+                  >
+                    {videoMotionIntensityOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}：{option.description}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  音频策略
+                  <select
+                    className="fullWidthControl"
+                    value={videoAudioMode}
+                    onChange={(e) => setVideoAudioMode(e.target.value as (typeof videoAudioModeOptions)[number]["id"])}
+                    disabled={busy}
+                    data-testid="segment-video-audio-mode-select"
+                  >
+                    {videoAudioModeOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}：{option.description}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="row" style={{ gap: 18, flexWrap: "wrap", marginTop: 8 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={videoUseReferenceImage}
+                    onChange={(e) => setVideoUseReferenceImage(e.target.checked)}
+                    disabled={busy}
+                    data-testid="segment-video-use-reference-checkbox"
+                  />
+                  将分镜图作为 reference image 输入
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={videoIncludeDialogue}
+                    onChange={(e) => setVideoIncludeDialogue(e.target.checked)}
+                    disabled={busy}
+                    data-testid="segment-video-include-dialogue-checkbox"
+                  />
+                  将对话纳入视频提示词
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={videoIncludeNarration}
+                    onChange={(e) => setVideoIncludeNarration(e.target.checked)}
+                    disabled={busy}
+                    data-testid="segment-video-include-narration-checkbox"
+                  />
+                  将旁白纳入视频提示词
+                </label>
+                <span className="pill" data-testid="segment-video-generate-audio-indicator">
+                  {videoAudioMode === "demo_native_audio" ? "第 7 步将直接生成有声音轨" : "第 7 步将保持静音片段"}
+                </span>
+              </div>
+              <div className="row" style={{ marginTop: 10 }}>
+                <button onClick={applyVideoPromptEnhancement} disabled={busy} data-testid="segment-video-apply-enhancement-button">
+                  套用视频模型增强模板
+                </button>
+                <button
+                  onClick={previewSegmentVideoPrompt}
+                  disabled={busy || !selectedChapter}
+                  data-testid="segment-video-preview-prompt-button"
+                >
+                  {busy && pendingAction?.includes("视频 Prompt 预览") ? "预览生成中..." : "预览当前章节视频 Prompt"}
+                </button>
+              </div>
+              <p className="muted modelSelectionHint" style={{ marginTop: 8, marginBottom: 0 }}>
+                当前配置：{selectedVideoPromptProfile.label} / 运动强度 {selectedVideoMotionOption.label} / 音频策略 {selectedVideoAudioMode.label} / reference {videoUseReferenceImage ? "开启" : "关闭"} / 原生音轨 {videoAudioMode === "demo_native_audio" ? "开启" : "关闭"}
+              </p>
+              <p className="muted" style={{ marginTop: 6, marginBottom: 0 }}>
+                {videoAudioMode === "demo_native_audio"
+                  ? "Demo 模式：第 7 步直接生成有声章节片段，第 8 步只整理字幕并保留这些原生音轨。"
+                  : "正式成片模式：第 7 步生成静音章节片段，第 8 步统一生成旁白、字幕和配音。"}
+              </p>
+              {videoPromptPreview ? (
+                <div className="card" style={{ padding: 12, marginTop: 12 }} data-testid="segment-video-prompt-preview">
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <strong>当前章节视频 Prompt 预览</strong>
+                    <span className="pill">
+                      {asString(videoPromptPreview.prompt_profile_label, asString(videoPromptPreview.prompt_profile, "未命名档案"))}
+                    </span>
+                  </div>
+                  <p className="muted" style={{ marginTop: 8 }}>
+                    Provider/Model：{asString(videoPromptPreview.provider, "-")}/{asString(videoPromptPreview.model, "-")}
+                  </p>
+                  <details open style={{ marginTop: 8 }}>
+                    <summary>章节级 Prompt</summary>
+                    <pre style={{ whiteSpace: "pre-wrap", maxHeight: 240, overflow: "auto" }}>
+                      {asString(videoPromptPreview.chapter_prompt, "暂无章节级 Prompt")}
+                    </pre>
+                  </details>
+                  <div className="diffList" style={{ marginTop: 10 }}>
+                    {videoPromptPreview.shot_prompts.slice(0, 6).map((shot) => (
+                      <div key={`${shot.shot_index}-${shot.title}`} className="diffItem" style={{ display: "grid", gap: 6 }}>
+                        <strong>镜头 {shot.shot_index} · {shot.title}</strong>
+                        {asString(shot.motion_directive, "") ? <span>运镜：{asString(shot.motion_directive)}</span> : null}
+                        {asString(shot.reference_image_url, "") ? (
+                          <a className="downloadLink subtle" href={resolveDownloadUrl(asString(shot.reference_image_url, ""))}>
+                            查看该镜头 reference
+                          </a>
+                        ) : null}
+                        <pre style={{ whiteSpace: "pre-wrap", maxHeight: 180, overflow: "auto", margin: 0 }}>
+                          {shot.prompt}
+                        </pre>
+                      </div>
+                    ))}
+                  </div>
+                  {videoPromptPreview.shot_prompts.length > 6 ? (
+                    <p className="muted" style={{ marginBottom: 0 }}>
+                      已展示前 6 个镜头 Prompt，其余镜头可后续按需要继续扩展预览。
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           ) : null}
           {selected && chapterScopedSteps.has(selected.step_name) && failedChapterItems.length > 0 ? (

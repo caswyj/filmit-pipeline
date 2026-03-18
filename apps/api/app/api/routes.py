@@ -30,7 +30,7 @@ from app.schemas.review import (
     SwitchModelRerunPayload,
 )
 from app.schemas.style import StylePresetRead
-from app.schemas.step import AssetRead, ExportRead, ProjectRunResponse, StepRead, StepRunPayload
+from app.schemas.step import AssetRead, ExportRead, ProjectRunResponse, StepPromptPreviewPayload, StepPromptPreviewRead, StepRead, StepRunPayload
 from app.schemas.step import BatchStepRunPayload, BatchStepRunResponse
 from app.schemas.storyboard import SelectStoryboardVersionPayload, StoryboardVersionRead
 from app.services.demo_service import get_demo_case, list_demo_cases
@@ -303,6 +303,22 @@ async def run_specific_step(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return StepRead.model_validate(step)
+
+
+@router.post("/projects/{project_id}/steps/{step_name}/prompt-preview", response_model=StepPromptPreviewRead)
+def preview_step_prompt(
+    project_id: str,
+    step_name: str,
+    payload: StepPromptPreviewPayload,
+    db: Session = Depends(get_db),
+    svc: PipelineService = Depends(get_service),
+) -> StepPromptPreviewRead:
+    project = _get_project_or_404(db, project_id)
+    try:
+        preview = svc.preview_step_prompt(project, step_name, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return StepPromptPreviewRead.model_validate(preview)
 
 
 @router.post("/projects/{project_id}/steps/{step_name}/run-all-chapters", response_model=BatchStepRunResponse)
@@ -628,10 +644,19 @@ async def render_final(project_id: str, db: Session = Depends(get_db), svc: Pipe
 
 
 @router.post("/projects/{project_id}/final-cut", response_model=ExportRead)
-async def generate_final_cut(project_id: str, db: Session = Depends(get_db), svc: PipelineService = Depends(get_service)) -> ExportRead:
+async def generate_final_cut(
+    project_id: str,
+    payload: StepRunPayload | None = None,
+    db: Session = Depends(get_db),
+    svc: PipelineService = Depends(get_service),
+) -> ExportRead:
     project = _get_project_or_404(db, project_id)
     try:
-        export_job = await svc.generate_final_cut(project, force=True)
+        export_job = await svc.generate_final_cut(
+            project,
+            force=True if payload is None else payload.force,
+            params={} if payload is None else payload.params,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return ExportRead.model_validate(export_job)

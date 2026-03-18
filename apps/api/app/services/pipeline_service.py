@@ -40,6 +40,7 @@ from app.db.models import (
     StoryboardVersion,
 )
 from app.services.prompt_service import get_baseline_prompts
+from app.services.object_storage_service import ObjectStorageService
 from app.services.storage_service import project_category_dir, project_root, sanitize_component, step_category, storage_root
 from app.services.style_service import build_style_prompt, normalize_style_profile
 
@@ -86,6 +87,65 @@ STORYBOARD_QUALITY_PROFILES = {
         "shot_retry_limit": 3,
         "batch_budget_usd": 15.0,
     },
+}
+SEGMENT_VIDEO_PROMPT_PROFILES: dict[str, dict[str, Any]] = {
+    "generic": {
+        "label": "通用视频模型",
+        "guidance": [
+            "优先单镜头单动作目标，避免在一个 shot 内塞入过多事件。",
+            "保持人物身份、服装、场景光线和关键道具稳定，不要凭空变形。",
+            "让镜头运动服务叙事，避免无意义漂移、乱晃和抽搐式运动。",
+        ],
+    },
+    "seedance2": {
+        "label": "Seedance 2",
+        "guidance": [
+            "把当前分镜图当作起始关键帧 reference，优先锁定开场构图和主体身份。",
+            "描述应短而具体，聚焦 1 个主动作、1 个镜头运动、1 个情绪目标，避免提示词过载。",
+            "强调真实运动、镜头内动作延续与首尾帧衔接，减少抽象修辞和文学化废话。",
+        ],
+    },
+    "seedance1_5_pro": {
+        "label": "Seedance 1.5 Pro",
+        "guidance": [
+            "将当前分镜图作为 first_frame reference，提示词聚焦主体、动作、运镜与光源逻辑，避免长篇文学化修辞。",
+            "单镜头只保留一个主动作目标，明确动作起点、运动方向、镜头路径和结尾状态，减少模型漂移。",
+            "优先保持人物身份、构图、关键道具与真实运动连续性，必要时为下一镜头留出干净尾帧。",
+        ],
+    },
+    "sora2": {
+        "label": "Sora 2",
+        "guidance": [
+            "强调时空连续、物理合理和电影镜头语言，让动作与镜头移动同步成立。",
+            "清楚描述主体、场景、动作起点和终点，避免大段重复形容词。",
+            "保持光源逻辑、材质和人物表演细节稳定，减少跨帧漂移。",
+        ],
+    },
+    "runway_gen4": {
+        "label": "Runway Gen-4",
+        "guidance": [
+            "把 reference image 作为构图与角色身份锚点，提示词强调运动方向和镜头节奏。",
+            "避免把多个镜头意图塞进同一个片段，单段只保留一个清晰的动作目标。",
+            "突出景深、镜头移动、主体 blocking 与环境细节变化。",
+        ],
+    },
+    "veo3_1": {
+        "label": "Veo 3.1",
+        "guidance": [
+            "强调写实环境运动、摄影机语言和光照变化，动作描述要具备时序。",
+            "清楚写出人物 blocking、景别、镜头路径与环境反馈，减少抽象风格词堆叠。",
+            "让结尾帧为下个镜头留出干净的动作和视线承接。",
+        ],
+    },
+}
+SEGMENT_VIDEO_MOTION_INTENSITY_HINTS = {
+    "low": "轻动作、克制位移，优先细微表演和稳定镜头。",
+    "medium": "中等动作幅度，允许主体位移与轻度摄影机运动。",
+    "high": "强动作或明显运镜，但仍需保持主体结构稳定与画面可控。",
+}
+VIDEO_AUDIO_MODE_LABELS = {
+    "demo_native_audio": "Demo 模式（第 7 步原生音轨，第 8 步跳过 TTS）",
+    "formal_tts": "正式成片模式（第 7 步静音，第 8 步统一旁白/TTS）",
 }
 STORYBOARD_TEXT_OCR_LANG = "eng+chi_sim"
 STORY_BIBLE_CHARACTER_VIEWS = [
@@ -418,6 +478,7 @@ class PipelineService:
     def __init__(self, db: Session) -> None:
         self.db = db
         self.registry = ProviderRegistry()
+        self.object_storage = ObjectStorageService()
         self.step_def_map = {step.step_name: step for step in PIPELINE_STEPS}
 
     def list_provider_catalog(self) -> list[dict[str, Any]]:
@@ -1442,6 +1503,83 @@ class PipelineService:
             self.db.refresh(project)
         return project
 
+    def preview_step_prompt(self, project: Project, step_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        step = self.db.scalar(select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == step_name))
+        if not step:
+            raise ValueError(f"{step_name} step not found")
+        if step_name != "segment_video":
+            raise ValueError("currently only segment_video prompt preview is supported")
+
+        chapter_id = str(payload.get("chapter_id") or "").strip()
+        if not chapter_id:
+            raise ValueError("segment_video prompt preview requires chapter_id")
+        chapter = self._get_chapter(project.id, chapter_id)
+        provider = step.model_provider or self._resolve_binding(project, step_name, self.step_def_map[step_name].step_type)[0]
+        model = step.model_name or self._resolve_binding(project, step_name, self.step_def_map[step_name].step_type)[1]
+        system_prompt, task_prompt = self._get_active_prompts(project.id, step_name)
+        system_prompt = str(payload.get("system_prompt") or system_prompt)
+        task_prompt = str(payload.get("task_prompt") or task_prompt)
+        params = deepcopy(payload.get("params") or {})
+        style_directive = build_style_prompt(project.style_profile)
+        continuity_package = self._chapter_boundary_frame_package(project, chapter)
+        shots = self._chapter_segment_shots(project, chapter)
+        profile_key = self._segment_video_prompt_profile_key(provider, model, params)
+        profile = self._segment_video_prompt_profile(profile_key)
+
+        return {
+            "project_id": project.id,
+            "step_name": step_name,
+            "chapter_id": chapter.id,
+            "provider": provider,
+            "model": model,
+            "prompt_profile": profile_key,
+            "prompt_profile_label": str(profile.get("label") or profile_key),
+            "chapter_prompt": self._build_segment_video_prompt(
+                project,
+                chapter,
+                task_prompt,
+                style_directive,
+                continuity_package=continuity_package,
+                params=params,
+                provider=provider,
+                model=model,
+            ),
+            "shot_prompts": [
+                {
+                    "shot_index": int(shot.get("shot_index") or index + 1),
+                    "title": str(shot.get("title") or f"镜头 {int(shot.get('shot_index') or index + 1):02d}"),
+                    "motion_directive": str(shot.get("motion_directive") or ""),
+                    "reference_image_url": str(shot.get("image_url") or ""),
+                    "prompt": self._build_segment_video_shot_prompt(
+                        project,
+                        chapter,
+                        shot,
+                        task_prompt,
+                        style_directive,
+                        continuity_package=continuity_package,
+                        params=params,
+                        provider=provider,
+                        model=model,
+                    ),
+                }
+                for index, shot in enumerate(shots[:8])
+            ],
+            "prompt_summary": {
+                "shot_count": len(shots),
+                "reference_input_enabled": bool(params.get("video_use_reference_image", True)),
+                "include_dialogue": bool(params.get("video_include_dialogue", True)),
+                "include_narration": bool(params.get("video_include_narration", True)),
+                "motion_intensity": str(params.get("video_motion_intensity") or "medium"),
+                "audio_mode": self._normalize_video_audio_mode(
+                    params.get("video_audio_mode") or params.get("audio_mode"),
+                    fallback="demo_native_audio" if self._segment_video_generate_audio(params) else "formal_tts",
+                ),
+                "profile_guidance": list(profile.get("guidance") or []),
+                "system_prompt": system_prompt,
+                "task_prompt": task_prompt,
+            },
+        }
+
     async def rebuild_story_bible_references(self, project: Project) -> Project:
         chapter_step = self.db.scalar(
             select(PipelineStep).where(PipelineStep.project_id == project.id, PipelineStep.step_name == "chapter_chunking")
@@ -1646,15 +1784,16 @@ class PipelineService:
             self.db.commit()
             raise
 
-    async def generate_final_cut(self, project: Project, *, force: bool = True) -> ExportJob:
+    async def generate_final_cut(self, project: Project, *, force: bool = True, params: dict[str, Any] | None = None) -> ExportJob:
         self.ensure_pipeline_steps(project)
         steps = {item.step_name: item for item in self._list_steps(project.id)}
         final_step = steps.get("stitch_subtitle_tts")
         if final_step is None:
             raise ValueError("final cut step not found")
+        params = params or {}
 
         if final_step.status != StepStatus.APPROVED.value or force:
-            rerun_step = await self._execute_step(project, final_step, params={"force_final_cut": force})
+            rerun_step = await self._execute_step(project, final_step, params={"force_final_cut": force, **params})
             if rerun_step.status == StepStatus.REVIEW_REQUIRED.value:
                 await self.approve_step(
                     project,
@@ -1691,6 +1830,85 @@ class PipelineService:
             if self._chapter_step_status(chapter, "segment_video") == StepStatus.APPROVED.value:
                 approved_segments += 1
         return approved_segments > 0
+
+    def _normalize_video_audio_mode(self, raw_value: Any, *, fallback: str = "formal_tts") -> str:
+        value = str(raw_value or "").strip().lower()
+        if value in VIDEO_AUDIO_MODE_LABELS:
+            return value
+        if value in {"demo", "native", "native_audio", "segment_audio"}:
+            return "demo_native_audio"
+        if value in {"formal", "tts", "voiceover"}:
+            return "formal_tts"
+        return fallback
+
+    def _video_audio_mode_label(self, mode: str) -> str:
+        return VIDEO_AUDIO_MODE_LABELS.get(mode, VIDEO_AUDIO_MODE_LABELS["formal_tts"])
+
+    def _segment_video_generate_audio(self, params: dict[str, Any] | None) -> bool:
+        safe_params = params or {}
+        requested_mode = self._normalize_video_audio_mode(
+            safe_params.get("video_audio_mode") or safe_params.get("audio_mode"),
+            fallback="",
+        )
+        if requested_mode == "demo_native_audio":
+            return True
+        if requested_mode == "formal_tts":
+            return False
+        return bool(safe_params.get("generate_audio", False))
+
+    def _video_has_audio_stream(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe:
+            cmd = [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ]
+            completed = subprocess.run(cmd, capture_output=True, text=True)
+            if completed.returncode == 0:
+                return bool(completed.stdout.strip())
+        cmd = [self._ffmpeg_executable(), "-hide_banner", "-i", str(path)]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+        return "Audio:" in output
+
+    def _resolve_final_cut_audio_mode(
+        self,
+        manifest: list[dict[str, Any]],
+        params: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        safe_params = params or {}
+        requested = self._normalize_video_audio_mode(
+            safe_params.get("audio_mode") or safe_params.get("video_audio_mode"),
+            fallback="",
+        )
+        native_requested = any(bool(item.get("native_audio_requested")) for item in manifest)
+        all_have_audio = bool(manifest) and all(bool(item.get("has_audio_stream")) for item in manifest)
+        some_have_audio = any(bool(item.get("has_audio_stream")) for item in manifest)
+
+        if requested == "demo_native_audio":
+            if all_have_audio:
+                return requested, "全部章节片段都检测到原生音轨，成片将直接保留第 7 步音频。"
+            return (
+                "formal_tts",
+                "你请求了 Demo 模式，但当前并非所有章节片段都带音轨；已自动回退为正式成片模式以避免最终音轨残缺。",
+            )
+        if requested == "formal_tts":
+            return requested, "已显式选择正式成片模式，第 8 步会统一生成旁白与字幕。"
+        if native_requested and all_have_audio:
+            return "demo_native_audio", "检测到当前章节片段已由第 7 步生成完整原生音轨，默认采用 Demo 模式。"
+        if some_have_audio:
+            return "formal_tts", "仅部分章节片段带音轨，为避免成片音频断续，默认改用正式成片模式。"
+        return "formal_tts", "当前章节片段未检测到可复用原生音轨，默认采用正式成片模式。"
 
     def get_export(self, project_id: str, export_id: str) -> ExportJob:
         export = self.db.scalar(
@@ -1890,8 +2108,13 @@ class PipelineService:
                     response = await adapter.invoke(req)
                     estimated_cost = await adapter.estimate_cost(req, response.usage)
 
+            response_output = deepcopy(response.output or {})
+            if step.step_name in {"segment_video", "stitch_subtitle_tts"} and isinstance(response_output, dict):
+                execution_provider = str(response_output.get("provider") or execution_provider)
+                execution_model = str(response_output.get("model") or execution_model)
+
             output = {
-                "artifact": response.output,
+                "artifact": response_output,
                 "prompt": {"system": system_prompt, "task": task_prompt, "style": style_directive},
                 "params": params,
             }
@@ -2470,6 +2693,9 @@ class PipelineService:
                         "scene": str(shot.get("scene") or ""),
                         "scene_hint": str(shot.get("scene_hint") or ""),
                         "continuity_anchor": str(shot.get("continuity_anchor") or ""),
+                        "narration": str(shot.get("narration") or ""),
+                        "composition": str(shot.get("composition") or ""),
+                        "motion_directive": str(shot.get("motion_directive") or ""),
                     },
                     story_bible=story_bible,
                 )
@@ -2977,6 +3203,33 @@ class PipelineService:
         relative = file_path.resolve().relative_to(GENERATED_DIR.resolve()).as_posix()
         return f"/api/v1/local-files/{relative}"
 
+    def _volcengine_reference_object_key(self, project: Project, chapter: ChapterChunk, shot_index: int, source_path: str | Path) -> str:
+        path = Path(source_path)
+        suffix = path.suffix.lower() or ".png"
+        project_slug = sanitize_component(project.name or project.id)
+        return (
+            f"filmit/{project_slug}-{project.id}/chapter-{chapter.chapter_index + 1:03d}/"
+            f"shot-{shot_index:02d}{suffix}"
+        )
+
+    def _upload_reference_frame_for_volcengine(
+        self,
+        project: Project,
+        chapter: ChapterChunk,
+        *,
+        shot_index: int,
+        source_path: str | Path | None,
+    ) -> str:
+        if not source_path:
+            return ""
+        path = Path(str(source_path)).expanduser()
+        if not path.exists():
+            return ""
+        if not self.object_storage.is_configured():
+            return ""
+        object_key = self._volcengine_reference_object_key(project, chapter, shot_index, path)
+        return self.object_storage.upload_local_file(path, object_key)
+
     def _get_step_by_name(self, project_id: str, step_name: str) -> PipelineStep | None:
         return self.db.scalar(
             select(PipelineStep).where(PipelineStep.project_id == project_id, PipelineStep.step_name == step_name).limit(1)
@@ -3140,6 +3393,9 @@ class PipelineService:
                     "storage_key": storage_key,
                     "preview_url": artifact.get("preview_url"),
                     "chapter_excerpt": self._compact_final_cut_text(self._chapter_body_text(chapter), limit=220),
+                    "native_audio_requested": bool(artifact.get("native_audio_requested")),
+                    "has_audio_stream": self._video_has_audio_stream(Path(storage_key)),
+                    "audio_mode": self._normalize_video_audio_mode(artifact.get("audio_mode"), fallback="formal_tts"),
                 }
             )
         return manifest
@@ -3409,6 +3665,7 @@ class PipelineService:
         artifact = deepcopy(output.get("artifact") or {})
         manifest = artifact.get("segment_manifest")
         subtitle_entries = artifact.get("subtitle_entries")
+        audio_mode = self._normalize_video_audio_mode(artifact.get("audio_mode"), fallback="formal_tts")
         return {
             "chapter_count": len({str(item.get('chapter_id') or '') for item in manifest}) if isinstance(manifest, list) else 0,
             "segment_count": len(manifest) if isinstance(manifest, list) else 0,
@@ -3422,6 +3679,12 @@ class PipelineService:
             "narration_writer_provider": artifact.get("narration_writer_provider"),
             "narration_writer_model": artifact.get("narration_writer_model"),
             "target_duration_sec": project.target_duration_sec,
+            "audio_mode": audio_mode,
+            "audio_mode_label": self._video_audio_mode_label(audio_mode),
+            "audio_mode_reason": artifact.get("audio_mode_reason"),
+            "uses_native_segment_audio": bool(artifact.get("uses_native_segment_audio")),
+            "native_audio_segment_count": int(artifact.get("native_audio_segment_count") or 0),
+            "segment_audio_ready": bool(artifact.get("segment_audio_ready")),
         }
 
     def _collect_chapter_video_paths(self, project_id: str) -> list[Path]:
@@ -7464,9 +7727,180 @@ class PipelineService:
             "summary": f"已细化 {len(shots)} 个分镜镜头。",
         }
 
+    def _extract_json_value_from_text(self, text: str) -> Any:
+        candidate = (text or "").strip()
+        if not candidate:
+            return None
+        candidates: list[str] = [candidate]
+        if "```" in candidate:
+            candidates = re.findall(r"```(?:json)?\s*([\[{].*?[\]}])\s*```", candidate, flags=re.DOTALL) + candidates
+        for opening, closing in (("[", "]"), ("{", "}")):
+            start = candidate.find(opening)
+            end = candidate.rfind(closing)
+            if start >= 0 and end > start:
+                candidates.append(candidate[start : end + 1])
+        seen: set[str] = set()
+        for item in candidates:
+            normalized = item.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            try:
+                return json.loads(normalized)
+            except Exception:
+                continue
+        return None
+
+    def _normalize_shot_detail_dialogue(self, text: str) -> tuple[str, str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return "", ""
+        quoted = re.findall(r"[“\"]([^”\"]{2,180})[”\"]", raw)
+        if quoted:
+            dialogue = " ".join(self._compact_final_cut_text(item, limit=96) for item in quoted if item.strip())
+            return dialogue, ""
+        if self._looks_like_first_person_narration(raw):
+            return "", self._compact_final_cut_text(raw, limit=120)
+        return self._compact_final_cut_text(raw, limit=96), ""
+
+    def _parse_shot_detail_json(self, project: Project, chapter: ChapterChunk, text: str) -> dict[str, Any]:
+        parsed = self._extract_json_value_from_text(text)
+        if isinstance(parsed, dict):
+            shot_items = parsed.get("shots")
+            if isinstance(shot_items, list):
+                parsed = shot_items
+            else:
+                return {}
+        if not isinstance(parsed, list):
+            return {}
+
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        shots: list[dict[str, Any]] = []
+        for raw_item in parsed:
+            if not isinstance(raw_item, dict):
+                continue
+            visual_description = str(
+                raw_item.get("visual_description")
+                or raw_item.get("visual")
+                or raw_item.get("summary")
+                or ""
+            ).strip()
+            scene_details = raw_item.get("scene_details")
+            scene_name = ""
+            setting_description = ""
+            lighting = ""
+            if isinstance(scene_details, dict):
+                scene_name = str(scene_details.get("scene_name") or raw_item.get("scene") or "").strip()
+                setting_description = str(scene_details.get("setting_description") or "").strip()
+                lighting = str(scene_details.get("lighting") or "").strip()
+            else:
+                scene_name = str(raw_item.get("scene") or "").strip()
+            character_details = raw_item.get("character_details")
+            raw_characters: list[str] = []
+            action_parts: list[str] = []
+            if isinstance(character_details, list):
+                for item in character_details:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("character_name") or item.get("name") or "").strip()
+                    action = str(item.get("action") or "").strip()
+                    if name and name not in raw_characters:
+                        raw_characters.append(name)
+                    if action:
+                        if name and not action.startswith(name):
+                            action_parts.append(f"{name}{action}")
+                        else:
+                            action_parts.append(action)
+            combined_character_text = " ".join(raw_characters + action_parts)
+            character_matching_text = " ".join(
+                part for part in (combined_character_text, visual_description, str(raw_item.get("dialogue") or "")) if part
+            ).lower()
+            prop_matching_text = " ".join(
+                part
+                for part in (
+                    visual_description,
+                    combined_character_text,
+                    str(raw_item.get("composition") or ""),
+                    str(raw_item.get("dialogue") or ""),
+                )
+                if part
+            )
+            matched_characters = self._extract_shot_entities(
+                story_bible.get("characters") if isinstance(story_bible, dict) else [],
+                character_matching_text,
+                chapter=chapter,
+                limit=3,
+            )
+            matched_props = self._extract_shot_entities(
+                story_bible.get("props") if isinstance(story_bible, dict) else [],
+                prop_matching_text.lower(),
+                chapter=chapter,
+                limit=2,
+            )
+            characters: list[str] = []
+            for candidate in [*matched_characters, *raw_characters]:
+                value = str(candidate or "").strip()
+                if value and value not in characters:
+                    characters.append(value)
+            props: list[str] = []
+            for candidate in matched_props:
+                value = str(candidate or "").strip()
+                if value and value in prop_matching_text and value not in props:
+                    props.append(value)
+            dialogue_text, narration_text = self._normalize_shot_detail_dialogue(str(raw_item.get("dialogue") or ""))
+            action_seed = "；".join(part for part in action_parts if part)
+            if not action_seed:
+                action_seed = str(raw_item.get("action") or "").strip()
+            if not action_seed:
+                action_seed = visual_description
+            scene_hint_parts: list[str] = []
+            for candidate in (scene_name, setting_description, lighting):
+                value = str(candidate or "").strip()
+                if value and value not in scene_hint_parts:
+                    scene_hint_parts.append(value)
+            shot = {
+                "shot_index": int(raw_item.get("shot_index") or raw_item.get("shot_id") or len(shots) + 1),
+                "duration_sec": max(
+                    2.5,
+                    float(raw_item.get("duration_seconds") or raw_item.get("duration_sec") or 6.0),
+                ),
+                "frame_type": str(raw_item.get("shot_distance") or raw_item.get("frame_type") or "中景").strip() or "中景",
+                "visual": self._compact_final_cut_text(
+                    "；".join(part for part in (visual_description, setting_description) if part),
+                    limit=180,
+                ),
+                "action": self._compact_final_cut_text(action_seed, limit=96),
+                "dialogue": dialogue_text,
+                "narration": narration_text,
+                "characters": characters,
+                "props": props,
+                "scene": scene_name[:120],
+                "scene_hint": " / ".join(scene_hint_parts[:3])[:180],
+                "continuity_anchor": "保持同一人物外貌、服装和同一场景光线连续一致。",
+                "composition": self._compact_final_cut_text(str(raw_item.get("composition") or ""), limit=120),
+                "motion_directive": self._compact_final_cut_text(str(raw_item.get("camera_movement") or ""), limit=96),
+            }
+            shots.append(self._enrich_shot_payload(chapter, shot, story_bible=story_bible))
+
+        if not shots:
+            return {}
+        target_shot_count = self._target_chapter_shot_count(project, chapter)
+        if len(shots) > target_shot_count:
+            shots = self._sample_structured_shots(shots, target_shot_count)
+        return {
+            "shot_count": len(shots),
+            "shots": shots,
+            "summary": f"已从分镜细化 JSON 中解析 {len(shots)} 个结构化镜头。",
+        }
+
     def _parse_shot_detail_text(self, project: Project, chapter: ChapterChunk, text: str) -> dict[str, Any]:
         source = str(text or "").strip()
-        if not source or "镜头草案" not in source:
+        if not source:
+            return {}
+        json_payload = self._parse_shot_detail_json(project, chapter, source)
+        if json_payload.get("shots"):
+            return json_payload
+        if "镜头草案" not in source:
             return {}
 
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
@@ -7897,6 +8331,7 @@ class PipelineService:
             model,
             task_prompt,
             style_directive,
+            params,
             continuity_package=continuity_package,
             shots=shots,
             fallback_reason="当前未接入可用的真实视频模型，已回退为带运镜的本地 motion preview。",
@@ -7923,14 +8358,27 @@ class PipelineService:
             frames = self._active_storyboard_frames_for_chapter(project.id, target)
             if not frames:
                 return None
+            shot_specs = {
+                int(item.get("shot_index") or 0): deepcopy(item)
+                for item in self._chapter_shots(target)
+                if isinstance(item, dict)
+            }
             shot_index = min(frames) if edge == "first" else max(frames)
             frame = deepcopy(frames[shot_index])
+            shot_spec = deepcopy(shot_specs.get(shot_index) or {})
             data_url = self._reference_image_data_url(frame.get("storage_key"), frame.get("image_url"))
             return {
                 "chapter_id": target.id,
                 "chapter_title": str((target.meta or {}).get("title") or f"章节 {target.chapter_index + 1}"),
                 "shot_index": shot_index,
-                "summary": str(frame.get("summary") or frame.get("visual") or ""),
+                "summary": str(
+                    shot_spec.get("summary")
+                    or shot_spec.get("action")
+                    or shot_spec.get("visual")
+                    or frame.get("summary")
+                    or frame.get("visual")
+                    or ""
+                ),
                 "storage_key": frame.get("storage_key"),
                 "image_url": frame.get("image_url"),
                 "data_url": data_url,
@@ -7963,7 +8411,7 @@ class PipelineService:
         return package
 
     def _supports_live_segment_video(self, provider: str, adapter: Any) -> bool:
-        if provider != "openai":
+        if provider not in {"openai", "volcengine"}:
             return False
         is_configured = getattr(adapter, "is_configured", None)
         if callable(is_configured):
@@ -7982,6 +8430,9 @@ class PipelineService:
         clip_count = max(len(ordered_indexes), 1)
         default_duration = max(2.0, self._chapter_segment_duration(project, chapter) / clip_count)
         shots: list[dict[str, Any]] = []
+        story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        previous_scene = ""
+        previous_characters: list[str] = []
         for position, shot_index in enumerate(ordered_indexes, start=1):
             frame = deepcopy(frames[shot_index])
             spec = deepcopy(shot_specs.get(shot_index) or {})
@@ -7991,21 +8442,116 @@ class PipelineService:
             except (TypeError, ValueError):
                 duration_sec = default_duration
             merged = {
-                **spec,
                 **frame,
+                **spec,
                 "shot_index": shot_index,
                 "duration_sec": round(max(2.0, min(duration_sec, 6.0)), 2),
                 "storage_key": str(frame.get("storage_key") or ""),
                 "image_url": str(frame.get("image_url") or frame.get("thumbnail_url") or ""),
-                "summary": str(frame.get("summary") or spec.get("visual") or ""),
-                "characters": list(spec.get("characters") or frame.get("characters") or []),
-                "props": list(spec.get("props") or frame.get("props") or []),
-                "scene": str(spec.get("scene") or frame.get("scene") or ""),
-                "scene_hint": str(spec.get("scene_hint") or frame.get("scene_hint") or ""),
-                "motion_directive": self._shot_motion_directive(position),
+                "summary": str(spec.get("summary") or spec.get("action") or spec.get("visual") or frame.get("summary") or ""),
+                "visual": str(spec.get("visual")) if "visual" in spec else str(frame.get("visual") or frame.get("summary") or ""),
+                "action": str(spec.get("action")) if "action" in spec else str(frame.get("action") or frame.get("summary") or ""),
+                "dialogue": str(spec.get("dialogue")) if "dialogue" in spec else str(frame.get("dialogue") or ""),
+                "characters": list(spec.get("characters")) if isinstance(spec.get("characters"), list) else list(frame.get("characters") or []),
+                "props": list(spec.get("props")) if isinstance(spec.get("props"), list) else list(frame.get("props") or []),
+                "scene": str(spec.get("scene")) if "scene" in spec else str(frame.get("scene") or ""),
+                "scene_hint": str(spec.get("scene_hint")) if "scene_hint" in spec else str(frame.get("scene_hint") or ""),
+                "narration": str(spec.get("narration")) if "narration" in spec else "",
+                "motion_directive": str(spec.get("motion_directive") or self._shot_motion_directive(position)),
             }
-            shots.append(merged)
+            prepared = self._prepare_segment_video_shot(
+                project,
+                chapter,
+                merged,
+                story_bible=story_bible,
+                previous_scene=previous_scene,
+                previous_characters=previous_characters,
+            )
+            previous_scene = str(prepared.get("scene") or previous_scene or "")
+            previous_characters = list(prepared.get("characters") or previous_characters or [])
+            shots.append(prepared)
         return shots
+
+    def _prepare_segment_video_shot(
+        self,
+        project: Project,
+        chapter: ChapterChunk,
+        shot: dict[str, Any],
+        *,
+        story_bible: dict[str, Any] | None = None,
+        previous_scene: str = "",
+        previous_characters: list[str] | None = None,
+    ) -> dict[str, Any]:
+        prepared = deepcopy(shot)
+        previous_characters = previous_characters or []
+        if not isinstance(story_bible, dict):
+            story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
+        prepared = self._enrich_shot_payload(chapter, prepared, story_bible=story_bible)
+
+        visual_source = str(prepared.get("visual") or prepared.get("summary") or "").strip()
+        action_source = str(prepared.get("action") or visual_source).strip()
+        dialogue_source = str(prepared.get("dialogue") or "").strip()
+        narration_source = str(prepared.get("narration") or "").strip()
+        combined_text = " ".join(part for part in (visual_source, action_source, dialogue_source, narration_source) if part)
+
+        protagonist = self._default_story_bible_character(story_bible)
+        if not (prepared.get("characters") or []):
+            if self._looks_like_first_person_narration(combined_text) and protagonist:
+                prepared["characters"] = [protagonist]
+            elif previous_characters:
+                prepared["characters"] = previous_characters[:1]
+
+        if not str(prepared.get("scene") or "").strip() and previous_scene:
+            prepared["scene"] = previous_scene
+        if not str(prepared.get("scene_hint") or "").strip() and str(prepared.get("scene") or "").strip():
+            prepared["scene_hint"] = str(prepared.get("scene") or "")
+        prepared["props"] = [
+            item
+            for item in list(prepared.get("props") or [])
+            if str(item).strip() and str(item).strip() in combined_text
+        ]
+
+        prepared["visual"] = self._compact_final_cut_text(visual_source or action_source or combined_text, limit=100)
+        prepared["action"] = self._compact_final_cut_text(action_source or visual_source or combined_text, limit=80)
+        prepared["dialogue"] = (
+            self._compact_final_cut_text(dialogue_source, limit=72)
+            if dialogue_source
+            else self._extract_dialogue_basis(combined_text)
+        )
+        prepared["narration"] = self._compact_final_cut_text(str(prepared.get("narration") or ""), limit=96)
+        if not str(prepared.get("summary") or "").strip():
+            prepared["summary"] = prepared["action"]
+        if not str(prepared.get("motion_directive") or "").strip():
+            prepared["motion_directive"] = self._shot_motion_directive(int(prepared.get("shot_index") or 1))
+        return prepared
+
+    def _default_story_bible_character(self, story_bible: dict[str, Any] | None) -> str:
+        if not isinstance(story_bible, dict):
+            return ""
+        characters = story_bible.get("characters")
+        if not isinstance(characters, list):
+            return ""
+        for item in characters:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    return name
+        return ""
+
+    def _looks_like_first_person_narration(self, text: str) -> bool:
+        cleaned = str(text or "")
+        return any(token in cleaned for token in ("我", "自己", "我们"))
+
+    def _extract_dialogue_basis(self, text: str) -> str:
+        source = str(text or "").strip()
+        if not source:
+            return ""
+        match = re.search(r"[“\"]([^”\"]{2,80})[”\"]", source)
+        if match:
+            return self._compact_final_cut_text(match.group(1), limit=48)
+        if len(source) <= 48 and re.search(r"[!?？！。]$", source):
+            return self._compact_final_cut_text(source, limit=48)
+        return ""
 
     def _shot_motion_directive(self, position: int) -> str:
         variants = (
@@ -8039,10 +8585,34 @@ class PipelineService:
         aggregated_usage: dict[str, Any] = {}
         total_estimated_cost = 0.0
         fallback_count = 0
+        prompt_options = self._segment_video_prompt_options(provider=provider, model=model, params=params)
+        use_reference_image = bool(prompt_options.get("include_reference_image", True))
+        generate_audio = self._segment_video_generate_audio(params)
+        audio_mode = self._normalize_video_audio_mode(
+            (params or {}).get("video_audio_mode") or (params or {}).get("audio_mode"),
+            fallback="demo_native_audio" if generate_audio else "formal_tts",
+        )
+        previous_last_frame = continuity_package.get("previous_last_frame")
+        previous_last_frame_url = ""
+        if isinstance(previous_last_frame, dict):
+            previous_last_frame_url = str(previous_last_frame.get("image_url") or "")
+        clip_records: dict[int, dict[str, Any]] = {}
+        queued_jobs: list[dict[str, Any]] = []
         for shot in shots:
-            shot_index = int(shot.get("shot_index") or len(clip_manifest) + 1)
+            shot_index = int(shot.get("shot_index") or len(clip_records) + 1)
             clip_path = clip_dir / f"shot-{shot_index:02d}.mp4"
             try:
+                input_reference_url = str(shot.get("image_url") or "")
+                if provider == "volcengine" and use_reference_image:
+                    try:
+                        input_reference_url = self._upload_reference_frame_for_volcengine(
+                            project,
+                            chapter,
+                            shot_index=shot_index,
+                            source_path=shot.get("storage_key"),
+                        )
+                    except Exception:
+                        input_reference_url = ""
                 prompt = self._build_segment_video_shot_prompt(
                     project,
                     chapter,
@@ -8050,6 +8620,9 @@ class PipelineService:
                     task_prompt,
                     style_directive,
                     continuity_package=continuity_package,
+                    params=params,
+                    provider=provider,
+                    model=model,
                 )
                 req = ProviderRequest(
                     step="video",
@@ -8065,8 +8638,32 @@ class PipelineService:
                         **params,
                         "seconds": max(2, int(round(float(shot.get("duration_sec") or 2.0)))),
                         "size": params.get("size") or "1280x720",
-                        "input_reference_path": str(shot.get("storage_key") or continuity_package.get("input_reference_path") or ""),
-                        "continuity_reference_path": str(continuity_package.get("input_reference_path") or ""),
+                        "input_reference_path": (
+                            str(shot.get("storage_key") or continuity_package.get("input_reference_path") or "")
+                            if use_reference_image
+                            else ""
+                        ),
+                        "continuity_reference_path": (
+                            str(continuity_package.get("input_reference_path") or "")
+                            if use_reference_image
+                            else ""
+                        ),
+                        "input_reference_url": (
+                            input_reference_url
+                            if use_reference_image
+                            else ""
+                        ),
+                        "continuity_reference_url": (
+                            (
+                                ""
+                                if provider == "volcengine"
+                                else previous_last_frame_url
+                            )
+                            if use_reference_image
+                            else ""
+                        ),
+                        "return_last_frame": True,
+                        "generate_audio": generate_audio,
                     },
                 )
                 response = await adapter.invoke(req)
@@ -8076,19 +8673,12 @@ class PipelineService:
                 video_id = str(artifact.get("video_id") or artifact.get("artifact_id") or "").strip()
                 if not video_id:
                     raise ValueError("video provider did not return a job id")
-                await self._poll_single_segment_video_job(adapter, video_id, clip_path)
-                if not self._is_playable_video(clip_path):
-                    raise ValueError("downloaded clip is not playable")
-                clip_paths.append(clip_path)
-                clip_manifest.append(
+                queued_jobs.append(
                     {
                         "shot_index": shot_index,
-                        "duration_sec": float(shot.get("duration_sec") or 0),
-                        "mode": "provider_video",
-                        "provider": provider,
-                        "model": model,
-                        "storage_key": str(clip_path),
-                        "preview_url": self._to_local_file_url(clip_path),
+                        "shot": deepcopy(shot),
+                        "clip_path": clip_path,
+                        "video_id": video_id,
                     }
                 )
             except Exception as exc:  # noqa: BLE001
@@ -8099,21 +8689,84 @@ class PipelineService:
                     duration_sec=float(shot.get("duration_sec") or 2.0),
                     motion_mode=self._clip_motion_mode_for_index(shot_index),
                 )
-                clip_paths.append(clip_path)
-                clip_manifest.append(
-                    {
-                        "shot_index": shot_index,
-                        "duration_sec": float(shot.get("duration_sec") or 0),
-                        "mode": "motion_preview_fallback",
-                        "provider": provider,
-                        "model": model,
-                        "storage_key": str(clip_path),
-                        "preview_url": self._to_local_file_url(clip_path),
-                        "fallback_reason": str(exc),
-                    }
+                clip_records[shot_index] = {
+                    "shot_index": shot_index,
+                    "duration_sec": float(shot.get("duration_sec") or 0),
+                    "mode": "motion_preview_fallback",
+                    "provider": provider,
+                    "model": model,
+                    "storage_key": str(clip_path),
+                    "preview_url": self._to_local_file_url(clip_path),
+                    "fallback_reason": str(exc),
+                    "reference_image_used": use_reference_image,
+                    "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
+                    "narration_basis_included": bool(prompt_options.get("include_narration", True)),
+                    "prompt_profile": str(prompt_options.get("profile_key") or ""),
+                    "native_audio_requested": False,
+                    "audio_mode": "formal_tts",
+                }
+        for job in queued_jobs:
+            shot_index = int(job["shot_index"])
+            shot = deepcopy(job["shot"])
+            clip_path = Path(job["clip_path"])
+            video_id = str(job["video_id"])
+            try:
+                await self._poll_single_segment_video_job(adapter, video_id, clip_path)
+                if not self._is_playable_video(clip_path):
+                    raise ValueError("downloaded clip is not playable")
+                clip_records[shot_index] = {
+                    "shot_index": shot_index,
+                    "duration_sec": float(shot.get("duration_sec") or 0),
+                    "mode": "provider_video",
+                    "provider": provider,
+                    "model": model,
+                    "storage_key": str(clip_path),
+                    "preview_url": self._to_local_file_url(clip_path),
+                    "reference_image_used": use_reference_image,
+                    "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
+                    "narration_basis_included": bool(prompt_options.get("include_narration", True)),
+                    "prompt_profile": str(prompt_options.get("profile_key") or ""),
+                    "native_audio_requested": generate_audio,
+                    "audio_mode": audio_mode,
+                }
+            except Exception as exc:  # noqa: BLE001
+                fallback_count += 1
+                self._render_motion_preview_clip(
+                    Path(str(shot.get("storage_key") or "")),
+                    clip_path,
+                    duration_sec=float(shot.get("duration_sec") or 2.0),
+                    motion_mode=self._clip_motion_mode_for_index(shot_index),
                 )
+                clip_records[shot_index] = {
+                    "shot_index": shot_index,
+                    "duration_sec": float(shot.get("duration_sec") or 0),
+                    "mode": "motion_preview_fallback",
+                    "provider": provider,
+                    "model": model,
+                    "storage_key": str(clip_path),
+                    "preview_url": self._to_local_file_url(clip_path),
+                    "fallback_reason": str(exc),
+                    "reference_image_used": use_reference_image,
+                    "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
+                    "narration_basis_included": bool(prompt_options.get("include_narration", True)),
+                    "prompt_profile": str(prompt_options.get("profile_key") or ""),
+                    "native_audio_requested": False,
+                    "audio_mode": "formal_tts",
+                }
+        ordered_shot_indexes = sorted(index for index in clip_records.keys() if index > 0)
+        clip_manifest = [clip_records[index] for index in ordered_shot_indexes]
+        clip_paths = [Path(str(item.get("storage_key") or "")) for item in clip_manifest]
         final_path = self._generated_project_dir(project.id, step.step_name) / f"{self._chapter_media_prefix(chapter)}-attempt-{step.attempt}.mp4"
+        if clip_manifest and fallback_count == len(clip_manifest):
+            reasons = [
+                str(item.get("fallback_reason") or "").strip()
+                for item in clip_manifest
+                if isinstance(item, dict) and str(item.get("fallback_reason") or "").strip()
+            ]
+            first_reason = reasons[0] if reasons else "all shot jobs fell back to motion preview"
+            raise ValueError(f"segment video provider did not generate any real clips: {first_reason}")
         self._concat_video_segments_reencode(clip_paths, final_path)
+        native_audio_present = self._video_has_audio_stream(final_path)
         artifact = {
             "provider": provider,
             "step": "video",
@@ -8131,6 +8784,16 @@ class PipelineService:
             "continuity_package": continuity_package,
             "clip_manifest": clip_manifest,
             "fallback_clip_count": fallback_count,
+            "prompt_profile": str(prompt_options.get("profile_key") or ""),
+            "prompt_profile_label": str(prompt_options.get("profile", {}).get("label") or ""),
+            "reference_image_used": use_reference_image,
+            "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
+            "narration_basis_included": bool(prompt_options.get("include_narration", True)),
+            "motion_intensity": str(prompt_options.get("motion_intensity") or "medium"),
+            "native_audio_requested": generate_audio,
+            "native_audio_present": native_audio_present,
+            "audio_mode": audio_mode,
+            "audio_mode_label": self._video_audio_mode_label(audio_mode),
         }
         artifact["motion_validation"] = self._analyze_video_motion(final_path)
         aggregated_usage["clip_count"] = len(clip_manifest)
@@ -8139,12 +8802,40 @@ class PipelineService:
         return ProviderResponse(output=artifact, usage=aggregated_usage, raw={"clip_manifest": clip_manifest}), total_estimated_cost
 
     async def _poll_single_segment_video_job(self, adapter: Any, video_id: str, output_path: Path) -> None:
-        for _ in range(1, settings.video_poll_max_attempts + 1):
-            status_response = await adapter.get_video_status(video_id)
+        provider_name = ""
+        name_fn = getattr(adapter, "name", None)
+        if callable(name_fn):
+            try:
+                provider_name = str(name_fn() or "").strip().lower()
+            except Exception:  # noqa: BLE001
+                provider_name = ""
+        poll_interval = settings.video_poll_interval_sec
+        max_attempts = settings.video_poll_max_attempts
+        if provider_name == "volcengine":
+            poll_interval = max(poll_interval, 10)
+            max_attempts = max(max_attempts, 36)
+            await asyncio.sleep(6)
+        transient_errors = 0
+        for _ in range(1, max_attempts + 1):
+            try:
+                status_response = await adapter.get_video_status(video_id)
+            except Exception as exc:  # noqa: BLE001
+                transient_errors += 1
+                if transient_errors >= 6:
+                    raise ValueError(f"segment video status polling failed: {exc}") from exc
+                await asyncio.sleep(poll_interval)
+                continue
             artifact = deepcopy(status_response.output or {})
             status = str(artifact.get("status") or "").lower()
             if status in {"completed", "succeeded"}:
-                content, mime_type = await adapter.download_video(video_id)
+                for download_attempt in range(1, 4):
+                    try:
+                        content, mime_type = await adapter.download_video(video_id)
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        if download_attempt >= 3:
+                            raise ValueError(f"segment video download failed: {exc}") from exc
+                        await asyncio.sleep(4)
                 suffix = self._suffix_for_mime_type(mime_type)
                 target_path = output_path if output_path.suffix == suffix else output_path.with_suffix(suffix)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8162,7 +8853,7 @@ class PipelineService:
                 return
             if status in {"failed", "cancelled", "canceled"}:
                 raise ValueError(f"segment video generation failed: {artifact.get('status')}")
-            await asyncio.sleep(settings.video_poll_interval_sec)
+            await asyncio.sleep(poll_interval)
         raise ValueError("segment video generation timed out during polling")
 
     def _generate_motion_preview_segment_artifact(
@@ -8174,6 +8865,7 @@ class PipelineService:
         model: str,
         task_prompt: str,
         style_directive: str,
+        params: dict[str, Any],
         *,
         continuity_package: dict[str, Any],
         shots: list[dict[str, Any]],
@@ -8227,6 +8919,25 @@ class PipelineService:
             "task_prompt": task_prompt,
             "style_directive": style_directive,
         }
+        prompt_options = self._segment_video_prompt_options(provider=provider, model=model, params=params)
+        audio_mode = self._normalize_video_audio_mode(
+            (params or {}).get("video_audio_mode") or (params or {}).get("audio_mode"),
+            fallback="formal_tts",
+        )
+        artifact.update(
+            {
+                "prompt_profile": str(prompt_options.get("profile_key") or ""),
+                "prompt_profile_label": str(prompt_options.get("profile", {}).get("label") or ""),
+                "reference_image_used": bool(prompt_options.get("include_reference_image", True)),
+                "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
+                "narration_basis_included": bool(prompt_options.get("include_narration", True)),
+                "motion_intensity": str(prompt_options.get("motion_intensity") or "medium"),
+                "native_audio_requested": False,
+                "native_audio_present": False,
+                "audio_mode": audio_mode,
+                "audio_mode_label": self._video_audio_mode_label(audio_mode),
+            }
+        )
         artifact["motion_validation"] = self._analyze_video_motion(final_path)
         usage = {
             "clip_count": len(clip_manifest),
@@ -8431,6 +9142,9 @@ class PipelineService:
         manifest = self._build_final_cut_segment_manifest(project)
         if not manifest:
             raise ValueError("no approved chapter video segments available for final cut")
+        audio_mode, audio_mode_reason = self._resolve_final_cut_audio_mode(manifest, params)
+        native_audio_segment_count = sum(1 for item in manifest if bool(item.get("has_audio_stream")))
+        segment_audio_ready = bool(manifest) and native_audio_segment_count == len(manifest)
         voice = str(params.get("voice") or "alloy")
         target_duration_sec = round(
             sum(max(float(item.get("duration_sec") or 0.0), 0.0) for item in manifest),
@@ -8442,6 +9156,51 @@ class PipelineService:
         narration_writer_provider = ""
         narration_writer_model = ""
         segment_lines: list[dict[str, Any]] | None = None
+        if audio_mode == "demo_native_audio":
+            plan = self._build_final_cut_narration_plan(
+                project,
+                manifest=manifest,
+                voice=voice,
+                segment_lines=None,
+            )
+            artifact = {
+                "provider": "local",
+                "step": "tts",
+                "model": "native-segment-audio-pass-through",
+                "segment_manifest": manifest,
+                "narration_text": str(plan.get("narration_text") or "").strip(),
+                "subtitle_entries": plan["subtitle_entries"],
+                "subtitle_format": "srt",
+                "chapter_count": plan["chapter_count"],
+                "segment_count": plan["segment_count"],
+                "voice": None,
+                "tts_speed": None,
+                "target_duration_sec": target_duration_sec,
+                "spoken_audio_duration_sec": None,
+                "narration_generation_mode": "native_segment_audio",
+                "narration_writer_provider": "",
+                "narration_writer_model": "",
+                "audio_mode": audio_mode,
+                "audio_mode_label": self._video_audio_mode_label(audio_mode),
+                "audio_mode_reason": audio_mode_reason,
+                "uses_native_segment_audio": True,
+                "native_audio_segment_count": native_audio_segment_count,
+                "segment_audio_ready": segment_audio_ready,
+                "summary": f"已保留 {plan['segment_count']} 个章节片段的原生音轨，并生成字幕方案。",
+            }
+            return (
+                ProviderResponse(
+                    output=artifact,
+                    usage={},
+                    raw={
+                        "audio_mode": audio_mode,
+                        "audio_mode_reason": audio_mode_reason,
+                        "native_audio_segment_count": native_audio_segment_count,
+                        "segment_audio_ready": segment_audio_ready,
+                    },
+                ),
+                0.0,
+            )
         try:
             (
                 segment_lines,
@@ -8536,6 +9295,12 @@ class PipelineService:
                 "narration_generation_mode": narration_generation_mode,
                 "narration_writer_provider": narration_writer_provider,
                 "narration_writer_model": narration_writer_model,
+                "audio_mode": audio_mode,
+                "audio_mode_label": self._video_audio_mode_label(audio_mode),
+                "audio_mode_reason": audio_mode_reason,
+                "uses_native_segment_audio": False,
+                "native_audio_segment_count": native_audio_segment_count,
+                "segment_audio_ready": segment_audio_ready,
                 "summary": str(artifact.get("summary") or f"已生成 {plan['segment_count']} 个章节片段的旁白与字幕方案。"),
             }
         )
@@ -8556,6 +9321,92 @@ class PipelineService:
             total_estimated_cost,
         )
 
+    def _segment_video_prompt_profile_key(self, provider: str, model: str, params: dict[str, Any] | None = None) -> str:
+        raw = str((params or {}).get("video_prompt_profile") or "").strip().lower()
+        if raw in SEGMENT_VIDEO_PROMPT_PROFILES:
+            return raw
+        model_id = f"{provider}/{model}".lower()
+        if "seedance-1-5" in model_id or "seedance1.5" in model_id or "seedance_1_5" in model_id:
+            return "seedance1_5_pro"
+        if "seedance" in model_id:
+            return "seedance2"
+        if "sora" in model_id:
+            return "sora2"
+        if "runway" in model_id:
+            return "runway_gen4"
+        if "veo" in model_id:
+            return "veo3_1"
+        return "generic"
+
+    def _segment_video_prompt_profile(self, profile_key: str) -> dict[str, Any]:
+        return deepcopy(SEGMENT_VIDEO_PROMPT_PROFILES.get(profile_key, SEGMENT_VIDEO_PROMPT_PROFILES["generic"]))
+
+    def _segment_video_prompt_options(
+        self,
+        *,
+        provider: str,
+        model: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        safe_params = params or {}
+        profile_key = self._segment_video_prompt_profile_key(provider, model, safe_params)
+        motion_key = str(safe_params.get("video_motion_intensity") or "medium").strip().lower()
+        if motion_key not in SEGMENT_VIDEO_MOTION_INTENSITY_HINTS:
+            motion_key = "medium"
+        audio_mode = self._normalize_video_audio_mode(
+            safe_params.get("video_audio_mode") or safe_params.get("audio_mode"),
+            fallback="demo_native_audio" if self._segment_video_generate_audio(safe_params) else "formal_tts",
+        )
+        return {
+            "profile_key": profile_key,
+            "profile": self._segment_video_prompt_profile(profile_key),
+            "include_reference_image": bool(safe_params.get("video_use_reference_image", True)),
+            "include_dialogue": bool(safe_params.get("video_include_dialogue", True)),
+            "include_narration": bool(safe_params.get("video_include_narration", True)),
+            "motion_intensity": motion_key,
+            "motion_hint": SEGMENT_VIDEO_MOTION_INTENSITY_HINTS[motion_key],
+            "audio_mode": audio_mode,
+            "generate_audio": self._segment_video_generate_audio(safe_params),
+        }
+
+    def _chapter_narration_hint(self, chapter: ChapterChunk) -> str:
+        stages = self._chapter_stages(chapter)
+        script_stage = stages.get("story_scripting")
+        if isinstance(script_stage, dict):
+            script_artifact = deepcopy((script_stage.get("output") or {}).get("artifact") or {})
+            beats = script_artifact.get("beats")
+            if isinstance(beats, list):
+                beat_summaries = [
+                    str(item.get("summary") or "").strip()
+                    for item in beats[:2]
+                    if isinstance(item, dict) and str(item.get("summary") or "").strip()
+                ]
+                if beat_summaries:
+                    return " ".join(beat_summaries)
+        return str((chapter.meta or {}).get("summary") or self._chapter_body_text(chapter)[:220]).strip()
+
+    def _segment_video_reference_brief(
+        self,
+        shot: dict[str, Any],
+        continuity_package: dict[str, Any] | None,
+        *,
+        include_reference_image: bool,
+    ) -> list[str]:
+        if not include_reference_image:
+            return ["Reference input: disabled for this run."]
+        lines = ["Primary reference: use the attached storyboard frame as the opening composition and identity anchor."]
+        continuity = continuity_package or {}
+        if isinstance(continuity.get("previous_last_frame"), dict):
+            lines.append(
+                "Boundary reference: preserve continuity from previous chapter last frame "
+                f"({str(continuity['previous_last_frame'].get('chapter_title') or '').strip() or '上一章节'})."
+            )
+        if isinstance(continuity.get("current_last_frame"), dict):
+            lines.append("Ending reference: keep this shot's end frame clean enough to hand off to the chapter's final continuity target.")
+        if str(shot.get("image_url") or "").strip():
+            lines.append("Reference discipline: keep face geometry, costume silhouette, key props and light direction aligned with the reference image.")
+        return lines
+
     def _build_segment_video_prompt(
         self,
         project: Project,
@@ -8564,10 +9415,14 @@ class PipelineService:
         style_directive: str,
         *,
         continuity_package: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        provider: str = "",
+        model: str = "",
     ) -> str:
         shots = self._chapter_shots(chapter)[:8]
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
+        prompt_options = self._segment_video_prompt_options(provider=provider, model=model, params=params)
         raw_continuity = continuity_package or {}
         prompt_continuity = {
             "enabled": bool(raw_continuity.get("enabled")),
@@ -8582,45 +9437,62 @@ class PipelineService:
                 "shot_index": raw_frame.get("shot_index"),
                 "summary": raw_frame.get("summary"),
             }
-        shot_summaries = [
-            {
-                "shot_index": shot.get("shot_index"),
-                "visual": shot.get("visual"),
-                "action": shot.get("action"),
-                "dialogue": shot.get("dialogue"),
-                "props": shot.get("props"),
-                "continuity_anchor": shot.get("continuity_anchor"),
-            }
-            for shot in shots
+        chapter_title = str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}")
+        chapter_summary = str((chapter.meta or {}).get("summary") or self._chapter_body_text(chapter)[:240]).strip()
+        narration_hint = self._chapter_narration_hint(chapter)
+        shot_summary_lines = []
+        for shot in shots:
+            shot_summary_lines.append(
+                f"- 镜头 {int(shot.get('shot_index') or 1)} | 景别 {str(shot.get('frame_type') or '中景')} | "
+                f"人物 {', '.join(str(item) for item in (shot.get('characters') or []) if str(item).strip()) or '未显式给出'} | "
+                f"动作 {str(shot.get('action') or shot.get('visual') or '').strip()[:80]}"
+            )
+        lines = [
+            f"Video prompt profile: {prompt_options['profile'].get('label')} ({prompt_options['profile_key']})",
+            f"Provider/model target: {provider}/{model}".strip("/"),
+            f"Chapter: {chapter_title}",
+            f"Chapter summary: {chapter_summary}",
+            f"Target duration: {round(self._chapter_segment_duration(project, chapter), 1)} seconds",
+            f"Motion intensity: {prompt_options['motion_hint']}",
+            f"Audio mode: {self._video_audio_mode_label(str(prompt_options['audio_mode']))}",
+            f"Director style: {visual_style.get('director_style') if isinstance(visual_style, dict) else ''}",
+            f"Real light source strategy: {visual_style.get('real_light_source_strategy') if isinstance(visual_style, dict) else ''}",
+            f"Skin texture level: {visual_style.get('skin_texture_level') if isinstance(visual_style, dict) else ''}",
+            f"Shot distance profile: {visual_style.get('shot_distance_profile') if isinstance(visual_style, dict) else ''}",
+            f"Lens package: {visual_style.get('lens_package') if isinstance(visual_style, dict) else ''}",
+            f"Camera movement style: {visual_style.get('camera_movement_style') if isinstance(visual_style, dict) else ''}",
+            f"Continuity method: {visual_style.get('continuity_method') if isinstance(visual_style, dict) else ''}",
+            "Shot plan:",
+            *shot_summary_lines,
+            f"User video directive: {task_prompt}",
+            f"Style bible: {style_directive}",
         ]
-        payload = {
-            "chapter_title": str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}"),
-            "chapter_summary": str((chapter.meta or {}).get("summary") or self._chapter_body_text(chapter)[:240]),
-            "target_duration_sec": round(self._chapter_segment_duration(project, chapter), 1),
-            "shot_summaries": shot_summaries,
-            "user_video_directive": task_prompt,
-            "style_bible": style_directive,
-            "film_controls": {
-                "director_style": visual_style.get("director_style"),
-                "real_light_source_strategy": visual_style.get("real_light_source_strategy"),
-                "skin_texture_level": visual_style.get("skin_texture_level"),
-                "shot_distance_profile": visual_style.get("shot_distance_profile"),
-                "lens_package": visual_style.get("lens_package"),
-                "camera_movement_style": visual_style.get("camera_movement_style"),
-                "continuity_method": visual_style.get("continuity_method"),
-            },
-            "continuity_package": prompt_continuity,
-            "hard_constraints": [
-                "maintain identity consistency with reference images",
-                "maintain location continuity",
-                "keep wardrobe and props stable",
-                "real motion video only, never use static hold-frame slideshow output",
-                "cinematic motion only, no montage collage",
-                "respect first and last frame continuity package when provided",
-                "no readable on-screen text, captions, logos or subtitles",
-            ],
-        }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        if prompt_options["include_narration"] and narration_hint:
+            lines.append(f"Narration basis: {narration_hint}")
+        if isinstance(prompt_continuity.get("current_first_frame"), dict):
+            lines.append(
+                "Current opening frame continuity target: "
+                f"{str(prompt_continuity['current_first_frame'].get('summary') or '').strip()}"
+            )
+        if isinstance(prompt_continuity.get("previous_last_frame"), dict):
+            lines.append(
+                "Previous chapter bridge: "
+                f"{str(prompt_continuity['previous_last_frame'].get('summary') or '').strip()}"
+            )
+        lines.extend(self._segment_video_reference_brief({}, raw_continuity, include_reference_image=prompt_options["include_reference_image"]))
+        lines.append("Model-specific guidance:")
+        lines.extend(f"- {item}" for item in prompt_options["profile"].get("guidance", []))
+        lines.append("Hard constraints:")
+        lines.extend(
+            [
+                "- Real motion video only, never output a static hold-frame slideshow.",
+                "- Keep character identity, wardrobe, light direction and location continuity stable.",
+                "- Respect first/last frame continuity package when present.",
+                "- If audio mode is Demo, generate native spoken dialogue/ambience in sync with the shot; if audio mode is Formal, keep the clip silent.",
+                "- No readable on-screen text, captions, logos or watermarks.",
+            ]
+        )
+        return "\n".join(line for line in lines if line and not line.endswith(": "))
 
     def _build_segment_video_shot_prompt(
         self,
@@ -8631,9 +9503,13 @@ class PipelineService:
         style_directive: str,
         *,
         continuity_package: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        provider: str = "",
+        model: str = "",
     ) -> str:
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
+        prompt_options = self._segment_video_prompt_options(provider=provider, model=model, params=params)
         shot_index = int(shot.get("shot_index") or 1)
         continuity = continuity_package or {}
         focus_continuity: dict[str, Any] = {
@@ -8655,43 +9531,71 @@ class PipelineService:
                 "shot_index": continuity["current_last_frame"].get("shot_index"),
                 "summary": continuity["current_last_frame"].get("summary"),
             }
-        payload = {
-            "chapter_title": str((chapter.meta or {}).get("title") or f"章节 {chapter.chapter_index + 1}"),
-            "chapter_summary": str((chapter.meta or {}).get("summary") or self._chapter_body_text(chapter)[:240]),
-            "shot_index": shot_index,
-            "target_duration_sec": round(float(shot.get("duration_sec") or 2.0), 2),
-            "shot": {
-                "frame_type": shot.get("frame_type"),
-                "visual": shot.get("visual"),
-                "action": shot.get("action"),
-                "dialogue": shot.get("dialogue"),
-                "characters": shot.get("characters"),
-                "scene": shot.get("scene"),
-                "scene_hint": shot.get("scene_hint"),
-                "props": shot.get("props"),
-                "continuity_anchor": shot.get("continuity_anchor"),
-                "motion_directive": shot.get("motion_directive"),
-            },
-            "film_controls": {
-                "director_style": visual_style.get("director_style"),
-                "real_light_source_strategy": visual_style.get("real_light_source_strategy"),
-                "skin_texture_level": visual_style.get("skin_texture_level"),
-                "shot_distance_profile": visual_style.get("shot_distance_profile"),
-                "lens_package": visual_style.get("lens_package"),
-                "camera_movement_style": visual_style.get("camera_movement_style"),
-                "continuity_method": visual_style.get("continuity_method"),
-            },
-            "continuity_package": focus_continuity,
-            "style_bible": style_directive,
-            "user_video_directive": task_prompt,
-            "hard_constraints": [
-                "generate real motion video for this single shot, never output a static hold frame",
-                "keep character identity, props, wardrobe and lighting stable against the reference image",
-                "respect the first/last frame continuity package when present",
-                "no readable subtitles, captions, logos or watermarks",
-            ],
-        }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        narration_hint = self._chapter_narration_hint(chapter)
+        dialogue_text = str(shot.get("dialogue") or "").strip()
+        character_names = ", ".join(str(item) for item in (shot.get("characters") or []) if str(item).strip())
+        prop_names = ", ".join(str(item) for item in (shot.get("props") or []) if str(item).strip())
+        scene_text = str(shot.get("scene_hint") or shot.get("scene") or "").strip()
+        lines = [
+            f"Video prompt profile: {prompt_options['profile'].get('label')} ({prompt_options['profile_key']})",
+            f"Provider/model target: {provider}/{model}".strip("/"),
+            f"Chapter: {str((chapter.meta or {}).get('title') or f'章节 {chapter.chapter_index + 1}')}",
+            f"Chapter summary: {str((chapter.meta or {}).get('summary') or self._chapter_body_text(chapter)[:240]).strip()}",
+            f"Shot index: {shot_index}",
+            f"Shot duration: {round(float(shot.get('duration_sec') or 2.0), 2)} seconds",
+            f"Shot type: {str(shot.get('frame_type') or '中景')}",
+            f"Characters: {character_names or '未显式给出'}",
+            f"Scene: {scene_text or '沿用分镜图场景'}",
+            f"Props: {prop_names or '无关键道具'}",
+            f"Visual objective: {str(shot.get('visual') or '').strip()}",
+            f"Action beat: {str(shot.get('action') or '').strip()}",
+            f"Motion directive: {str(shot.get('motion_directive') or '').strip()}",
+            f"Continuity anchor: {str(shot.get('continuity_anchor') or '').strip()}",
+            f"Motion intensity: {prompt_options['motion_hint']}",
+            f"Audio mode: {self._video_audio_mode_label(str(prompt_options['audio_mode']))}",
+            f"Director style: {visual_style.get('director_style') if isinstance(visual_style, dict) else ''}",
+            f"Real light source strategy: {visual_style.get('real_light_source_strategy') if isinstance(visual_style, dict) else ''}",
+            f"Lens package: {visual_style.get('lens_package') if isinstance(visual_style, dict) else ''}",
+            f"Camera movement style: {visual_style.get('camera_movement_style') if isinstance(visual_style, dict) else ''}",
+            f"User video directive: {task_prompt}",
+            f"Style bible: {style_directive}",
+        ]
+        if prompt_options["include_dialogue"] and dialogue_text:
+            lines.append(f"Dialogue basis: {dialogue_text}")
+        shot_narration = str(shot.get("narration") or "").strip()
+        if prompt_options["include_narration"] and shot_narration:
+            lines.append(f"Narration beat: {shot_narration}")
+        if prompt_options["include_narration"] and narration_hint:
+            lines.append(f"Narration basis: {narration_hint}")
+        if isinstance(focus_continuity.get("previous_last_frame"), dict):
+            lines.append(
+                "Previous chapter last-frame bridge: "
+                f"{str(focus_continuity['previous_last_frame'].get('summary') or '').strip()}"
+            )
+        if isinstance(focus_continuity.get("current_first_frame"), dict):
+            lines.append(
+                "Current chapter first-frame anchor: "
+                f"{str(focus_continuity['current_first_frame'].get('summary') or '').strip()}"
+            )
+        if isinstance(focus_continuity.get("current_last_frame"), dict):
+            lines.append(
+                "Target end-frame feel: "
+                f"{str(focus_continuity['current_last_frame'].get('summary') or '').strip()}"
+            )
+        lines.extend(self._segment_video_reference_brief(shot, continuity, include_reference_image=prompt_options["include_reference_image"]))
+        lines.append("Model-specific guidance:")
+        lines.extend(f"- {item}" for item in prompt_options["profile"].get("guidance", []))
+        lines.append("Hard constraints:")
+        lines.extend(
+            [
+                "- Generate a single-shot real motion video, never a static hold frame.",
+                "- Keep identity, wardrobe, props and lighting stable against the reference image.",
+                "- Respect continuity package and leave a clean end frame for the next shot.",
+                "- If audio mode is Demo, generate native spoken dialogue/ambience in sync with the shot; if audio mode is Formal, keep the clip silent.",
+                "- No readable subtitles, captions, logos or watermarks.",
+            ]
+        )
+        return "\n".join(line for line in lines if line and not line.endswith(": "))
 
     async def _generate_storyboard_frame_with_fallback(
         self,

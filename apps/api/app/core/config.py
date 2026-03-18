@@ -14,6 +14,13 @@ class Settings(BaseSettings):
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "n2v-assets"
+    tos_access_key_id: str | None = None
+    tos_secret_access_key: str | None = None
+    tos_session_token: str | None = None
+    tos_region: str | None = None
+    tos_endpoint: str | None = None
+    tos_bucket: str | None = None
+    tos_presign_expire_sec: int = 3600
     secret_key: str = "change-me"
     consistency_threshold: int = 75
     demo_1408_path: str | None = None
@@ -26,6 +33,9 @@ class Settings(BaseSettings):
     openrouter_site_url: str = "http://localhost:3000"
     openrouter_app_name: str = "FilmIt Pipeline"
     openrouter_timeout_sec: int = 180
+    volcengine_las_api_key: str | None = None
+    volcengine_las_base_url: str = "https://operator.las.cn-shanghai.volces.com/api/v1"
+    volcengine_timeout_sec: int = 180
     video_poll_interval_sec: int = 8
     video_poll_max_attempts: int = 15
 

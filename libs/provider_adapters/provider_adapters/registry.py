@@ -9,6 +9,7 @@ from .edge_tts_adapter import EdgeTTSProviderAdapter
 from .openai_adapter import OpenAIProviderAdapter
 from .openrouter_catalog import build_openrouter_pricing_map, fetch_openrouter_models
 from .openrouter_adapter import OpenRouterProviderAdapter
+from .volcengine_adapter import VolcengineLASProviderAdapter
 
 
 @dataclass(slots=True)
@@ -140,6 +141,12 @@ class ProviderRegistry:
             "image": ["runway-gen4-image"],
             "video": ["runway-gen4-turbo"],
         },
+        "volcengine": {
+            "video": [
+                "doubao-seedance-1-5-pro-251215",
+                "doubao-seedance-1-0-pro-250528",
+            ],
+        },
         "deepseek": {
             "chunk": ["deepseek-chat"],
             "script": ["deepseek-chat"],
@@ -175,6 +182,10 @@ class ProviderRegistry:
                 continue
             if provider == "edge_tts":
                 adapter = EdgeTTSProviderAdapter(supported)
+                self._adapters[provider] = adapter if adapter.is_configured() else MockProviderAdapter(provider, supported)
+                continue
+            if provider == "volcengine":
+                adapter = VolcengineLASProviderAdapter(supported)
                 self._adapters[provider] = adapter if adapter.is_configured() else MockProviderAdapter(provider, supported)
                 continue
             self._adapters[provider] = MockProviderAdapter(provider, supported)
@@ -228,7 +239,7 @@ class ProviderRegistry:
         elif step == "image":
             preferred_order = ["openrouter", "openai", "google", "runway", "anthropic", "deepseek", "azure", "elevenlabs"]
         else:
-            preferred_order = ["openai", "edge_tts", "runway", "google", "openrouter", "anthropic", "deepseek", "azure", "elevenlabs"]
+            preferred_order = ["volcengine", "openai", "edge_tts", "runway", "google", "openrouter", "anthropic", "deepseek", "azure", "elevenlabs"]
         for pass_index in range(2):
             for provider in preferred_order:
                 adapter = self._adapters.get(provider)
