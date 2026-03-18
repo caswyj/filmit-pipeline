@@ -42,18 +42,23 @@ class FilmItAgentRuntime:
         session: AgentSession,
         user_text: str,
         context: dict[str, Any],
+        planned_action: dict[str, Any] | None = None,
     ) -> RuntimeReply:
-        if self._is_write_intent(user_text):
-            approval_request = self._build_approval_request(user_text, context)
+        if bool((planned_action or {}).get("tool_name")) or self._is_write_intent(user_text):
+            approval_request = self._build_approval_request(user_text, context, planned_action=planned_action)
             text = self._build_write_intent_response(context, approval_request)
             return RuntimeReply(
                 text=text,
                 run_status="WAITING_APPROVAL",
-                content_json={"approval_request": approval_request, "sources": context.get("sources", [])},
+                content_json={
+                    "approval_request": approval_request,
+                    "action_proposal": planned_action or {},
+                    "sources": context.get("sources", []),
+                },
                 suggested_next_actions=[
                     "明确指出要影响的步骤、章节或项目范围",
                     "确认自己已知晓写操作会改变 FilmIt 项目状态",
-                    "在下一阶段接入执行器后，再允许 Agent 实际落地",
+                    "如果动作信息完整，可以在 Agent 面板里批准执行",
                 ],
             )
 
@@ -183,16 +188,34 @@ class FilmItAgentRuntime:
                 lines.append(f"- {item}")
         return "\n".join(lines)
 
-    def _build_approval_request(self, user_text: str, context: dict[str, Any]) -> dict[str, Any]:
+    def _build_approval_request(
+        self,
+        user_text: str,
+        context: dict[str, Any],
+        *,
+        planned_action: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         page_context = context.get("page_context", {})
+        planned_action = planned_action or {}
         return {
             "status": "REQUIRES_USER_CONFIRMATION",
             "reason": "当前请求包含会改变 FilmIt 项目状态的写操作。",
             "requested_action": user_text.strip(),
+            "tool_name": planned_action.get("tool_name"),
+            "display_name": planned_action.get("display_name"),
             "scope_hint": {
                 "selected_step_name": page_context.get("selected_step_name"),
                 "selected_chapter_title": (page_context.get("selected_chapter") or {}).get("title"),
             },
+            "scope_summary": planned_action.get("scope_summary"),
+            "ready": bool(planned_action.get("ready")),
+            "missing_fields": planned_action.get("missing_fields", []),
+            "user_visible_summary": planned_action.get("user_visible_summary"),
+            "estimated_cost": planned_action.get("estimated_cost"),
+            "estimated_cost_summary": planned_action.get("estimated_cost_summary"),
+            "cost_source": planned_action.get("cost_source"),
+            "prompt_preview": planned_action.get("prompt_preview"),
+            "feedback_summary": planned_action.get("feedback_summary"),
             "policy": "所有 Agent 写操作都必须让用户充分知情并明确授权确认。",
         }
 
@@ -200,20 +223,60 @@ class FilmItAgentRuntime:
         page_context = context.get("page_context", {})
         step_name = page_context.get("selected_step_name") or "-"
         chapter = (page_context.get("selected_chapter") or {}).get("title") or "-"
-        return "\n".join(
+        lines = [
+            "已识别到写操作请求。",
+            "",
+            "当前策略不会直接执行任何改动。",
+            "- 写操作需要你充分知情并明确授权确认",
+            f"- 当前页面步骤: {step_name}",
+            f"- 当前页面章节: {chapter}",
+            "",
+            f"待确认动作: {approval_request['requested_action']}",
+        ]
+        if approval_request.get("display_name"):
+            lines.append(f"- 已归一化动作: {approval_request['display_name']}")
+        if approval_request.get("scope_summary"):
+            lines.append(f"- 影响范围: {approval_request['scope_summary']}")
+        if approval_request.get("user_visible_summary"):
+            lines.append(f"- 执行摘要: {approval_request['user_visible_summary']}")
+        if approval_request.get("feedback_summary"):
+            lines.append(f"- 反馈摘要: {approval_request['feedback_summary']}")
+        if approval_request.get("estimated_cost_summary"):
+            lines.append(f"- 费用预估: {approval_request['estimated_cost_summary']}")
+        elif approval_request.get("estimated_cost") is not None:
+            lines.append(f"- 费用预估: 约 ${float(approval_request['estimated_cost']):.4f}")
+        if approval_request.get("prompt_preview"):
+            lines.extend(
+                [
+                    "",
+                    "拟应用的提示词修订预览",
+                    approval_request["prompt_preview"][:320],
+                ]
+            )
+        if approval_request.get("ready"):
+            lines.extend(
+                [
+                    "",
+                    "当前动作信息已完整，你可以在 Agent 面板里点击“批准执行”。",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "当前还不能安全执行，缺少这些信息:",
+                    f"- {', '.join(approval_request.get('missing_fields', []) or ['必要参数'])}",
+                    "",
+                    "请补充后再让我生成新的待确认动作。",
+                ]
+            )
+        lines.extend(
             [
-                "已识别到写操作请求。",
                 "",
-                "当前策略不会直接执行任何改动。",
-                "- 写操作需要你充分知情并明确授权确认",
-                f"- 当前页面步骤: {step_name}",
-                f"- 当前页面章节: {chapter}",
-                "",
-                f"待确认动作: {approval_request['requested_action']}",
-                "",
-                "这轮后端已接入审批式 Agent 骨架；实际写操作执行器会在下一阶段把确认流与 FilmIt 工具调用打通。",
+                "批准后，Agent 会调用真实 FilmIt 工具执行，并把结果同步回左侧工作流。",
             ]
         )
+        return "\n".join(lines)
 
     def _suggest_next_actions(self, context: dict[str, Any]) -> list[str]:
         overview = context.get("overview", {})

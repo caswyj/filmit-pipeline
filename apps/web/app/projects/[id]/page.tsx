@@ -2551,19 +2551,22 @@ export default function ProjectPage() {
                   })()}
                 </div>
               ))}
-            </section>
-          ) : null}
-          </section>
-        </div>
-        <aside className="agentSidebar">
+	            </section>
+	          ) : null}
+	          </section>
+	        </section>
+	        </div>
+	        <aside className="agentSidebar">
           <AgentPanel
             projectId={projectId}
             projectName={project?.name ?? "项目审核台"}
             projectStatus={project?.status ?? "-"}
             targetDurationSec={project?.target_duration_sec ?? 0}
-            selectedStepName={selected?.step_display_name ?? null}
+            selectedStepKey={selected?.step_name ?? null}
+            selectedStepLabel={selected?.step_display_name ?? null}
             selectedChapterId={selectedChapter?.id ?? null}
             selectedChapterTitle={selectedChapter?.title ?? null}
+            onAgentMutation={() => refreshWorkflowData(selected, true)}
           />
         </aside>
       </div>

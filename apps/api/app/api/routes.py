@@ -10,7 +10,16 @@ from sqlalchemy.orm import Session
 
 from app.agent import AgentSessionService
 from app.db.models import Project, SourceDocument
-from app.schemas.agent import AgentMessageRead, AgentSendMessagePayload, AgentSessionRead, AgentTurnRead, AgentRunRead
+from app.schemas.agent import (
+    AgentActionItemRead,
+    AgentActionQueueRead,
+    AgentMessageRead,
+    AgentRunRead,
+    AgentSendMessagePayload,
+    AgentSessionRead,
+    AgentToolDecisionPayload,
+    AgentTurnRead,
+)
 from app.schemas.chapter import ChapterRead
 from app.schemas.demo import DemoCaseRead, DemoImportPayload
 from app.db.session import get_db
@@ -257,6 +266,20 @@ def list_default_agent_messages(
     return [AgentMessageRead.model_validate(item) for item in messages]
 
 
+@router.get("/projects/{project_id}/agent/actions", response_model=AgentActionQueueRead)
+def list_project_agent_actions(
+    project_id: str,
+    db: Session = Depends(get_db),
+    agent_svc: AgentSessionService = Depends(get_agent_service),
+) -> AgentActionQueueRead:
+    project = _get_project_or_404(db, project_id)
+    result = agent_svc.list_action_queue(project)
+    return AgentActionQueueRead(
+        pending=[AgentActionItemRead.model_validate(item) for item in result["pending"]],
+        history=[AgentActionItemRead.model_validate(item) for item in result["history"]],
+    )
+
+
 @router.post("/projects/{project_id}/agent/sessions/default/messages", response_model=AgentTurnRead)
 async def send_message_to_default_agent_session(
     project_id: str,
@@ -266,6 +289,50 @@ async def send_message_to_default_agent_session(
 ) -> AgentTurnRead:
     project = _get_project_or_404(db, project_id)
     result = await agent_svc.send_message(project, payload.message, page_context=payload.page_context)
+    run = result["run"]
+    return AgentTurnRead(
+        session=AgentSessionRead.model_validate(result["session"]),
+        user_message=AgentMessageRead.model_validate(result["user_message"]),
+        assistant_message=AgentMessageRead.model_validate(result["assistant_message"]),
+        run=AgentRunRead.model_validate(run),
+    )
+
+
+@router.post("/projects/{project_id}/agent/tool-calls/{tool_call_id}/approve", response_model=AgentTurnRead)
+async def approve_agent_tool_call(
+    project_id: str,
+    tool_call_id: str,
+    payload: AgentToolDecisionPayload,
+    db: Session = Depends(get_db),
+    agent_svc: AgentSessionService = Depends(get_agent_service),
+) -> AgentTurnRead:
+    project = _get_project_or_404(db, project_id)
+    try:
+        result = await agent_svc.approve_tool_call(project, tool_call_id, comment=payload.comment)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    run = result["run"]
+    return AgentTurnRead(
+        session=AgentSessionRead.model_validate(result["session"]),
+        user_message=AgentMessageRead.model_validate(result["user_message"]),
+        assistant_message=AgentMessageRead.model_validate(result["assistant_message"]),
+        run=AgentRunRead.model_validate(run),
+    )
+
+
+@router.post("/projects/{project_id}/agent/tool-calls/{tool_call_id}/reject", response_model=AgentTurnRead)
+def reject_agent_tool_call(
+    project_id: str,
+    tool_call_id: str,
+    payload: AgentToolDecisionPayload,
+    db: Session = Depends(get_db),
+    agent_svc: AgentSessionService = Depends(get_agent_service),
+) -> AgentTurnRead:
+    project = _get_project_or_404(db, project_id)
+    try:
+        result = agent_svc.reject_tool_call(project, tool_call_id, comment=payload.comment)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     run = result["run"]
     return AgentTurnRead(
         session=AgentSessionRead.model_validate(result["session"]),

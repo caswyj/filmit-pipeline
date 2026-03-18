@@ -83,6 +83,39 @@ class AgentSendMessagePayload(BaseModel):
     page_context: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentToolDecisionPayload(BaseModel):
+    comment: str | None = None
+
+
+class AgentActionItemRead(BaseModel):
+    tool_call_id: str
+    call_status: str
+    requested_action: str
+    display_name: str | None = None
+    scope_summary: str | None = None
+    ready: bool
+    missing_fields: list[str] = Field(default_factory=list)
+    user_visible_summary: str | None = None
+    estimated_cost: float | None = None
+    estimated_cost_summary: str | None = None
+    cost_source: str | None = None
+    prompt_preview: str | None = None
+    feedback_summary: str | None = None
+    decision_status: str | None = None
+    decision_comment: str | None = None
+    execution_status: str | None = None
+    execution_summary: str | None = None
+    execution_run_id: str | None = None
+    execution_tool_call_id: str | None = None
+    created_at: datetime
+    finished_at: datetime | None = None
+
+
+class AgentActionQueueRead(BaseModel):
+    pending: list[AgentActionItemRead] = Field(default_factory=list)
+    history: list[AgentActionItemRead] = Field(default_factory=list)
+
+
 class AgentTurnRead(BaseModel):
     session: AgentSessionRead
     user_message: AgentMessageRead

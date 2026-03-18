@@ -346,6 +346,26 @@ button.primary {
   gap: 12px;
 }
 
+.agentActionQueueCard,
+.agentActionQueueList,
+.agentActionHistoryList {
+  display: grid;
+  gap: 10px;
+}
+
+.agentActionQueueItem,
+.agentActionHistoryItem {
+  border-radius: 14px;
+  border: 1px solid rgba(21, 35, 59, 0.08);
+  background: rgba(255, 255, 255, 0.88);
+  padding: 12px;
+}
+
+.agentActionQueueItem p,
+.agentActionHistoryItem p {
+  margin: 8px 0 0;
+}
+
 .agentMessages {
   display: grid;
   gap: 12px;
