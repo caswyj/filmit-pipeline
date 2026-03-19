@@ -86,7 +86,32 @@ class FilmItAgentRuntime:
     ) -> str | None:
         if not settings.agent_live_model_enabled:
             return None
-        if session.agent_provider != "openai" or not settings.openai_api_key:
+        provider = (session.agent_provider or settings.agent_provider or "").lower()
+        if provider == "openai":
+            return await self._maybe_generate_openai_response(
+                project=project,
+                session=session,
+                user_text=user_text,
+                context=context,
+            )
+        if provider == "openrouter":
+            return await self._maybe_generate_openrouter_response(
+                project=project,
+                session=session,
+                user_text=user_text,
+                context=context,
+            )
+        return None
+
+    async def _maybe_generate_openai_response(
+        self,
+        *,
+        project: Project,
+        session: AgentSession,
+        user_text: str,
+        context: dict[str, Any],
+    ) -> str | None:
+        if not settings.openai_api_key:
             return None
 
         prompt = self._build_live_prompt(project=project, user_text=user_text, context=context)
@@ -109,6 +134,55 @@ class FilmItAgentRuntime:
             response.raise_for_status()
             body = response.json()
             text = str(body.get("output_text") or self._collect_response_text(body)).strip()
+            return text or None
+        except Exception:
+            return None
+
+    async def _maybe_generate_openrouter_response(
+        self,
+        *,
+        project: Project,
+        session: AgentSession,
+        user_text: str,
+        context: dict[str, Any],
+    ) -> str | None:
+        api_key = settings.agent_openrouter_api_key or settings.openrouter_api_key
+        api_url = settings.agent_openrouter_api_url or settings.openrouter_api_url
+        site_url = settings.agent_openrouter_site_url or settings.openrouter_site_url
+        app_name = settings.agent_openrouter_app_name or settings.openrouter_app_name or "FilmIt Agent"
+        timeout_sec = settings.agent_openrouter_timeout_sec or settings.openrouter_timeout_sec
+        if not api_key or not api_url:
+            return None
+
+        prompt = self._build_live_prompt(project=project, user_text=user_text, context=context)
+        payload = {
+            "model": session.agent_model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 FilmIt 项目内置 Agent。只能基于给定上下文回答，不得臆造项目状态。"
+                        "如果用户要求写操作，但系统未明确给出已执行结果，必须说明写操作仍需明确授权确认。"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": settings.agent_max_output_tokens,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if site_url:
+            headers["HTTP-Referer"] = site_url
+        if app_name:
+            headers["X-Title"] = app_name
+        try:
+            async with httpx.AsyncClient(timeout=timeout_sec) as client:
+                response = await client.post(api_url.rstrip("/"), headers=headers, json=payload)
+            response.raise_for_status()
+            body = response.json()
+            text = self._collect_chat_completion_text(body).strip()
             return text or None
         except Exception:
             return None
@@ -305,3 +379,25 @@ class FilmItAgentRuntime:
                 if content.get("type") == "output_text" and content.get("text"):
                     lines.append(str(content["text"]))
         return "\n".join(lines).strip()
+
+    def _collect_chat_completion_text(self, response: dict[str, Any]) -> str:
+        choices = response.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            lines: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    lines.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if item.get("type") in {"text", "output_text"} and text:
+                    lines.append(str(text))
+            return "\n".join(lines)
+        return ""

@@ -117,12 +117,13 @@ class AgentToolRegistry:
         step_label = STEP_LABEL_BY_NAME.get(step_name or "", str(page_context.get("selected_step_name") or step_name or "-"))
         scope_mode = self._resolve_scope_mode(text)
         chapter = self._resolve_chapter(project.id, text=text, page_context=page_context)
-        chapter_id = str(chapter.get("id") or "").strip() or None
-        chapter_title = str(chapter.get("title") or page_context.get("selected_chapter_title") or "").strip() or None
+        chapter_data = chapter or {}
+        chapter_id = str(chapter_data.get("id") or "").strip() or None
+        chapter_title = str(chapter_data.get("title") or page_context.get("selected_chapter_title") or "").strip() or None
         scope_summary = self._scope_summary(step_label, chapter_title, scope_mode=scope_mode)
         shot_index = self._extract_shot_index(text)
         prompt_chapter_title = chapter_title if scope_mode == "single" else None
-        prompt_chapter_summary = str(chapter.get("summary") or "") if scope_mode == "single" else ""
+        prompt_chapter_summary = str(chapter_data.get("summary") or "") if scope_mode == "single" else ""
 
         if any(keyword in lowered for keyword in STORY_BIBLE_KEYWORDS) and any(keyword in text for keyword in REBUILD_KEYWORDS):
             return PlannedToolAction(

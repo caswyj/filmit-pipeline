@@ -29,6 +29,17 @@ class AgentSessionService:
             .order_by(AgentSession.created_at.asc())
         )
         if session:
+            changed = False
+            if session.agent_provider != settings.agent_provider:
+                session.agent_provider = settings.agent_provider
+                changed = True
+            if session.agent_model_name != settings.agent_model_name:
+                session.agent_model_name = settings.agent_model_name
+                changed = True
+            if changed:
+                self.db.add(session)
+                self.db.commit()
+                self.db.refresh(session)
             return session
 
         session = AgentSession(
