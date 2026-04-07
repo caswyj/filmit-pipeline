@@ -2106,7 +2106,7 @@ export default function ProjectPage() {
                 <p><strong>动作</strong> {asString(frame.action, "暂无动作描述")}</p>
                 {asString(frame.dialogue, "") !== "" ? <p><strong>对白</strong> {asString(frame.dialogue, "")}</p> : null}
                 {detectedTokens.length > 0 ? (
-                  <p style={{ color: "#d95f23" }}>
+                  <p className="accentText">
                     <strong>文字检测</strong> 命中 {detectedTokens.join(", ")}
                   </p>
                 ) : null}
@@ -2174,7 +2174,7 @@ export default function ProjectPage() {
       return (
         <div className="mediaWorkspace">
           <section className="mediaHeroCard">
-            <div className="card" style={{ marginBottom: 12, padding: 12, background: "rgba(217,95,35,0.08)" }}>
+            <div className="card calloutCard" style={{ marginBottom: 12, padding: 12 }}>
               <strong>硬约束</strong>
               <p style={{ margin: "6px 0 0" }}>
                 当前分镜图必须无字幕、无文字、无 Logo、无水印；若 OCR 检出可读文字，将直接判定失败并要求重生。
@@ -2268,7 +2268,7 @@ export default function ProjectPage() {
       return (
         <div className="mediaWorkspace">
           <section className="mediaHeroCard">
-            <div className="card" style={{ marginBottom: 12, padding: 12, background: "rgba(217,95,35,0.08)" }}>
+            <div className="card calloutCard" style={{ marginBottom: 12, padding: 12 }}>
               <strong>校核重点</strong>
               <p style={{ margin: "6px 0 0" }}>
                 除章节内部人物/场景连续性外，分镜校核会继续收口章节边界的首尾帧衔接；不相关的文学辅助章节默认跳过。
@@ -2382,7 +2382,7 @@ export default function ProjectPage() {
       return (
         <div className="mediaWorkspace">
           <section className="mediaHeroCard">
-            <div className="card" style={{ marginBottom: 12, padding: 12, background: "rgba(217,95,35,0.08)" }}>
+            <div className="card calloutCard" style={{ marginBottom: 12, padding: 12 }}>
               <strong>硬约束</strong>
               <p style={{ margin: "6px 0 0" }}>
                 视频片段必须输出真实运动，而不是静态停留；当前已启用首尾帧桥接提示词，优先约束章节边界连续性。
@@ -2733,13 +2733,11 @@ export default function ProjectPage() {
           <strong>流程总体进度</strong>
           <span>{overallProgress}%</span>
         </div>
-        <div style={{ width: "100%", height: 10, borderRadius: 999, background: "#2f3f5c", marginTop: 10, overflow: "hidden" }}>
+        <div className="progressTrack">
           <div
+            className="progressFill"
             style={{
               width: `${Math.max(0, Math.min(100, overallProgress))}%`,
-              height: "100%",
-              background: "linear-gradient(90deg,#4ea7ff,#75d5f5)",
-              transition: "width 280ms ease",
             }}
           />
         </div>
@@ -2821,13 +2819,11 @@ export default function ProjectPage() {
             <strong>{pendingAction ?? "执行完成"}</strong>
             <span>{Math.round(actionProgress)}%</span>
           </div>
-          <div style={{ width: "100%", height: 10, borderRadius: 999, background: "#2f3f5c", marginTop: 10, overflow: "hidden" }}>
+          <div className="progressTrack">
             <div
+              className="progressFill progressFillAccent"
               style={{
                 width: `${Math.max(0, Math.min(100, actionProgress))}%`,
-                height: "100%",
-                background: "linear-gradient(90deg,#d95f23,#f3a84a)",
-                transition: "width 300ms ease",
               }}
             />
           </div>
@@ -3091,8 +3087,8 @@ export default function ProjectPage() {
                 data-step-status={step.status}
                 data-selected={selected?.id === step.id ? "true" : "false"}
                 style={{
-                  borderColor: isRunning ? "#f3a84a" : selected?.id === step.id ? "#d95f23" : undefined,
-                  background: isRunning ? "rgba(243,168,74,0.16)" : undefined,
+                  borderColor: isRunning ? "var(--warning)" : selected?.id === step.id ? "var(--accent)" : undefined,
+                  background: isRunning ? "var(--warning-soft)" : undefined,
                 }}
               >
                 {step.step_order}. {step.step_display_name}{isRunning ? " · 执行中" : ""}
@@ -3279,7 +3275,7 @@ export default function ProjectPage() {
                 当前配置：{storyboardQualityPreset.label} / {storyboardImageSize} / 批量预算 ${asNumber(storyboardBudgetUsd, storyboardQualityPreset.defaultBudget).toFixed(1)}
               </p>
               {/(gpt-5-image|gemini-3)/i.test(modelName) ? (
-                <p style={{ color: "#d95f23", margin: 0 }}>
+                <p className="accentText" style={{ margin: 0 }}>
                   当前模型偏贵。若只是先看剧情和构图，建议改用 `google/gemini-2.5-flash-image`。
                 </p>
               ) : (
@@ -3806,7 +3802,7 @@ export default function ProjectPage() {
                   className="demoCard"
                   style={{
                     marginBottom: 12,
-                    borderColor: version.is_active ? "#d95f23" : undefined,
+                    borderColor: version.is_active ? "var(--accent)" : undefined,
                   }}
                 >
                   {(() => {

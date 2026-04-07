@@ -11,6 +11,19 @@ test.describe("n2v web smoke", () => {
     await expect(page.getByTestId("home-create-project-section")).toBeVisible();
     await expect(page.getByTestId("home-project-list")).toBeVisible();
     await expect(page.getByTestId("home-import-demo-button")).toBeVisible();
+    await expect(page.getByTestId("theme-switcher")).toBeVisible();
+    await expect(page.getByTestId("home-theme-select")).toBeVisible();
+  });
+
+  test("theme switcher persists the selected theme", async ({ page }) => {
+    await page.goto("/");
+
+    await page.getByTestId("home-theme-select").selectOption("premiere-dark");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "premiere-dark");
+
+    await page.reload();
+
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "premiere-dark");
   });
 
   test("project page renders workflow shell for a newly created project", async ({ page, request }) => {

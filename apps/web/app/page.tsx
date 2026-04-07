@@ -4,6 +4,9 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 
+import { useTheme } from "./components/theme-controller";
+import { resolveThemeId, themeGroups } from "./theme-config";
+
 type Project = {
   id: string;
   name: string;
@@ -34,6 +37,7 @@ const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
 export default function HomePage() {
   const router = useRouter();
+  const { activeTheme, themeId, setThemeId } = useTheme();
   const [projects, setProjects] = useState<Project[]>([]);
   const [demoCase, setDemoCase] = useState<DemoCase | null>(null);
   const [demoLoading, setDemoLoading] = useState(true);
@@ -153,6 +157,42 @@ export default function HomePage() {
             <p className="muted">
               支持分步审核、提示词重生成、模型切换重跑。现在可以直接从首页导入本机准备好的《1408》演示文本。
             </p>
+            <div className="demoCard homeThemePanel" data-testid="home-theme-panel">
+              <div className="homeThemePanelHeader">
+                <div>
+                  <p className="eyebrow">Workspace Theme</p>
+                  <strong>起始页主题选择</strong>
+                </div>
+                <span className="pill">{activeTheme.family}</span>
+              </div>
+              <div className="homeThemePanelBody">
+                <label className="homeThemeLabel">
+                  <span className="muted">FilmIt 界面主题</span>
+                  <select
+                    value={themeId}
+                    onChange={(event) => setThemeId(resolveThemeId(event.target.value))}
+                    data-testid="home-theme-select"
+                  >
+                    {themeGroups.map((group) => (
+                      <optgroup key={group.group} label={group.group}>
+                        {group.options.map((theme) => (
+                          <option key={theme.id} value={theme.id}>
+                            {theme.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <div className="homeThemeMeta">
+                  <strong>{activeTheme.label}</strong>
+                  <p className="muted">{activeTheme.description}</p>
+                  <p className="muted" style={{ marginBottom: 0 }}>
+                    灵感来源：{activeTheme.inspiration}
+                  </p>
+                </div>
+              </div>
+            </div>
             <div className="actionsRow">
               <button
                 className="primary"
@@ -205,7 +245,7 @@ export default function HomePage() {
 
       <section className="card" data-testid="home-create-project-section">
         <h2>手动创建项目</h2>
-        <p className="muted">也可以继续手动创建空项目，再自行上传 PDF/TXT 文本。</p>
+        <p className="muted">也可以继续手动创建空项目，再自行上传 PDF/TXT 文本。当前主题：{activeTheme.label}</p>
         <div className="row">
           <input
             value={name}
