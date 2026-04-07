@@ -1,13 +1,13 @@
 # FilmIt Pipeline
 
-FilmIt Pipeline 是一套给小说影视化和 AI 漫剧制作用的工作流系统，不是单次调用模型的 demo。它把 `PDF/TXT -> 切章 -> 剧本 -> 分镜 -> 出图 -> 视频 -> 配音/字幕 -> 导出` 拆成 8 个可审阅、可回滚、可换模型的步骤，并把中间产物落到本地，方便继续改。
+FilmIt Pipeline 是一套给小说影视化和 AI 漫剧制作使用的工作流系统。它把 `PDF/TXT -> 切章 -> 剧本 -> 分镜 -> 出图 -> 视频 -> 配音/字幕 -> 导出` 拆成 8 个可审阅、可回滚、可换模型的步骤，而不是一次性丢给模型跑完。
 
-它现在的核心价值很直接：
+这个项目真正有价值的地方不是“接了多少模型”，而是把生产流程拆开了：
 
 - 每一步都能看输入、看输出、单独重跑，不是黑盒。
-- 可以人工审核、改 prompt、切 provider、只修某一步，不用整条链路重来。
-- 图片、视频、字幕、音频都在同一个工作台里，不是零散脚本。
-- 产物全部落盘，适合继续做人工精修、拼接和版本管理。
+- 可以人工审核、改 prompt、换 provider，只修出问题的那一步。
+- 图片、视频、字幕、音频在同一个工作台里，不是几段零散脚本。
+- 中间产物全部落盘，方便继续精修、回滚和复用。
 
 ## 看效果
 
@@ -19,45 +19,27 @@ FilmIt Pipeline 是一套给小说影视化和 AI 漫剧制作用的工作流系
 
 - [辛巴达航海 · 第 4 章单镜头 Demo（MP4）](docs/assets/sinbad-shot-demo.mp4)
 
-## 10 分钟跑起来
+## 最短启动命令
 
-前提：
-
-- Docker Desktop
-- 一台能跑 Docker Compose 的 macOS 或 Linux 机器
-- 至少 10 GB 可用磁盘空间
-
-第一轮启动只需要先改一个关键配置：`N2V_GENERATED_DIR`。
+如果你只想先把项目跑起来，直接执行：
 
 ```bash
-cp .env.example .env
+make up
 ```
 
-打开 `.env`，至少确认这一项：
+如果你不想用 `make`：
 
 ```bash
-N2V_GENERATED_DIR=/absolute/path/on/your/machine/filmit-data
+./scripts/bootstrap.sh --up
 ```
 
-它必须是你自己机器上的绝对路径，而且 Docker 要能写进去。比如：
+这个脚本会做三件事：
 
-```bash
-N2V_GENERATED_DIR=/Users/alice/filmit-data
-```
+- 没有 `.env` 时，从 `.env.example` 自动创建
+- 自动生成本地 `N2V_GENERATED_DIR`
+- 自动创建输出目录，然后启动 `docker compose`
 
-如果你现在只是想先把界面和流程跑通，不想立刻花 API 费用，下面这些 key 可以先留空：
-
-- `N2V_OPENAI_API_KEY`
-- `N2V_OPENROUTER_API_KEY`
-- `N2V_VOLCENGINE_LAS_API_KEY`
-
-系统会尽量回退到 mock provider，让你先验证工作台、审核流和本地落盘。
-
-启动：
-
-```bash
-docker compose up -d --build
-```
+默认生成目录是仓库内的 `output/generated`，不会再写死作者机器路径。
 
 启动后访问：
 
@@ -65,24 +47,62 @@ docker compose up -d --build
 - API: `http://localhost:8000`
 - API Docs: `http://localhost:8000/docs`
 
-## 第一次进入后怎么验证
+## 两条使用路径
 
-推荐按这个顺序：
+### 路径 A：本地开发 / 流程调试
 
-1. 先创建一个空项目，确认前后端都能联通。
-2. 导入本地 `TXT` 或 `PDF`，先跑文本链路。
-3. 如果你配了真实 key，再去测试图片或视频步骤。
-4. 在项目页试一次“改 prompt / 切模型 / 只重跑某一步”。
+适合你现在想做这些事：
 
-第 4 步就是这个项目和普通生成 demo 的差别所在。
+- 先看界面和流程是否顺
+- 先做前端、审核流、状态机开发
+- 不想一开始就烧 API 费用
 
-## 真实模型怎么配
+做法：
 
-最常见的组合：
+```bash
+./scripts/bootstrap.sh
+docker compose up -d --build
+```
 
-- 想先把文本链路跑顺：配 `N2V_OPENROUTER_API_KEY`
-- 想测图片、视频、TTS：配 `N2V_OPENAI_API_KEY`
-- 想测 `Seedance` 视频链路：配 `N2V_VOLCENGINE_LAS_API_KEY`
+然后保持这些 key 为空：
+
+- `N2V_OPENAI_API_KEY`
+- `N2V_OPENROUTER_API_KEY`
+- `N2V_VOLCENGINE_LAS_API_KEY`
+
+这时系统会尽量回退到 mock provider。你依然可以验证：
+
+- 新建项目
+- 导入 `TXT` / `PDF`
+- 跑文本链路
+- 改 prompt
+- 切模型
+- 单步重跑
+- 审核和回滚
+
+如果你的目标是开发工作台，而不是测试真实媒体质量，这条路径就够了。
+
+### 路径 B：真实模型接入
+
+适合你现在想测真实图片、视频和配音。
+
+先初始化：
+
+```bash
+./scripts/bootstrap.sh
+```
+
+然后编辑 `.env`，按你的目标加 key：
+
+- 只想先把文本链路跑顺：`N2V_OPENROUTER_API_KEY`
+- 想测图片、视频、TTS：`N2V_OPENAI_API_KEY`
+- 想测 `Seedance` 视频链路：`N2V_VOLCENGINE_LAS_API_KEY`
+
+再启动：
+
+```bash
+docker compose up -d --build
+```
 
 当前代码里已经接入这些方向：
 
@@ -91,7 +111,40 @@ docker compose up -d --build
 - 视频生成：`OpenAI / Sora`、`Volcengine / Seedance`
 - 配音：`OpenAI TTS`、`Edge TTS`
 
-如果 key 留空，对应 provider 会退回 mock 或不可用状态，方便先做流程开发。
+## 第一次进入后建议怎么验
+
+推荐按这个顺序：
+
+1. 先创建一个空项目，确认前后端都正常。
+2. 导入一个本地 `TXT` 或 `PDF`，先看切章和剧本链路。
+3. 如果配了真实 key，再去跑图片或视频步骤。
+4. 在项目页试一次“改 prompt / 切模型 / 只重跑某一步”。
+
+第 4 步就是这个项目和普通生成 demo 的差别所在。
+
+## 常用命令
+
+```bash
+make bootstrap
+make up
+make down
+```
+
+不用 `make` 也可以：
+
+```bash
+./scripts/bootstrap.sh
+./scripts/bootstrap.sh --up
+docker compose down
+```
+
+浏览器回归测试：
+
+```bash
+cd apps/web
+npm run playwright:install
+npm run playwright:test
+```
 
 ## 项目结构
 
@@ -114,51 +167,25 @@ docs/      架构和演示材料
 - `audio/`
 - `exports/`
 
-这点很重要：FilmIt 的目标不是“一次生成结束”，而是把每一步产物留下来，方便团队继续修。
-
-## 现在已经能做什么
-
-- 导入 `PDF/TXT` 小说并拆分章节
-- 自动生成章节剧本和分镜
-- 在浏览器里审核每一步输出
-- 改 prompt 后重跑单步
-- 切换 provider / model 后重跑
-- 对比分镜版本并回滚
-- 预览本地生成的图片和视频
-- 跑通 `storyboard -> segment_video` 的真实媒体链路
+FilmIt 的目标不是“一次生成结束”，而是把每一步产物保留下来，方便继续修。
 
 ## 常见问题
 
 `docker compose` 起不来：
 
-- 先检查 `.env` 里的 `N2V_GENERATED_DIR` 是否是绝对路径
-- 再检查这个目录是否存在、是否有写权限
-- 如果拉镜像很慢，再去改 `N2V_REGISTRY_MIRROR`
+- 先检查 `.env` 里的 `N2V_GENERATED_DIR` 是否存在
+- 再检查这个目录是否有写权限
+- 如果拉镜像很慢，再调整 `N2V_REGISTRY_MIRROR`
 
 页面能打开，但媒体预览失败：
 
 - 大多数情况是 `N2V_GENERATED_DIR` 没设对
-- 现在的 `docker-compose.yml` 会按你的 `N2V_GENERATED_DIR` 绑定挂载，不再写死作者机器路径
+- 现在默认会走 `output/generated`，并通过脚本自动创建
 
 只想做前端或流程开发，不想真调模型：
 
 - 把 provider key 留空即可
 - 先用 mock 跑通界面、状态流转和审核操作
-
-## 浏览器回归测试
-
-```bash
-cd apps/web
-npm run playwright:install
-npm run playwright:test
-```
-
-如果你想可视化看一遍：
-
-```bash
-cd apps/web
-npm run playwright:test:headed
-```
 
 ## 相关文档
 
