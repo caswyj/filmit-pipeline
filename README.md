@@ -1,284 +1,166 @@
 # FilmIt Pipeline
 
-FilmIt Pipeline 是一个面向 AI 漫剧与小说影视化创作的全流程流水线：导入 `PDF/TXT` 小说，自动切章、生成剧本与分镜、联动图像/视频/字幕/配音模型，并在浏览器中提供可人工干预、可回滚、可切换模型的工作台。
+FilmIt Pipeline 是一套给小说影视化和 AI 漫剧制作用的工作流系统，不是单次调用模型的 demo。它把 `PDF/TXT -> 切章 -> 剧本 -> 分镜 -> 出图 -> 视频 -> 配音/字幕 -> 导出` 拆成 8 个可审阅、可回滚、可换模型的步骤，并把中间产物落到本地，方便继续改。
 
-本项目当前以 `docs/architecture-v1.1.0.md` 作为技术架构基线：
+它现在的核心价值很直接：
 
-- `PDF/TXT` 小说输入
-- 8 步流水线处理
-- 四按钮人工闭环
-- 步骤级模型切换与重跑
-- macOS 本地部署，浏览器访问工作台
+- 每一步都能看输入、看输出、单独重跑，不是黑盒。
+- 可以人工审核、改 prompt、切 provider、只修某一步，不用整条链路重来。
+- 图片、视频、字幕、音频都在同一个工作台里，不是零散脚本。
+- 产物全部落盘，适合继续做人工精修、拼接和版本管理。
 
-## 辛巴达 Demo
+## 看效果
 
-《辛巴达航海》项目第 4 章分镜示例：
+《辛巴达航海》第 4 章分镜示例：
 
 ![辛巴达航海分镜示例](docs/assets/sinbad-storyboard-contact-sheet.png)
 
-视频示例：
+真实视频片段示例：
 
 - [辛巴达航海 · 第 4 章单镜头 Demo（MP4）](docs/assets/sinbad-shot-demo.mp4)
-- 该示例展示 `分镜出图 -> 视频片段` 的真实媒体链路，分镜图作为 reference 输入，视频由 `Seedance 1.5 Pro` 生成。
 
-## 目录
+## 10 分钟跑起来
+
+前提：
+
+- Docker Desktop
+- 一台能跑 Docker Compose 的 macOS 或 Linux 机器
+- 至少 10 GB 可用磁盘空间
+
+第一轮启动只需要先改一个关键配置：`N2V_GENERATED_DIR`。
+
+```bash
+cp .env.example .env
+```
+
+打开 `.env`，至少确认这一项：
+
+```bash
+N2V_GENERATED_DIR=/absolute/path/on/your/machine/filmit-data
+```
+
+它必须是你自己机器上的绝对路径，而且 Docker 要能写进去。比如：
+
+```bash
+N2V_GENERATED_DIR=/Users/alice/filmit-data
+```
+
+如果你现在只是想先把界面和流程跑通，不想立刻花 API 费用，下面这些 key 可以先留空：
+
+- `N2V_OPENAI_API_KEY`
+- `N2V_OPENROUTER_API_KEY`
+- `N2V_VOLCENGINE_LAS_API_KEY`
+
+系统会尽量回退到 mock provider，让你先验证工作台、审核流和本地落盘。
+
+启动：
+
+```bash
+docker compose up -d --build
+```
+
+启动后访问：
+
+- Web: `http://localhost:3000`
+- API: `http://localhost:8000`
+- API Docs: `http://localhost:8000/docs`
+
+## 第一次进入后怎么验证
+
+推荐按这个顺序：
+
+1. 先创建一个空项目，确认前后端都能联通。
+2. 导入本地 `TXT` 或 `PDF`，先跑文本链路。
+3. 如果你配了真实 key，再去测试图片或视频步骤。
+4. 在项目页试一次“改 prompt / 切模型 / 只重跑某一步”。
+
+第 4 步就是这个项目和普通生成 demo 的差别所在。
+
+## 真实模型怎么配
+
+最常见的组合：
+
+- 想先把文本链路跑顺：配 `N2V_OPENROUTER_API_KEY`
+- 想测图片、视频、TTS：配 `N2V_OPENAI_API_KEY`
+- 想测 `Seedance` 视频链路：配 `N2V_VOLCENGINE_LAS_API_KEY`
+
+当前代码里已经接入这些方向：
+
+- 文本推理：`OpenRouter`、`OpenAI`
+- 图片生成：`OpenAI`
+- 视频生成：`OpenAI / Sora`、`Volcengine / Seedance`
+- 配音：`OpenAI TTS`、`Edge TTS`
+
+如果 key 留空，对应 provider 会退回 mock 或不可用状态，方便先做流程开发。
+
+## 项目结构
 
 ```text
 apps/
   api/     FastAPI 后端
   web/     Next.js 前端
 workers/   Celery worker
-libs/      Provider/Workflow/Consistency 共享库
-infra/     部署与基础设施配置
-docs/      技术文档
+libs/      Provider / Workflow / Consistency 共享库
+docs/      架构和演示材料
 ```
 
-## 快速启动
+所有生成文件都会落到 `N2V_GENERATED_DIR`，常见目录包括：
 
-1. 复制环境变量：
+- `sources/`
+- `chapters/`
+- `scripts/`
+- `storyboards/`
+- `videos/`
+- `audio/`
+- `exports/`
 
-```bash
-cp .env.example .env
-```
+这点很重要：FilmIt 的目标不是“一次生成结束”，而是把每一步产物留下来，方便团队继续修。
 
-2. 启动服务：
+## 现在已经能做什么
 
-```bash
-docker compose up -d --build
-```
+- 导入 `PDF/TXT` 小说并拆分章节
+- 自动生成章节剧本和分镜
+- 在浏览器里审核每一步输出
+- 改 prompt 后重跑单步
+- 切换 provider / model 后重跑
+- 对比分镜版本并回滚
+- 预览本地生成的图片和视频
+- 跑通 `storyboard -> segment_video` 的真实媒体链路
 
-如果你所在网络访问 `auth.docker.io` 超时，本项目默认已改为镜像前缀 `docker.m.daocloud.io`。如需切换，可修改 `.env` 中：
+## 常见问题
 
-```bash
-N2V_REGISTRY_MIRROR=...
-N2V_PYTHON_BASE_IMAGE=...
-N2V_NODE_BASE_IMAGE=...
-```
+`docker compose` 起不来：
 
-如需在浏览器中强制验证“第 5 步一致性失败后自动回退到第 4 步分镜出图并进行版本比较”的流程，可临时设置：
+- 先检查 `.env` 里的 `N2V_GENERATED_DIR` 是否是绝对路径
+- 再检查这个目录是否存在、是否有写权限
+- 如果拉镜像很慢，再去改 `N2V_REGISTRY_MIRROR`
 
-```bash
-N2V_CONSISTENCY_THRESHOLD=101
-docker compose up -d --build api web llm-worker media-worker
-```
+页面能打开，但媒体预览失败：
 
-恢复默认行为时改回：
+- 大多数情况是 `N2V_GENERATED_DIR` 没设对
+- 现在的 `docker-compose.yml` 会按你的 `N2V_GENERATED_DIR` 绑定挂载，不再写死作者机器路径
 
-```bash
-N2V_CONSISTENCY_THRESHOLD=75
-docker compose up -d --build api web llm-worker media-worker
-```
+只想做前端或流程开发，不想真调模型：
 
-3. 访问地址：
+- 把 provider key 留空即可
+- 先用 mock 跑通界面、状态流转和审核操作
 
-- Web: `http://localhost:3000`
-- API: `http://localhost:8000`
-- API Docs: `http://localhost:8000/docs`
-
-## 安全说明
-
-- 不要提交 `.env`、本地数据库、浏览器缓存或任何包含真实 API key 的文件。
-- `README.md`、`.env.example` 与代码示例中只使用占位符，例如 `N2V_OPENAI_API_KEY=<your-openai-api-key>`。
-- 当前仓库默认忽略 `.env`、`apps/api/generated/`、`.playwright-cli/`、`*.egg-info/` 等本地生成内容。
-
-## Playwright 浏览器测试
-
-后续页面维护、交互回归和新需求验收默认使用 `Playwright`。
-
-首次安装浏览器：
+## 浏览器回归测试
 
 ```bash
 cd apps/web
 npm run playwright:install
-```
-
-执行快速冒烟测试：
-
-```bash
-cd apps/web
 npm run playwright:test
 ```
 
-可视化执行：
+如果你想可视化看一遍：
 
 ```bash
 cd apps/web
 npm run playwright:test:headed
 ```
 
-执行现有的整条工作流自动化脚本：
+## 相关文档
 
-```bash
-cd apps/web
-npm run playwright:demo-workflow -- --headed --stop-after-step chapter_chunking
-```
-
-说明：
-
-- Playwright 默认访问 `http://127.0.0.1:3000`
-- API 默认访问 `http://127.0.0.1:8000`
-- 产物输出到 `output/playwright/`
-
-## 文件落盘
-
-当前所有项目相关文件默认统一落盘到 `N2V_GENERATED_DIR` 指向的目录，例如：
-
-- `/absolute/path/to/novel-to-video-demo-cases`
-
-目录结构按“项目 + 文件类别”组织，例如：
-
-- `sources/` 原始 `PDF/TXT`
-- `texts/` 全文解析结果
-- `chapters/` 章节切分结果
-- `scripts/` 章节剧本
-- `shots/` 分镜细化结果
-- `storyboards/` 分镜图
-- `videos/` 章节视频片段
-- `audio/` 配音与音频相关产物
-- `exports/` 最终成片
-
-最终导出的 `output_key` 现在返回真实的绝对路径，而不是逻辑占位键。
-
-## 当前实现说明
-
-当前已实现内容：
-
-1. 核心数据库模型（项目、步骤、镜头、素材、审计、版本）
-2. 流程状态机（`PENDING -> GENERATING -> REVIEW_REQUIRED -> APPROVED`）
-3. 四按钮人工闭环 API
-4. 可切换模型绑定与重跑
-5. 一致性评分引擎（基础版本）
-6. 最小 Web 工作台（项目创建、步骤审核、动作触发）
-7. 分镜版本回滚、版本选用、卡片化版本对比
-8. 分镜缩略图预览与本地生成资产访问路由
-9. OpenAI 首批真实模型接入准备（`gpt-5/gpt-image-1.5/gpt-4o-mini-tts/sora-2`）
-10. `Story Bible` 风格预设与自定义风格注入
-11. `segment_video` 任务轮询与本地视频片段落盘
-12. 八步中文显示名与每步提示词模板预设
-
-后续建议按 `docs/architecture-v1.1.0.md` 继续扩展 Story Bible 资产拆分、真实图生视频与高级时间线编辑。
-
-## 真实模型测试
-
-当前已优先接入 `OpenAI` 首批真实 provider 能力：
-
-- 文本步骤：`chunk/script/shot_detail/consistency`
-- 图片步骤：`storyboard_image`
-- 配音步骤：`stitch_subtitle_tts`
-- 视频步骤：`segment_video` 已接入创建接口，但完整异步轮询与拼接仍待补完
-
-启用方式：
-
-```bash
-cp .env.example .env
-```
-
-在 `.env` 中设置：
-
-```bash
-N2V_OPENAI_API_KEY=<your-openai-api-key>
-```
-
-然后重建：
-
-```bash
-docker compose up -d --build api web
-```
-
-说明：
-
-- 若未配置 `N2V_OPENAI_API_KEY`，系统会自动回退到 mock adapter。
-- 分镜图、视频片段、章节脚本等都会写入 `N2V_GENERATED_DIR` 指向的目录，并通过 `/api/v1/local-files/...` 提供浏览器预览。
-- 视频步骤当前已实现“创建任务 -> 轮询状态 -> 下载片段”的主干闭环，轮询参数可通过以下环境变量调整：
-
-```bash
-N2V_VIDEO_POLL_INTERVAL_SEC=8
-N2V_VIDEO_POLL_MAX_ATTEMPTS=15
-```
-
-## OpenRouter 统一接口
-
-当前已新增 `openrouter` provider，接入 `chat/completions` 统一文本接口。
-
-适用范围：
-
-- `chunk`
-- `script`
-- `shot_detail`
-- `consistency`
-
-也可用于 `image/video/tts` 的提示词包生成，但这些步骤如果只走 `openrouter`，当前产物将是“提示词/结构化文本”，不会直接生成真实二进制媒体。
-
-环境变量：
-
-```bash
-N2V_OPENROUTER_API_KEY=...
-N2V_OPENROUTER_API_URL=https://openrouter.ai/api/v1/chat/completions
-N2V_OPENROUTER_SITE_URL=http://localhost:3000
-N2V_OPENROUTER_APP_NAME=FilmIt Pipeline
-N2V_OPENROUTER_TIMEOUT_SEC=180
-```
-
-默认策略：
-
-- 文本推理与提示词阶段优先建议 `openrouter`
-- 真实图片/视频/音频生成仍优先建议专用媒体 provider
-
-## 风格预设
-
-当前内置可选风格：
-
-- `电影质感`
-- `赛博朋克`
-- `哥特式`
-- `阴郁黑色`
-- `Q版`
-- `写实`
-- `平面插画`
-- `三维风格化`
-- `动画番剧`
-- `水墨`
-
-支持用户在创建项目或项目页中继续补充：
-
-- 自定义风格名
-- 自定义风格约束
-
-这些内容会被标准化写入 `style_profile.story_bible`，并自动注入剧本、分镜图、视频生成等步骤的提示词。
-
-## 提示词模板
-
-当前八个步骤均已内置多组提示词模板，可在项目审核页直接选择并套用：
-
-- 导入全文
-- 切分章节
-- 章节剧本
-- 分镜细化
-- 分镜出图
-- 分镜校核
-- 视频片段
-- 成片输出
-
-模板会同时覆盖：
-
-- 系统提示词
-- 任务提示词
-
-## 本地演示
-
-如需用本机准备好的 `1408` 文本跑一次最小演示：
-
-1. 将演示输入放到 `demo_data/night_shift_demo/source_story.txt`
-2. 可直接在 Web 首页点击“一键导入 1408 Demo”
-3. 或运行：
-
-```bash
-python3 scripts/run_demo_1408.py
-```
-
-脚本会：
-
-- 创建一个本地演示项目
-- 上传 `1408` 文本
-- 运行首个步骤 `ingest_parse`
-- 将结果写入 `demo_runs/1408/<timestamp>/summary.json`
+- 架构基线：[docs/architecture-v1.1.0.md](docs/architecture-v1.1.0.md)
+- Agent 化规划：[docs/filmit-agentization-implementation-plan.md](docs/filmit-agentization-implementation-plan.md)

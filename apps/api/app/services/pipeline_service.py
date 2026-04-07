@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import html
 import io
 import json
@@ -43,6 +44,13 @@ from app.services.prompt_service import get_baseline_prompts
 from app.services.object_storage_service import ObjectStorageService
 from app.services.storage_service import project_category_dir, project_root, sanitize_component, step_category, storage_root
 from app.services.style_service import build_style_prompt, normalize_style_profile
+
+
+class StepExecutionError(Exception):
+    def __init__(self, message: str, *, detail_output: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.detail_output = deepcopy(detail_output or {})
+
 
 SOURCE_EXCERPT_LIMIT = 2000
 SOURCE_CONTENT_LIMIT = 2_000_000
@@ -111,6 +119,7 @@ SEGMENT_VIDEO_PROMPT_PROFILES: dict[str, dict[str, Any]] = {
             "将当前分镜图作为 first_frame reference，提示词聚焦主体、动作、运镜与光源逻辑，避免长篇文学化修辞。",
             "单镜头只保留一个主动作目标，明确动作起点、运动方向、镜头路径和结尾状态，减少模型漂移。",
             "优先保持人物身份、构图、关键道具与真实运动连续性，必要时为下一镜头留出干净尾帧。",
+            "对白与旁白必须分离：有对白的镜头只给出角色说话内容；无对白镜头才允许极短旁白，不要让模型把叙述文字全部念出来。",
         ],
     },
     "sora2": {
@@ -147,6 +156,7 @@ VIDEO_AUDIO_MODE_LABELS = {
     "demo_native_audio": "Demo 模式（第 7 步原生音轨，第 8 步跳过 TTS）",
     "formal_tts": "正式成片模式（第 7 步静音，第 8 步统一旁白/TTS）",
 }
+SEGMENT_VIDEO_JOB_CONCURRENCY = 3
 STORYBOARD_TEXT_OCR_LANG = "eng+chi_sim"
 STORY_BIBLE_CHARACTER_VIEWS = [
     ("front", "正面"),
@@ -2058,6 +2068,147 @@ class PipelineService:
             return False
         return bool(safe_params.get("generate_audio", False))
 
+    def _segment_video_strict_demo(self, params: dict[str, Any] | None, *, audio_mode: str | None = None) -> bool:
+        safe_params = params or {}
+        if "video_strict_demo" in safe_params:
+            return bool(safe_params.get("video_strict_demo"))
+        if "video_allow_fallback" in safe_params:
+            return not bool(safe_params.get("video_allow_fallback"))
+        normalized_mode = self._normalize_video_audio_mode(
+            audio_mode or safe_params.get("video_audio_mode") or safe_params.get("audio_mode"),
+            fallback="formal_tts",
+        )
+        return normalized_mode == "demo_native_audio"
+
+    def _segment_video_reference_sensitive_error(self, exc: Exception | str) -> bool:
+        text = str(exc or "").lower()
+        return any(
+            token in text
+            for token in (
+                "inputimagesensitivecontentdetected",
+                "input image may contain sensitive information",
+                "sensitive content",
+                "sensitive information",
+            )
+        )
+
+    def _segment_video_clip_signature(
+        self,
+        shot: dict[str, Any],
+        *,
+        provider: str,
+        model: str,
+        prompt_options: dict[str, Any],
+    ) -> str:
+        payload = {
+            "shot_index": int(shot.get("shot_index") or 0),
+            "scene": str(shot.get("scene") or ""),
+            "scene_hint": str(shot.get("scene_hint") or ""),
+            "frame_type": str(shot.get("frame_type") or ""),
+            "visual": str(shot.get("visual") or ""),
+            "action": str(shot.get("action") or ""),
+            "dialogue": str(shot.get("dialogue") or ""),
+            "narration": str(shot.get("narration") or ""),
+            "duration_sec": round(float(shot.get("duration_sec") or 0), 2),
+            "characters": [str(item) for item in (shot.get("characters") or []) if str(item).strip()],
+            "props": [str(item) for item in (shot.get("props") or []) if str(item).strip()],
+            "provider": provider,
+            "model": model,
+            "audio_mode": str(prompt_options.get("audio_mode") or ""),
+            "prompt_profile": str(prompt_options.get("profile_key") or ""),
+            "include_dialogue": bool(prompt_options.get("include_dialogue", True)),
+            "include_narration": bool(prompt_options.get("include_narration", True)),
+            "include_reference_image": bool(prompt_options.get("include_reference_image", True)),
+            "motion_intensity": str(prompt_options.get("motion_intensity") or ""),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _segment_video_existing_clip_manifest(self, chapter: ChapterChunk) -> tuple[int, list[dict[str, Any]]]:
+        stages = self._chapter_stages(chapter)
+        stage = stages.get("segment_video")
+        if not isinstance(stage, dict):
+            return 0, []
+        attempt = int(stage.get("attempt") or 0)
+        artifact = deepcopy((stage.get("output") or {}).get("artifact") or {})
+        manifest = artifact.get("clip_manifest")
+        if not isinstance(manifest, list):
+            return attempt, []
+        return attempt, [deepcopy(item) for item in manifest if isinstance(item, dict)]
+
+    def _segment_video_reusable_clip(
+        self,
+        chapter: ChapterChunk,
+        *,
+        shot_index: int,
+        clip_signature: str,
+        provider: str,
+        model: str,
+        prompt_options: dict[str, Any],
+        require_native_audio: bool,
+    ) -> dict[str, Any] | None:
+        previous_attempt, manifest = self._segment_video_existing_clip_manifest(chapter)
+        target_audio_mode = str(prompt_options.get("audio_mode") or "")
+        target_profile = str(prompt_options.get("profile_key") or "")
+        for item in manifest:
+            if int(item.get("shot_index") or 0) != shot_index:
+                continue
+            if str(item.get("mode") or "") != "provider_video":
+                continue
+            if str(item.get("provider") or "") != provider or str(item.get("model") or "") != model:
+                continue
+            if str(item.get("audio_mode") or "") not in {"", target_audio_mode}:
+                continue
+            if str(item.get("prompt_profile") or "") not in {"", target_profile}:
+                continue
+            previous_signature = str(item.get("clip_signature") or "").strip()
+            if previous_signature and previous_signature != clip_signature:
+                continue
+            source_path = Path(str(item.get("storage_key") or ""))
+            if not source_path.exists() or not self._is_playable_video(source_path):
+                continue
+            has_audio_stream = bool(item.get("has_audio_stream"))
+            if require_native_audio and not has_audio_stream:
+                continue
+            reusable = deepcopy(item)
+            reusable["reused_from_attempt"] = previous_attempt
+            reusable["reused_from_storage_key"] = str(source_path)
+            reusable["clip_signature"] = clip_signature
+            reusable["has_audio_stream"] = has_audio_stream or self._video_has_audio_stream(source_path)
+            return reusable
+        if require_native_audio:
+            clip_root = self._generated_project_dir(chapter.project_id, "segment_video")
+            prefix = self._chapter_media_prefix(chapter)
+            candidates = sorted(
+                clip_root.glob(f"{prefix}-clips-attempt-*/shot-{shot_index:02d}.mp4"),
+                key=lambda path: int(match.group(1)) if (match := re.search(r"attempt-(\d+)", str(path.parent))) else 0,
+                reverse=True,
+            )
+            for source_path in candidates:
+                if not source_path.exists() or not self._is_playable_video(source_path):
+                    continue
+                if require_native_audio and not self._video_has_audio_stream(source_path):
+                    continue
+                attempt_match = re.search(r"attempt-(\d+)", str(source_path.parent))
+                return {
+                    "shot_index": shot_index,
+                    "duration_sec": 0.0,
+                    "mode": "provider_video",
+                    "provider": provider,
+                    "model": model,
+                    "storage_key": str(source_path),
+                    "preview_url": self._to_local_file_url(source_path),
+                    "prompt_profile": target_profile,
+                    "clip_signature": clip_signature,
+                    "native_audio_requested": True,
+                    "has_audio_stream": True,
+                    "audio_mode": target_audio_mode,
+                    "reused_from_attempt": int(attempt_match.group(1)) if attempt_match else 0,
+                    "reused_from_storage_key": str(source_path),
+                    "reused": True,
+                }
+        return None
+
     def _video_has_audio_stream(self, path: Path) -> bool:
         if not path.exists():
             return False
@@ -2453,11 +2604,15 @@ class PipelineService:
             step.error_message = str(exc)
             step.finished_at = datetime.now(timezone.utc)
             if chapter:
+                chapter_error_output = {"error_message": str(exc)}
+                detail_output = getattr(exc, "detail_output", None)
+                if isinstance(detail_output, dict):
+                    chapter_error_output.update(deepcopy(detail_output))
                 self._set_chapter_stage_state(
                     chapter,
                     step.step_name,
                     status=StepStatus.FAILED.value,
-                    output={"error_message": str(exc)},
+                    output=chapter_error_output,
                     attempt=step.attempt,
                     provider=step.model_provider,
                     model=step.model_name,
@@ -8135,12 +8290,14 @@ class PipelineService:
         json_payload = self._parse_shot_detail_json(project, chapter, source)
         if json_payload.get("shots"):
             return json_payload
-        if "镜头草案" not in source:
+        if "镜头草案" not in source and "**镜头**" not in source:
             return {}
 
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         shots: list[dict[str, Any]] = []
         current_scene = ""
+        current_characters = ""
+        current_dialogue_context = ""
         current: dict[str, Any] | None = None
 
         def finalize(raw_shot: dict[str, Any] | None) -> None:
@@ -8150,9 +8307,11 @@ class PipelineService:
             action_text = str(raw_shot.get("action_text") or "").strip()
             dialogue_text = str(raw_shot.get("dialogue_text") or "").strip()
             composition_text = str(raw_shot.get("composition_text") or "").strip()
-            character_text = str(raw_shot.get("character_text") or "").strip()
+            character_text = str(raw_shot.get("character_text") or current_characters or "").strip()
             frame_type = str(raw_shot.get("frame_type") or "中景").strip() or "中景"
             duration_sec = float(raw_shot.get("duration_sec") or 6.0)
+            if not dialogue_text and current_dialogue_context:
+                dialogue_text = current_dialogue_context
             character_matching_text = " ".join(part for part in (character_text, action_text, dialogue_text) if part).lower()
             prop_matching_text = " ".join(
                 part for part in (character_text, action_text, dialogue_text, composition_text) if part
@@ -8205,30 +8364,56 @@ class PipelineService:
             line = raw_line.strip()
             if not line:
                 continue
-            if line.startswith("### 场景：") or line.startswith("### 场景:"):
+            if line.startswith("### 场景：") or line.startswith("### 场景:") or line.startswith("**场景**：") or line.startswith("**场景**:"):
                 current_scene = line.split("：", 1)[1].strip() if "：" in line else line.split(":", 1)[1].strip()
                 continue
-            shot_match = re.match(r"^(\d+)\.\s+\*\*人物\*\*[:：]\s*(.+)$", line)
+            if line.startswith("**人物**：") or line.startswith("**人物**:"):
+                current_characters = line.split("：", 1)[1].strip() if "：" in line else line.split(":", 1)[1].strip()
+                continue
+            if line.startswith("**对话**：") or line.startswith("**对话**:"):
+                current_dialogue_context = ""
+                continue
+            if current_dialogue_context == "" and not line.startswith(("-", "*", "###", "**")) and current is None:
+                current_dialogue_context = line
+                continue
+            shot_match = re.match(r"^(\d+)\.\s+\*\*(人物|镜头)\*\*[:：]\s*(.+)$", line)
             if shot_match:
                 finalize(current)
+                label = shot_match.group(2)
+                raw_value = shot_match.group(3).strip()
+                frame_type = "中景"
+                action_seed = ""
+                character_seed = current_characters
+                if label == "人物":
+                    character_seed = raw_value
+                else:
+                    parts = re.split(r"[，,]", raw_value, maxsplit=1)
+                    candidate_frame = parts[0].strip()
+                    if candidate_frame in {"远景", "全景", "中景", "近景", "特写", "大全景", "中近景"}:
+                        frame_type = candidate_frame
+                        action_seed = parts[1].strip() if len(parts) > 1 else ""
+                    else:
+                        action_seed = raw_value
                 current = {
-                    "character_text": shot_match.group(2).strip(),
+                    "character_text": character_seed,
                     "scene_text": current_scene,
-                    "action_text": "",
-                    "dialogue_text": "",
+                    "action_text": action_seed,
+                    "dialogue_text": current_dialogue_context,
                     "composition_text": "",
-                    "frame_type": "中景",
+                    "frame_type": frame_type,
                     "duration_sec": 6.0,
                 }
                 continue
             if current is None:
                 continue
-            field_match = re.match(r"^\*\*(场景|动作|对白|构图|景别|时长)\*\*[:：]\s*(.+)$", line)
+            field_match = re.match(r"^(?:[-*]\s+)?\*\*(人物形象|场景|动作|对白|构图|景别|时长)\*\*[:：]\s*(.+)$", line)
             if not field_match:
                 continue
             label = field_match.group(1)
             value = field_match.group(2).strip()
-            if label == "场景":
+            if label == "人物形象":
+                current["character_text"] = value
+            elif label == "场景":
                 current["scene_text"] = value
             elif label == "动作":
                 current["action_text"] = value
@@ -8827,6 +9012,9 @@ class PipelineService:
             (params or {}).get("video_audio_mode") or (params or {}).get("audio_mode"),
             fallback="demo_native_audio" if generate_audio else "formal_tts",
         )
+        strict_demo = bool(prompt_options.get("strict_demo"))
+        allow_fallback = not strict_demo
+        require_native_audio = generate_audio and audio_mode == "demo_native_audio"
         previous_last_frame = continuity_package.get("previous_last_frame")
         previous_last_frame_url = ""
         if isinstance(previous_last_frame, dict):
@@ -8836,6 +9024,34 @@ class PipelineService:
         for shot in shots:
             shot_index = int(shot.get("shot_index") or len(clip_records) + 1)
             clip_path = clip_dir / f"shot-{shot_index:02d}.mp4"
+            clip_signature = self._segment_video_clip_signature(
+                shot,
+                provider=provider,
+                model=model,
+                prompt_options=prompt_options,
+            )
+            reusable_clip = self._segment_video_reusable_clip(
+                chapter,
+                shot_index=shot_index,
+                clip_signature=clip_signature,
+                provider=provider,
+                model=model,
+                prompt_options=prompt_options,
+                require_native_audio=require_native_audio,
+            )
+            if reusable_clip:
+                source_path = Path(str(reusable_clip.get("reused_from_storage_key") or reusable_clip.get("storage_key") or ""))
+                if source_path.exists() and source_path != clip_path:
+                    clip_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_path, clip_path)
+                reusable_clip["storage_key"] = str(clip_path if clip_path.exists() else source_path)
+                reusable_clip["preview_url"] = self._to_local_file_url(clip_path if clip_path.exists() else source_path)
+                reusable_clip["clip_signature"] = clip_signature
+                reusable_clip["audio_mode"] = audio_mode
+                reusable_clip["native_audio_requested"] = generate_audio
+                reusable_clip["reused"] = True
+                clip_records[shot_index] = reusable_clip
+                continue
             try:
                 input_reference_url = str(shot.get("image_url") or "")
                 if provider == "volcengine" and use_reference_image:
@@ -8859,6 +9075,37 @@ class PipelineService:
                     provider=provider,
                     model=model,
                 )
+                request_params = {
+                    **params,
+                    "seconds": max(2, int(round(float(shot.get("duration_sec") or 2.0)))),
+                    "size": params.get("size") or "1280x720",
+                    "input_reference_path": (
+                        str(shot.get("storage_key") or continuity_package.get("input_reference_path") or "")
+                        if use_reference_image
+                        else ""
+                    ),
+                    "continuity_reference_path": (
+                        str(continuity_package.get("input_reference_path") or "")
+                        if use_reference_image
+                        else ""
+                    ),
+                    "input_reference_url": (
+                        input_reference_url
+                        if use_reference_image
+                        else ""
+                    ),
+                    "continuity_reference_url": (
+                        (
+                            ""
+                            if provider == "volcengine"
+                            else previous_last_frame_url
+                        )
+                        if use_reference_image
+                        else ""
+                    ),
+                    "return_last_frame": True,
+                    "generate_audio": generate_audio,
+                }
                 req = ProviderRequest(
                     step="video",
                     model=model,
@@ -8869,39 +9116,29 @@ class PipelineService:
                         "continuity_package": continuity_package,
                     },
                     prompt=system_prompt,
-                    params={
-                        **params,
-                        "seconds": max(2, int(round(float(shot.get("duration_sec") or 2.0)))),
-                        "size": params.get("size") or "1280x720",
-                        "input_reference_path": (
-                            str(shot.get("storage_key") or continuity_package.get("input_reference_path") or "")
-                            if use_reference_image
-                            else ""
-                        ),
-                        "continuity_reference_path": (
-                            str(continuity_package.get("input_reference_path") or "")
-                            if use_reference_image
-                            else ""
-                        ),
-                        "input_reference_url": (
-                            input_reference_url
-                            if use_reference_image
-                            else ""
-                        ),
-                        "continuity_reference_url": (
-                            (
-                                ""
-                                if provider == "volcengine"
-                                else previous_last_frame_url
-                            )
-                            if use_reference_image
-                            else ""
-                        ),
-                        "return_last_frame": True,
-                        "generate_audio": generate_audio,
-                    },
+                    params=request_params,
                 )
-                response = await adapter.invoke(req)
+                reference_retry_reason = ""
+                try:
+                    response = await adapter.invoke(req)
+                except Exception as exc:
+                    if provider == "volcengine" and use_reference_image and input_reference_url and self._segment_video_reference_sensitive_error(exc):
+                        retry_params = dict(request_params)
+                        retry_params["input_reference_path"] = ""
+                        retry_params["input_reference_url"] = ""
+                        retry_req = ProviderRequest(
+                            step="video",
+                            model=model,
+                            input=req.input,
+                            prompt=system_prompt,
+                            params=retry_params,
+                        )
+                        response = await adapter.invoke(retry_req)
+                        reference_retry_reason = "reference image rejected by provider; retried without reference image"
+                        request_params = retry_params
+                        input_reference_url = ""
+                    else:
+                        raise
                 total_estimated_cost += await adapter.estimate_cost(req, response.usage)
                 aggregated_usage = self._merge_usage_metrics(aggregated_usage, response.usage)
                 artifact = deepcopy(response.output or {})
@@ -8914,82 +9151,187 @@ class PipelineService:
                         "shot": deepcopy(shot),
                         "clip_path": clip_path,
                         "video_id": video_id,
+                        "clip_signature": clip_signature,
+                        "reference_image_used": bool(use_reference_image and input_reference_url),
+                        "reference_retry_reason": reference_retry_reason,
                     }
                 )
             except Exception as exc:  # noqa: BLE001
-                fallback_count += 1
-                self._render_motion_preview_clip(
-                    Path(str(shot.get("storage_key") or "")),
-                    clip_path,
-                    duration_sec=float(shot.get("duration_sec") or 2.0),
-                    motion_mode=self._clip_motion_mode_for_index(shot_index),
-                )
-                clip_records[shot_index] = {
+                failure_record = {
                     "shot_index": shot_index,
                     "duration_sec": float(shot.get("duration_sec") or 0),
-                    "mode": "motion_preview_fallback",
+                    "mode": "provider_failed",
                     "provider": provider,
                     "model": model,
-                    "storage_key": str(clip_path),
-                    "preview_url": self._to_local_file_url(clip_path),
-                    "fallback_reason": str(exc),
-                    "reference_image_used": use_reference_image,
+                    "storage_key": "",
+                    "preview_url": "",
+                    "provider_error": str(exc),
+                    "provider_status": "invoke_failed",
+                    "video_id": "",
+                    "reference_image_used": False,
                     "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
                     "narration_basis_included": bool(prompt_options.get("include_narration", True)),
                     "prompt_profile": str(prompt_options.get("profile_key") or ""),
-                    "native_audio_requested": False,
-                    "audio_mode": "formal_tts",
+                    "clip_signature": clip_signature,
+                    "native_audio_requested": generate_audio,
+                    "has_audio_stream": False,
+                    "audio_mode": audio_mode,
                 }
-        for job in queued_jobs:
+                if allow_fallback:
+                    fallback_count += 1
+                    self._render_motion_preview_clip(
+                        Path(str(shot.get("storage_key") or "")),
+                        clip_path,
+                        duration_sec=float(shot.get("duration_sec") or 2.0),
+                        motion_mode=self._clip_motion_mode_for_index(shot_index),
+                    )
+                    failure_record.update(
+                        {
+                            "mode": "motion_preview_fallback",
+                            "storage_key": str(clip_path),
+                            "preview_url": self._to_local_file_url(clip_path),
+                            "fallback_reason": str(exc),
+                            "provider_status": "fallback_after_invoke_failure",
+                            "native_audio_requested": False,
+                            "audio_mode": "formal_tts",
+                        }
+                    )
+                clip_records[shot_index] = failure_record
+
+        semaphore = asyncio.Semaphore(SEGMENT_VIDEO_JOB_CONCURRENCY)
+
+        async def resolve_job(job: dict[str, Any]) -> tuple[int, dict[str, Any], int]:
             shot_index = int(job["shot_index"])
             shot = deepcopy(job["shot"])
             clip_path = Path(job["clip_path"])
             video_id = str(job["video_id"])
-            try:
-                await self._poll_single_segment_video_job(adapter, video_id, clip_path)
-                if not self._is_playable_video(clip_path):
-                    raise ValueError("downloaded clip is not playable")
-                clip_records[shot_index] = {
-                    "shot_index": shot_index,
-                    "duration_sec": float(shot.get("duration_sec") or 0),
-                    "mode": "provider_video",
-                    "provider": provider,
-                    "model": model,
-                    "storage_key": str(clip_path),
-                    "preview_url": self._to_local_file_url(clip_path),
-                    "reference_image_used": use_reference_image,
-                    "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
-                    "narration_basis_included": bool(prompt_options.get("include_narration", True)),
-                    "prompt_profile": str(prompt_options.get("profile_key") or ""),
-                    "native_audio_requested": generate_audio,
-                    "audio_mode": audio_mode,
-                }
-            except Exception as exc:  # noqa: BLE001
-                fallback_count += 1
-                self._render_motion_preview_clip(
-                    Path(str(shot.get("storage_key") or "")),
-                    clip_path,
-                    duration_sec=float(shot.get("duration_sec") or 2.0),
-                    motion_mode=self._clip_motion_mode_for_index(shot_index),
-                )
-                clip_records[shot_index] = {
-                    "shot_index": shot_index,
-                    "duration_sec": float(shot.get("duration_sec") or 0),
-                    "mode": "motion_preview_fallback",
-                    "provider": provider,
-                    "model": model,
-                    "storage_key": str(clip_path),
-                    "preview_url": self._to_local_file_url(clip_path),
-                    "fallback_reason": str(exc),
-                    "reference_image_used": use_reference_image,
-                    "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
-                    "narration_basis_included": bool(prompt_options.get("include_narration", True)),
-                    "prompt_profile": str(prompt_options.get("profile_key") or ""),
-                    "native_audio_requested": False,
-                    "audio_mode": "formal_tts",
-                }
+            async with semaphore:
+                try:
+                    status_artifact = await self._poll_single_segment_video_job(adapter, video_id, clip_path)
+                    if not self._is_playable_video(clip_path):
+                        raise ValueError("downloaded clip is not playable")
+                    has_audio_stream = self._video_has_audio_stream(clip_path)
+                    if require_native_audio and not has_audio_stream:
+                        raise ValueError("provider clip completed without native audio")
+                    return (
+                        shot_index,
+                        {
+                            "shot_index": shot_index,
+                            "duration_sec": float(shot.get("duration_sec") or 0),
+                            "mode": "provider_video",
+                            "provider": provider,
+                            "model": model,
+                            "storage_key": str(clip_path),
+                            "preview_url": self._to_local_file_url(clip_path),
+                            "reference_image_used": bool(job.get("reference_image_used")),
+                            "reference_retry_reason": str(job.get("reference_retry_reason") or ""),
+                            "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
+                            "narration_basis_included": bool(prompt_options.get("include_narration", True)),
+                            "prompt_profile": str(prompt_options.get("profile_key") or ""),
+                            "clip_signature": str(job.get("clip_signature") or ""),
+                            "native_audio_requested": generate_audio,
+                            "has_audio_stream": has_audio_stream,
+                            "audio_mode": audio_mode,
+                            "video_id": video_id,
+                            "provider_status": str(status_artifact.get("status") or "completed"),
+                            "provider_last_frame_url": str(status_artifact.get("last_frame_url") or ""),
+                            "provider_cover_url": str(status_artifact.get("cover_url") or ""),
+                        },
+                        0,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if allow_fallback:
+                        self._render_motion_preview_clip(
+                            Path(str(shot.get("storage_key") or "")),
+                            clip_path,
+                            duration_sec=float(shot.get("duration_sec") or 2.0),
+                            motion_mode=self._clip_motion_mode_for_index(shot_index),
+                        )
+                        return (
+                            shot_index,
+                            {
+                                "shot_index": shot_index,
+                                "duration_sec": float(shot.get("duration_sec") or 0),
+                                "mode": "motion_preview_fallback",
+                                "provider": provider,
+                                "model": model,
+                                "storage_key": str(clip_path),
+                                "preview_url": self._to_local_file_url(clip_path),
+                                "fallback_reason": str(exc),
+                                "provider_error": str(exc),
+                                "provider_status": "fallback_after_poll_failure",
+                                "video_id": video_id,
+                                "reference_image_used": bool(job.get("reference_image_used")),
+                                "reference_retry_reason": str(job.get("reference_retry_reason") or ""),
+                                "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
+                                "narration_basis_included": bool(prompt_options.get("include_narration", True)),
+                                "prompt_profile": str(prompt_options.get("profile_key") or ""),
+                                "clip_signature": str(job.get("clip_signature") or ""),
+                                "native_audio_requested": False,
+                                "has_audio_stream": False,
+                                "audio_mode": "formal_tts",
+                            },
+                            1,
+                        )
+                    return (
+                        shot_index,
+                        {
+                            "shot_index": shot_index,
+                            "duration_sec": float(shot.get("duration_sec") or 0),
+                            "mode": "provider_failed",
+                            "provider": provider,
+                            "model": model,
+                            "storage_key": "",
+                            "preview_url": "",
+                            "provider_error": str(exc),
+                            "provider_status": "poll_failed",
+                            "video_id": video_id,
+                            "reference_image_used": bool(job.get("reference_image_used")),
+                            "reference_retry_reason": str(job.get("reference_retry_reason") or ""),
+                            "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
+                            "narration_basis_included": bool(prompt_options.get("include_narration", True)),
+                            "prompt_profile": str(prompt_options.get("profile_key") or ""),
+                            "clip_signature": str(job.get("clip_signature") or ""),
+                            "native_audio_requested": generate_audio,
+                            "has_audio_stream": False,
+                            "audio_mode": audio_mode,
+                        },
+                        0,
+                    )
+
+        if queued_jobs:
+            resolved_jobs = await asyncio.gather(*(resolve_job(job) for job in queued_jobs))
+            for shot_index, record, fallback_delta in resolved_jobs:
+                clip_records[shot_index] = record
+                fallback_count += fallback_delta
         ordered_shot_indexes = sorted(index for index in clip_records.keys() if index > 0)
         clip_manifest = [clip_records[index] for index in ordered_shot_indexes]
+        failed_provider_records = [
+            item for item in clip_manifest if str(item.get("mode") or "") == "provider_failed"
+        ]
+        if failed_provider_records:
+            first_reason = "; ".join(
+                f"shot {int(item.get('shot_index') or 0)}: {str(item.get('provider_error') or 'provider failed').strip()}"
+                for item in failed_provider_records[:3]
+            )
+            raise StepExecutionError(
+                "segment video demo requires full provider coverage; "
+                f"{len(failed_provider_records)} shots failed without fallback: {first_reason}",
+                detail_output={
+                    "artifact": {
+                        "provider": provider,
+                        "step": "video",
+                        "model": model,
+                        "artifact_mode": "provider_failure_diagnostics",
+                        "summary": "当前章节未生成完整 Demo 视频；以下镜头未拿到真实 provider 视频。",
+                        "clip_manifest": clip_manifest,
+                        "fallback_clip_count": fallback_count,
+                        "strict_demo": strict_demo,
+                        "native_audio_requested": generate_audio,
+                        "audio_mode": audio_mode,
+                    }
+                },
+            )
         clip_paths = [Path(str(item.get("storage_key") or "")) for item in clip_manifest]
         final_path = self._generated_project_dir(project.id, step.step_name) / f"{self._chapter_media_prefix(chapter)}-attempt-{step.attempt}.mp4"
         if clip_manifest and fallback_count == len(clip_manifest):
@@ -9025,6 +9367,7 @@ class PipelineService:
             "dialogue_basis_included": bool(prompt_options.get("include_dialogue", True)),
             "narration_basis_included": bool(prompt_options.get("include_narration", True)),
             "motion_intensity": str(prompt_options.get("motion_intensity") or "medium"),
+            "strict_demo": strict_demo,
             "native_audio_requested": generate_audio,
             "native_audio_present": native_audio_present,
             "audio_mode": audio_mode,
@@ -9036,7 +9379,7 @@ class PipelineService:
         aggregated_usage["request_count"] = len([item for item in clip_manifest if item.get("mode") == "provider_video"])
         return ProviderResponse(output=artifact, usage=aggregated_usage, raw={"clip_manifest": clip_manifest}), total_estimated_cost
 
-    async def _poll_single_segment_video_job(self, adapter: Any, video_id: str, output_path: Path) -> None:
+    async def _poll_single_segment_video_job(self, adapter: Any, video_id: str, output_path: Path) -> dict[str, Any]:
         provider_name = ""
         name_fn = getattr(adapter, "name", None)
         if callable(name_fn):
@@ -9057,20 +9400,23 @@ class PipelineService:
             except Exception as exc:  # noqa: BLE001
                 transient_errors += 1
                 if transient_errors >= 6:
-                    raise ValueError(f"segment video status polling failed: {exc}") from exc
+                    detail = f"{type(exc).__name__}: {exc}".strip(": ")
+                    raise ValueError(f"segment video status polling failed: {detail}") from exc
                 await asyncio.sleep(poll_interval)
                 continue
             artifact = deepcopy(status_response.output or {})
             status = str(artifact.get("status") or "").lower()
             if status in {"completed", "succeeded"}:
-                for download_attempt in range(1, 4):
+                download_attempt_limit = 6 if provider_name == "volcengine" else 3
+                for download_attempt in range(1, download_attempt_limit + 1):
                     try:
                         content, mime_type = await adapter.download_video(video_id)
                         break
                     except Exception as exc:  # noqa: BLE001
-                        if download_attempt >= 3:
-                            raise ValueError(f"segment video download failed: {exc}") from exc
-                        await asyncio.sleep(4)
+                        if download_attempt >= download_attempt_limit:
+                            detail = f"{type(exc).__name__}: {exc}".strip(": ")
+                            raise ValueError(f"segment video download failed: {detail}") from exc
+                        await asyncio.sleep(min(4 * download_attempt, 20))
                 suffix = self._suffix_for_mime_type(mime_type)
                 target_path = output_path if output_path.suffix == suffix else output_path.with_suffix(suffix)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9085,7 +9431,9 @@ class PipelineService:
                             pass
                     else:
                         target_path.replace(output_path)
-                return
+                artifact["download_mime_type"] = mime_type
+                artifact["output_path"] = str(output_path)
+                return artifact
             if status in {"failed", "cancelled", "canceled"}:
                 raise ValueError(f"segment video generation failed: {artifact.get('status')}")
             await asyncio.sleep(poll_interval)
@@ -9249,35 +9597,75 @@ class PipelineService:
         if not segment_paths:
             raise ValueError("no segment paths to concat")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        concat_file = output_path.with_suffix(".concat.txt")
-        concat_file.write_text(
-            "\n".join(f"file '{path.as_posix()}'" for path in segment_paths),
-            encoding="utf-8",
-        )
-        cmd = [
-            self._ffmpeg_executable(),
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-an",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
+        include_audio = any(self._video_has_audio_stream(path) for path in segment_paths)
+        with tempfile.TemporaryDirectory(prefix="n2v-concat-") as temp_dir:
+            temp_root = Path(temp_dir)
+            normalized_paths: list[Path] = []
+            for index, path in enumerate(segment_paths, start=1):
+                normalized = temp_root / f"normalized-{index:03d}.mp4"
+                self._normalize_video_clip_for_concat(path, normalized, include_audio=include_audio)
+                normalized_paths.append(normalized)
+            concat_file = temp_root / "segments.concat.txt"
+            concat_file.write_text(
+                "\n".join(f"file '{path.as_posix()}'" for path in normalized_paths),
+                encoding="utf-8",
+            )
+            cmd = [
+                self._ffmpeg_executable(),
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+            if include_audio:
+                cmd.extend(["-c:a", "aac", "-ar", "48000", "-ac", "2"])
+            else:
+                cmd.append("-an")
+            cmd.extend(["-movflags", "+faststart", str(output_path)])
+            completed = subprocess.run(cmd, capture_output=True, text=True)
+            if completed.returncode != 0:
+                raise ValueError(f"ffmpeg concat reencode failed: {completed.stderr.strip()}")
+
+    def _normalize_video_clip_for_concat(self, source_path: Path, output_path: Path, *, include_audio: bool) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        has_audio = include_audio and self._video_has_audio_stream(source_path)
+        cmd = [self._ffmpeg_executable(), "-y", "-i", str(source_path)]
+        if include_audio and not has_audio:
+            cmd.extend(
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=48000",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-shortest",
+                ]
+            )
+        elif include_audio:
+            cmd.extend(["-map", "0:v:0", "-map", "0:a:0?"])
+        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        if include_audio:
+            cmd.extend(["-c:a", "aac", "-ar", "48000", "-ac", "2"])
+        else:
+            cmd.append("-an")
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
         completed = subprocess.run(cmd, capture_output=True, text=True)
         if completed.returncode != 0:
-            raise ValueError(f"ffmpeg concat reencode failed: {completed.stderr.strip()}")
+            raise ValueError(f"ffmpeg normalize clip failed: {completed.stderr.strip()}")
 
     def _transcode_video_clip(self, source_path: Path, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        include_audio = self._video_has_audio_stream(source_path)
         cmd = [
             self._ffmpeg_executable(),
             "-y",
@@ -9287,11 +9675,13 @@ class PipelineService:
             "libx264",
             "-pix_fmt",
             "yuv420p",
-            "-an",
-            "-movflags",
-            "+faststart",
-            str(output_path),
         ]
+        if include_audio:
+            cmd.extend(["-c:a", "aac", "-ar", "48000", "-ac", "2"])
+        else:
+            cmd.append("-an")
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
+        cmd.append(str(output_path))
         completed = subprocess.run(cmd, capture_output=True, text=True)
         if completed.returncode != 0:
             raise ValueError(f"ffmpeg transcode clip failed: {completed.stderr.strip()}")
@@ -9602,6 +9992,7 @@ class PipelineService:
             "motion_hint": SEGMENT_VIDEO_MOTION_INTENSITY_HINTS[motion_key],
             "audio_mode": audio_mode,
             "generate_audio": self._segment_video_generate_audio(safe_params),
+            "strict_demo": self._segment_video_strict_demo(safe_params, audio_mode=audio_mode),
         }
 
     def _chapter_narration_hint(self, chapter: ChapterChunk) -> str:
@@ -9745,6 +10136,7 @@ class PipelineService:
         story_bible = normalize_style_profile(project.style_profile).get("story_bible", {})
         visual_style = story_bible.get("visual_style", {}) if isinstance(story_bible, dict) else {}
         prompt_options = self._segment_video_prompt_options(provider=provider, model=model, params=params)
+        compact_style = self._segment_video_style_brief(visual_style)
         shot_index = int(shot.get("shot_index") or 1)
         continuity = continuity_package or {}
         focus_continuity: dict[str, Any] = {
@@ -9775,7 +10167,7 @@ class PipelineService:
             f"Video prompt profile: {prompt_options['profile'].get('label')} ({prompt_options['profile_key']})",
             f"Provider/model target: {provider}/{model}".strip("/"),
             f"Chapter: {str((chapter.meta or {}).get('title') or f'章节 {chapter.chapter_index + 1}')}",
-            f"Chapter summary: {str((chapter.meta or {}).get('summary') or self._chapter_body_text(chapter)[:240]).strip()}",
+            f"Chapter summary: {self._compact_final_cut_text(str((chapter.meta or {}).get('summary') or self._chapter_body_text(chapter)[:240]).strip(), limit=120)}",
             f"Shot index: {shot_index}",
             f"Shot duration: {round(float(shot.get('duration_sec') or 2.0), 2)} seconds",
             f"Shot type: {str(shot.get('frame_type') or '中景')}",
@@ -9793,15 +10185,31 @@ class PipelineService:
             f"Lens package: {visual_style.get('lens_package') if isinstance(visual_style, dict) else ''}",
             f"Camera movement style: {visual_style.get('camera_movement_style') if isinstance(visual_style, dict) else ''}",
             f"User video directive: {task_prompt}",
-            f"Style bible: {style_directive}",
         ]
+        if prompt_options["profile_key"] == "seedance1_5_pro":
+            lines.append(f"Compact style brief: {compact_style}")
+        else:
+            lines.append(f"Style bible: {style_directive}")
         if prompt_options["include_dialogue"] and dialogue_text:
             lines.append(f"Dialogue basis: {dialogue_text}")
+            if str(prompt_options.get("audio_mode") or "") == "demo_native_audio":
+                lines.append("Audio track rule: keep character speech diegetic and concise; do not read narration aloud when dialogue is present.")
+                lines.append(f'Spoken dialogue for the audio track: "{self._compact_final_cut_text(dialogue_text, limit=72)}"')
         shot_narration = str(shot.get("narration") or "").strip()
         if prompt_options["include_narration"] and shot_narration:
             lines.append(f"Narration beat: {shot_narration}")
-        if prompt_options["include_narration"] and narration_hint:
+            if str(prompt_options.get("audio_mode") or "") == "demo_native_audio" and not dialogue_text:
+                lines.append("Audio track rule: no character dialogue in this shot; only use a short external voice-over line.")
+                lines.append(f'Voice-over line for the audio track: "{self._compact_final_cut_text(shot_narration, limit=84)}"')
+        if prompt_options["include_narration"] and narration_hint and not (
+            prompt_options["profile_key"] == "seedance1_5_pro" and dialogue_text
+        ):
             lines.append(f"Narration basis: {narration_hint}")
+            if str(prompt_options.get("audio_mode") or "") == "demo_native_audio" and not shot_narration and not dialogue_text:
+                lines.append("Audio track rule: keep the shot free of spoken character dialogue; allow only a brief narrator voice-over if needed.")
+                lines.append(f'Voice-over line for the audio track: "{self._compact_final_cut_text(narration_hint, limit=84)}"')
+        if str(prompt_options.get("audio_mode") or "") == "demo_native_audio" and dialogue_text:
+            lines.append("Narration/direct speech separation: if a narrator is needed elsewhere in the chapter, keep it out of this shot and let only the quoted dialogue be spoken.")
         if isinstance(focus_continuity.get("previous_last_frame"), dict):
             lines.append(
                 "Previous chapter last-frame bridge: "
@@ -9831,6 +10239,21 @@ class PipelineService:
             ]
         )
         return "\n".join(line for line in lines if line and not line.endswith(": "))
+
+    def _segment_video_style_brief(self, visual_style: dict[str, Any] | None) -> str:
+        if not isinstance(visual_style, dict):
+            return ""
+        parts = [
+            str(visual_style.get("director_style") or "").strip(),
+            str(visual_style.get("real_light_source_strategy") or "").strip(),
+            str(visual_style.get("skin_texture_level") or "").strip(),
+            str(visual_style.get("shot_distance_profile") or "").strip(),
+            str(visual_style.get("lens_package") or "").strip(),
+            str(visual_style.get("camera_movement_style") or "").strip(),
+            str(visual_style.get("continuity_method") or "").strip(),
+        ]
+        text = "；".join(part for part in parts if part)
+        return self._compact_final_cut_text(text, limit=180) if text else ""
 
     async def _generate_storyboard_frame_with_fallback(
         self,

@@ -174,6 +174,14 @@ type StoryBibleEntity = {
 };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+const generatedRoots = [
+  process.env.NEXT_PUBLIC_GENERATED_DIR,
+  "/workspace/output/generated",
+  "/Users/wyj/proj/novel-to-video-demo-cases",
+  "/Users/wyj/proj/novel-to-video-pipeline/output/generated",
+]
+  .filter((root): root is string => Boolean(root))
+  .map((root) => root.replace(/\/+$/, "") + "/");
 const localOnlySteps = new Set(["ingest_parse", "chapter_chunking"]);
 const textEditableSteps = new Set(["ingest_parse", "chapter_chunking", "story_scripting", "shot_detailing"]);
 const chapterScopedSteps = new Set(["story_scripting", "shot_detailing", "storyboard_image", "consistency_check", "segment_video"]);
@@ -396,11 +404,7 @@ function resolveGeneratedPathUrl(pathOrUrl: string): string {
     return pathOrUrl;
   }
   if (pathOrUrl.includes("/api/v1/local-files/")) return resolveMediaUrl(pathOrUrl);
-  const knownRoots = [
-    "/Users/wyj/proj/novel-to-video-demo-cases/",
-    "/Users/wyj/proj/novel-to-video-pipeline/output/generated/",
-  ];
-  const matchedRoot = knownRoots.find((root) => pathOrUrl.startsWith(root));
+  const matchedRoot = generatedRoots.find((root) => pathOrUrl.startsWith(root));
   if (!matchedRoot) return resolveMediaUrl(pathOrUrl);
   const relative = pathOrUrl
     .slice(matchedRoot.length)
@@ -526,6 +530,30 @@ function chapterStageOutput(chapter: Chapter | null, stepName: string | undefine
   return asRecord(stage.output);
 }
 
+function chapterMediaPrefix(chapter: Chapter | null): string {
+  if (!chapter) return "";
+  const chapterIndex = Math.max(0, Number(chapter.chapter_index ?? 0)) + 1;
+  const chunkIndex = Math.max(0, Number(chapter.chunk_index ?? 0)) + 1;
+  return `chapter-${String(chapterIndex).padStart(3, "0")}-chunk-${String(chunkIndex).padStart(2, "0")}`;
+}
+
+function outputBelongsToChapter(output: Record<string, unknown>, chapter: Chapter | null, stepName: string | undefined): boolean {
+  if (!chapter || !stepName) return true;
+  const prefix = chapterMediaPrefix(chapter);
+  if (!prefix) return true;
+  const artifact = asRecord(output.artifact);
+  const gallery = extractStoryboardGallery(output);
+  const candidates = [
+    asString(artifact.storage_key, ""),
+    asString(artifact.preview_url, ""),
+    asString(artifact.export_url, ""),
+    asString(gallery.contact_sheet_url, ""),
+    asString(gallery.gallery_export_url, ""),
+  ].filter(Boolean);
+  if (candidates.length === 0) return true;
+  return candidates.some((item) => item.includes(prefix));
+}
+
 function chapterHasRenderableOutput(chapter: Chapter, stepName: string | undefined): boolean {
   if (!stepName) return false;
   const output = chapterStageOutput(chapter, stepName);
@@ -628,6 +656,40 @@ function asStoryBibleEntityList(value: unknown): StoryBibleEntity[] {
     }));
 }
 
+function storyBiblePrimaryUrl(
+  item: StoryBibleEntity,
+  kind: "characters" | "scenes" | "props"
+): string {
+  if (kind === "characters") return item.identity_reference_image_url || item.reference_image_url || "";
+  if (kind === "scenes") return item.scene_reference_image_url || item.reference_image_url || "";
+  return item.prop_reference_image_url || item.reference_image_url || "";
+}
+
+function storyBibleVariants(
+  item: StoryBibleEntity,
+  kind: "characters" | "scenes" | "props"
+): StoryBibleAssetView[] {
+  if (kind === "characters") return item.identity_reference_views;
+  if (kind === "scenes") return item.scene_reference_variants;
+  return item.prop_reference_views;
+}
+
+function storyBibleStatus(
+  item: StoryBibleEntity,
+  kind: "characters" | "scenes" | "props"
+): string {
+  const variants = storyBibleVariants(item, kind);
+  return item.reference_generation_status || (variants.length > 0 ? "SUCCEEDED" : "MISSING");
+}
+
+function storyBibleStatusLabel(status: string): string {
+  if (status === "MISSING") return "未生成";
+  if (status === "PARTIAL") return "部分缺失";
+  if (status === "FAILED") return "生成失败";
+  if (status === "SUCCEEDED") return "已就绪";
+  return status || "未知";
+}
+
 export default function ProjectPage() {
   const params = useParams<{ id: string }>();
   const projectId = params.id;
@@ -694,15 +756,47 @@ export default function ProjectPage() {
   const storyBibleCharacters = useMemo(() => asStoryBibleEntityList(storyBible.characters), [storyBible]);
   const storyBibleScenes = useMemo(() => asStoryBibleEntityList(storyBible.scenes), [storyBible]);
   const storyBibleProps = useMemo(() => asStoryBibleEntityList(storyBible.props), [storyBible]);
+  const storyBibleAssetSummary = useMemo(() => {
+    const summarize = (items: StoryBibleEntity[], kind: "characters" | "scenes" | "props") => {
+      const ready = items.filter((item) => {
+        const variants = storyBibleVariants(item, kind);
+        return storyBibleStatus(item, kind) === "SUCCEEDED" && variants.length > 0;
+      }).length;
+      return {
+        total: items.length,
+        ready,
+        attention: Math.max(items.length - ready, 0),
+      };
+    };
+    const characters = summarize(storyBibleCharacters, "characters");
+    const scenes = summarize(storyBibleScenes, "scenes");
+    const props = summarize(storyBibleProps, "props");
+    return {
+      characters,
+      scenes,
+      props,
+      total: characters.total + scenes.total + props.total,
+      ready: characters.ready + scenes.ready + props.ready,
+      attention: characters.attention + scenes.attention + props.attention,
+    };
+  }, [storyBibleCharacters, storyBibleScenes, storyBibleProps]);
+
+  const selectedChapterOutput = useMemo(() => {
+    if (!selected || !chapterScopedSteps.has(selected.step_name)) return {};
+    const output = chapterStageOutput(selectedChapter, selected.step_name);
+    if (!outputBelongsToChapter(output, selectedChapter, selected.step_name)) {
+      return {};
+    }
+    return output;
+  }, [selected, selectedChapter]);
 
   const selectedOutput = useMemo(() => {
     if (!selected) return {};
-    if (chapterScopedSteps.has(selected.step_name)) {
-      const chapterOutput = chapterStageOutput(selectedChapter, selected.step_name);
-      if (Object.keys(chapterOutput).length > 0) return chapterOutput;
+    if (chapterScopedSteps.has(selected.step_name) && selectedChapter) {
+      return selectedChapterOutput;
     }
     return asRecord(selected.output_ref);
-  }, [selected, selectedChapter]);
+  }, [selected, selectedChapter, selectedChapterOutput]);
   const currentStoryboardSummary = useMemo(() => summarizeStoryboardSnapshot(selectedOutput), [selectedOutput]);
   const activeStoryboardVersion = useMemo(
     () => storyboardVersions.find((version) => version.is_active) ?? storyboardVersions[0] ?? null,
@@ -1882,28 +1976,33 @@ export default function ProjectPage() {
     kind: "characters" | "scenes" | "props"
   ) {
     if (items.length === 0) return null;
+    const readyCount = items.filter((item) => {
+      const variants = storyBibleVariants(item, kind);
+      return storyBibleStatus(item, kind) === "SUCCEEDED" && variants.length > 0;
+    }).length;
+    const attentionCount = Math.max(items.length - readyCount, 0);
     return (
-      <div style={{ marginBottom: 16 }}>
-        <p className="eyebrow">{eyebrow}</p>
-        <div className="storyboardGrid">
+      <details className="storyBibleShelf" open={kind === "characters"}>
+        <summary className="storyBibleShelfSummary">
+          <div>
+            <p className="eyebrow">{eyebrow}</p>
+            <strong>{title}</strong>
+          </div>
+          <div className="storyBibleShelfMeta">
+            <span className="pill">{items.length} 项</span>
+            <span className="pill">已就绪 {readyCount}</span>
+            {attentionCount > 0 ? <span className="pill">{attentionCount} 项待处理</span> : null}
+          </div>
+        </summary>
+        <div className="storyboardGrid storyBibleShelfBody">
           {items.map((item) => {
-            const primaryUrl =
-              kind === "characters"
-                ? item.identity_reference_image_url || item.reference_image_url
-                : kind === "scenes"
-                ? item.scene_reference_image_url || item.reference_image_url
-                : item.prop_reference_image_url || item.reference_image_url;
+            const primaryUrl = storyBiblePrimaryUrl(item, kind);
             const primaryExportUrl = primaryUrl || "";
-            const variants =
-              kind === "characters"
-                ? item.identity_reference_views
-                : kind === "scenes"
-                ? item.scene_reference_variants
-                : item.prop_reference_views;
+            const variants = storyBibleVariants(item, kind);
             const variantLabel = kind === "characters" ? "身份四视图" : kind === "scenes" ? "多角度/多光照参考" : "物品多视图";
             const exportLabel = kind === "characters" ? "导出主参考图" : kind === "scenes" ? "导出主场景图" : "导出主物品图";
             const variantSummary = variants.length > 0 ? `${variantLabel} · ${variants.length}` : `${variantLabel} · 待重建`;
-            const status = item.reference_generation_status || (variants.length > 0 ? "SUCCEEDED" : "MISSING");
+            const status = storyBibleStatus(item, kind);
             const needsAttention = status !== "SUCCEEDED" || variants.length === 0;
             const description = item.reference_display_description || item.description || item.visual_anchor || "暂无描述";
             const actionLabel =
@@ -1933,7 +2032,7 @@ export default function ProjectPage() {
                   ) : null}
                   {needsAttention ? (
                     <p className="muted" style={{ marginBottom: 8 }}>
-                      当前状态：{status === "MISSING" ? "未生成" : status === "PARTIAL" ? "部分缺失" : status === "FAILED" ? "生成失败" : status}
+                      当前状态：{storyBibleStatusLabel(status)}
                     </p>
                   ) : null}
                   {item.reference_generation_error ? (
@@ -1968,7 +2067,7 @@ export default function ProjectPage() {
             );
           })}
         </div>
-      </div>
+      </details>
     );
   }
 
@@ -2751,173 +2850,226 @@ export default function ProjectPage() {
         </section>
       ) : null}
 
-      <section className="card">
-        <h3>Story Bible 风格设定</h3>
-        <div className="row">
-          <select value={stylePresetId} onChange={(e) => setStylePresetId(e.target.value)}>
-            {stylePresets.map((preset) => (
-              <option key={preset.id} value={preset.id}>
-                {preset.label}
-              </option>
-            ))}
-          </select>
-          <button onClick={saveStyleProfile} disabled={busy}>
-            保存风格设定
-          </button>
-          <button onClick={rebuildStoryBibleReferences} disabled={busy}>
-            重建参考图库
-          </button>
-        </div>
-        <textarea
-          rows={2}
-          value={customStyle}
-          onChange={(e) => setCustomStyle(e.target.value)}
-          placeholder="自定义风格名，例如“工业宗教+潮湿金属质感”"
-          style={{ width: "100%", marginTop: 10 }}
-        />
-        <textarea
-          rows={3}
-          value={customDirectives}
-          onChange={(e) => setCustomDirectives(e.target.value)}
-          placeholder="补充风格约束：镜头语言、配色、材质、人物设计、运动节奏"
-          style={{ width: "100%", marginTop: 10 }}
-        />
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-            gap: 12,
-            marginTop: 12,
-          }}
-        >
-          <label>
-            导演风格
-            <select value={directorStyle} onChange={(e) => setDirectorStyle(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
-              {directorStyleOptions.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            真实光源管理
-            <select
-              value={realLightSourceStrategy}
-              onChange={(e) => setRealLightSourceStrategy(e.target.value)}
-              style={{ width: "100%", marginTop: 6 }}
-            >
-              {realLightSourceOptions.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            肌肤纹理
-            <select value={skinTextureLevel} onChange={(e) => setSkinTextureLevel(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
-              {skinTextureOptions.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            景别策略
-            <select value={shotDistanceProfile} onChange={(e) => setShotDistanceProfile(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
-              {shotDistanceOptions.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            镜头组
-            <select value={lensPackage} onChange={(e) => setLensPackage(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
-              {lensPackageOptions.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            运镜风格
-            <select
-              value={cameraMovementStyle}
-              onChange={(e) => setCameraMovementStyle(e.target.value)}
-              style={{ width: "100%", marginTop: 6 }}
-            >
-              {cameraMotionOptions.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className="row" style={{ gap: 20, marginTop: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <input
-              type="checkbox"
-              checked={firstLastFrameBridge}
-              onChange={(e) => setFirstLastFrameBridge(e.target.checked)}
-            />
-            启用首尾帧桥接
-          </label>
-          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <input
-              type="checkbox"
-              checked={forbidReadableText}
-              onChange={(e) => setForbidReadableText(e.target.checked)}
-            />
-            强制分镜禁字
-          </label>
-        </div>
-        <p className="muted" style={{ marginBottom: 0 }}>
-          预设风格会被注入 Story Bible，并自动进入剧本、分镜图、视频生成阶段的提示词。当前项目默认启用首尾帧桥接与分镜禁字硬约束。
-        </p>
-        <div className="card" style={{ marginTop: 12, padding: 12 }}>
-          <p className="eyebrow" style={{ marginTop: 0 }}>当前影视控制摘要</p>
-          <p style={{ marginBottom: 6 }}>导演风格：{asString(storyBibleVisualStyle.director_style, directorStyle)}</p>
-          <p style={{ marginBottom: 6 }}>真实光源管理：{asString(storyBibleVisualStyle.real_light_source_strategy, realLightSourceStrategy)}</p>
-          <p style={{ marginBottom: 6 }}>肌肤纹理：{asString(storyBibleVisualStyle.skin_texture_level, skinTextureLevel)}</p>
-          <p style={{ marginBottom: 6 }}>景别策略：{asString(storyBibleVisualStyle.shot_distance_profile, shotDistanceProfile)}</p>
-          <p style={{ marginBottom: 6 }}>镜头组：{asString(storyBibleVisualStyle.lens_package, lensPackage)}</p>
-          <p style={{ marginBottom: 6 }}>运镜风格：{asString(storyBibleVisualStyle.camera_movement_style, cameraMovementStyle)}</p>
-          <p style={{ marginBottom: 0 }}>
-            连续性方法：{asString(storyBibleVisualStyle.continuity_method, firstLastFrameBridge ? "story_bible + first_last_frame" : "story_bible_only")}
-          </p>
-        </div>
-        {(() => {
-          const safety = asRecord(storyBible.safety_preprocess);
-          const changedCount = asNumber(safety.changed_count, 0);
-          if (!changedCount) return null;
-          return (
-            <div className="card" style={{ marginTop: 12, padding: 12 }}>
-              <p className="eyebrow" style={{ marginTop: 0 }}>Story Bible 前置安全改写</p>
-              <p style={{ marginBottom: 6 }}>{asString(safety.summary, "已执行参考图安全预处理。")}</p>
-              <p className="muted" style={{ marginBottom: 0 }}>
-                已改写 {changedCount} 个参考项，避免人物/场景/物品参考图因敏感视觉表述直接生成失败。
-              </p>
-            </div>
-          );
-        })()}
-        {(storyBibleCharacters.length > 0 || storyBibleScenes.length > 0 || storyBibleProps.length > 0) ? (
-          <div style={{ marginTop: 18 }}>
-            <div className="mediaSectionHeader">
-              <div>
-                <p className="eyebrow">全局锚点</p>
-                <h4>人物身份肖像、场景参考与关键物品图库</h4>
-              </div>
-            </div>
-            {renderStoryBibleEntitySection("身份肖像参考", "角色身份肖像锚点", storyBibleCharacters, "characters")}
-            {renderStoryBibleEntitySection("场景空间参考", "场景锚点", storyBibleScenes, "scenes")}
-            {renderStoryBibleEntitySection("关键物品参考", "重要物品图库", storyBibleProps, "props")}
+      <section className="card storyBibleSection" data-testid="story-bible-section">
+        <div className="storyBibleHeader">
+          <div className="storyBibleHeaderText">
+            <p className="eyebrow">Story Bible</p>
+            <h3>影视基准与参考资产</h3>
+            <p className="muted storyBibleLead">
+              先收口风格与硬约束，再按需展开资产库。默认减少页面噪音，但保留人物、场景、物品的完整人工闭环。
+            </p>
           </div>
+          <div className="storyBibleHeaderActions">
+            <button onClick={saveStyleProfile} disabled={busy}>
+              保存风格设定
+            </button>
+            <button onClick={rebuildStoryBibleReferences} disabled={busy}>
+              重建参考图库
+            </button>
+          </div>
+        </div>
+
+        <div className="storyBibleCountRow">
+          <span className="storyBibleCountPill">总资产 {storyBibleAssetSummary.total}</span>
+          <span className="storyBibleCountPill">已就绪 {storyBibleAssetSummary.ready}</span>
+          {storyBibleAssetSummary.attention > 0 ? (
+            <span className="storyBibleCountPill attention">待处理 {storyBibleAssetSummary.attention}</span>
+          ) : null}
+          <span className="storyBibleCountPill">人物 {storyBibleAssetSummary.characters.total}</span>
+          <span className="storyBibleCountPill">场景 {storyBibleAssetSummary.scenes.total}</span>
+          <span className="storyBibleCountPill">物品 {storyBibleAssetSummary.props.total}</span>
+        </div>
+
+        <div className="storyBibleSummaryGrid">
+          <article className="storyBibleSummaryCard">
+            <p className="eyebrow">当前影视控制摘要</p>
+            <p>导演风格：{asString(storyBibleVisualStyle.director_style, directorStyle)}</p>
+            <p>真实光源管理：{asString(storyBibleVisualStyle.real_light_source_strategy, realLightSourceStrategy)}</p>
+            <p>肌肤纹理：{asString(storyBibleVisualStyle.skin_texture_level, skinTextureLevel)}</p>
+            <p>景别策略：{asString(storyBibleVisualStyle.shot_distance_profile, shotDistanceProfile)}</p>
+            <p>镜头组：{asString(storyBibleVisualStyle.lens_package, lensPackage)}</p>
+            <p>运镜风格：{asString(storyBibleVisualStyle.camera_movement_style, cameraMovementStyle)}</p>
+            <p style={{ marginBottom: 0 }}>
+              连续性方法：{asString(storyBibleVisualStyle.continuity_method, firstLastFrameBridge ? "story_bible + first_last_frame" : "story_bible_only")}
+            </p>
+          </article>
+          <article className="storyBibleSummaryCard">
+            <p className="eyebrow">当前资产状态</p>
+            <p>人物身份肖像：{storyBibleAssetSummary.characters.ready}/{storyBibleAssetSummary.characters.total}</p>
+            <p>场景空间参考：{storyBibleAssetSummary.scenes.ready}/{storyBibleAssetSummary.scenes.total}</p>
+            <p>关键物品参考：{storyBibleAssetSummary.props.ready}/{storyBibleAssetSummary.props.total}</p>
+            <p style={{ marginBottom: 0 }}>
+              当前项目默认启用首尾帧桥接与分镜禁字硬约束。
+            </p>
+          </article>
+          {(() => {
+            const safety = asRecord(storyBible.safety_preprocess);
+            const changedCount = asNumber(safety.changed_count, 0);
+            if (!changedCount) {
+              return (
+                <article className="storyBibleSummaryCard">
+                  <p className="eyebrow">安全预处理</p>
+                  <p style={{ marginBottom: 0 }}>
+                    当前未命中需要改写的敏感视觉描述，参考图将直接按 Story Bible 基准生成。
+                  </p>
+                </article>
+              );
+            }
+            return (
+              <article className="storyBibleSummaryCard attention">
+                <p className="eyebrow">前置安全改写</p>
+                <p>{asString(safety.summary, "已执行参考图安全预处理。")}</p>
+                <p style={{ marginBottom: 0 }}>
+                  已改写 {changedCount} 个参考项，避免人物、场景、物品参考图因敏感视觉表述直接生成失败。
+                </p>
+              </article>
+            );
+          })()}
+        </div>
+
+        <details className="storyBibleDetails" open>
+          <summary>
+            <div>
+              <strong>风格控制与生成约束</strong>
+              <p className="muted">这里保留项目级创作控制；资产库单独折叠，避免主页面过于拥挤。</p>
+            </div>
+            <span className="pill">项目级控制</span>
+          </summary>
+          <div className="storyBibleDetailsBody">
+            <div className="row">
+              <select value={stylePresetId} onChange={(e) => setStylePresetId(e.target.value)}>
+                {stylePresets.map((preset) => (
+                  <option key={preset.id} value={preset.id}>
+                    {preset.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <textarea
+              rows={2}
+              value={customStyle}
+              onChange={(e) => setCustomStyle(e.target.value)}
+              placeholder="自定义风格名，例如“工业宗教+潮湿金属质感”"
+              style={{ width: "100%", marginTop: 10 }}
+            />
+            <textarea
+              rows={3}
+              value={customDirectives}
+              onChange={(e) => setCustomDirectives(e.target.value)}
+              placeholder="补充风格约束：镜头语言、配色、材质、人物设计、运动节奏"
+              style={{ width: "100%", marginTop: 10 }}
+            />
+            <div className="storyBibleControlGrid">
+              <label>
+                导演风格
+                <select value={directorStyle} onChange={(e) => setDirectorStyle(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
+                  {directorStyleOptions.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                真实光源管理
+                <select
+                  value={realLightSourceStrategy}
+                  onChange={(e) => setRealLightSourceStrategy(e.target.value)}
+                  style={{ width: "100%", marginTop: 6 }}
+                >
+                  {realLightSourceOptions.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                肌肤纹理
+                <select value={skinTextureLevel} onChange={(e) => setSkinTextureLevel(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
+                  {skinTextureOptions.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                景别策略
+                <select value={shotDistanceProfile} onChange={(e) => setShotDistanceProfile(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
+                  {shotDistanceOptions.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                镜头组
+                <select value={lensPackage} onChange={(e) => setLensPackage(e.target.value)} style={{ width: "100%", marginTop: 6 }}>
+                  {lensPackageOptions.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                运镜风格
+                <select
+                  value={cameraMovementStyle}
+                  onChange={(e) => setCameraMovementStyle(e.target.value)}
+                  style={{ width: "100%", marginTop: 6 }}
+                >
+                  {cameraMotionOptions.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="storyBibleCheckboxRow">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={firstLastFrameBridge}
+                  onChange={(e) => setFirstLastFrameBridge(e.target.checked)}
+                />
+                启用首尾帧桥接
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={forbidReadableText}
+                  onChange={(e) => setForbidReadableText(e.target.checked)}
+                />
+                强制分镜禁字
+              </label>
+            </div>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              预设风格会被注入 Story Bible，并自动进入剧本、分镜图、视频生成阶段的提示词。
+            </p>
+          </div>
+        </details>
+
+        {(storyBibleCharacters.length > 0 || storyBibleScenes.length > 0 || storyBibleProps.length > 0) ? (
+          <details className="storyBibleDetails" data-testid="story-bible-assets-toggle">
+            <summary>
+              <div>
+                <strong>参考资产库</strong>
+                <p className="muted">默认折叠，避免整页都被人物、场景、物品缩略图占满；需要时再展开精查。</p>
+              </div>
+              <span className="pill">
+                {storyBibleAssetSummary.ready}/{storyBibleAssetSummary.total} 已就绪
+              </span>
+            </summary>
+            <div className="storyBibleDetailsBody">
+              {renderStoryBibleEntitySection("身份肖像参考", "角色身份肖像锚点", storyBibleCharacters, "characters")}
+              {renderStoryBibleEntitySection("场景空间参考", "场景锚点", storyBibleScenes, "scenes")}
+              {renderStoryBibleEntitySection("关键物品参考", "重要物品图库", storyBibleProps, "props")}
+            </div>
+          </details>
         ) : null}
       </section>
 
@@ -2976,34 +3128,33 @@ export default function ProjectPage() {
       </section>
 
       <section className="grid">
-        <aside className="card" data-testid="chapter-list">
-          <h3>章节列表</h3>
+        <aside className="card chapterRail" data-testid="chapter-list">
+          <div className="chapterRailHeader">
+            <div>
+              <h3>章节导航</h3>
+              <p className="muted">仅保留章节定位与阶段状态。</p>
+            </div>
+            <span className="pill">{chapters.length}</span>
+          </div>
           {chaptersLoading ? <p className="muted">章节加载中...</p> : null}
           {!chaptersLoading && chapters.length === 0 ? <p className="muted">暂无章节</p> : null}
           {chapters.map((chapter) => (
             <button
               key={chapter.id}
               onClick={() => setSelectedChapterId(chapter.id)}
+              className="chapterNavItem"
               data-testid={`chapter-button-${chapter.id}`}
               data-chapter-id={chapter.id}
               data-selected={selectedChapter?.id === chapter.id ? "true" : "false"}
-              style={{
-                width: "100%",
-                textAlign: "left",
-                marginBottom: 6,
-                borderColor: selectedChapter?.id === chapter.id ? "#d95f23" : undefined,
-              }}
             >
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <span>
-                  {chapter.chapter_index + 1}. {chapter.title}
-                </span>
-                <span className="pill">
+              <div className="chapterNavTop">
+                <span className="chapterNavIndex">{chapter.chapter_index + 1}</span>
+                <span className="pill chapterNavStatus">
                   {chapter.stage_status}
                   {typeof chapter.consistency_score === "number" ? ` · ${chapter.consistency_score}` : ""}
                 </span>
               </div>
-              <p className="muted" style={{ margin: "6px 0 0" }}>{clipText(chapter.summary, 40)}</p>
+              <strong className="chapterNavTitle">{chapter.title}</strong>
             </button>
           ))}
         </aside>

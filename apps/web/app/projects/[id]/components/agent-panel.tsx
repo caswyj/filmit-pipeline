@@ -126,7 +126,7 @@ export function AgentPanel({
   selectedChapterTitle,
   onAgentMutation,
 }: AgentPanelProps) {
-  const [isOpen, setIsOpen] = useState(false);
+  const [isOpen, setIsOpen] = useState(true);
   const [session, setSession] = useState<AgentSession | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -136,19 +136,6 @@ export function AgentPanel({
   const [latestRun, setLatestRun] = useState<AgentRun | null>(null);
   const [actionQueue, setActionQueue] = useState<AgentActionQueue>({ pending: [], history: [] });
   const messageEndRef = useRef<HTMLDivElement | null>(null);
-
-  const storageKey = useMemo(() => `filmit-agent-panel-open:${projectId}`, [projectId]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const saved = window.localStorage.getItem(storageKey);
-    setIsOpen(saved === "true");
-  }, [storageKey]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(storageKey, isOpen ? "true" : "false");
-  }, [isOpen, storageKey]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -354,8 +341,7 @@ export function AgentPanel({
         </button>
       </section>
 
-      {isOpen ? (
-        <>
+      <>
           <section className="card agentStatusCard" data-testid="project-agent-status-card">
             <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
               <strong>{session?.title ?? "FilmIt Agent"}</strong>
@@ -375,9 +361,14 @@ export function AgentPanel({
                 当前页面焦点: {selectedStepLabel ?? "-"} / {selectedChapterTitle ?? "-"}
               </div>
             </div>
+            {!isOpen ? (
+              <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
+                已收起详情；输入框仍保留在下方，方便你直接继续对话。
+              </p>
+            ) : null}
           </section>
 
-          {(actionQueue.pending.length > 0 || actionQueue.history.length > 0) ? (
+          {isOpen && (actionQueue.pending.length > 0 || actionQueue.history.length > 0) ? (
             <section className="card agentActionQueueCard" data-testid="project-agent-action-queue-card">
               <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
                 <strong>审批工作台</strong>
@@ -454,33 +445,39 @@ export function AgentPanel({
               <strong>Agent 对话</strong>
               {latestRun ? <span className="pill">{latestRun.status}</span> : null}
             </div>
-            <div className="agentMessages">
-              {messages.map((message) => (
-                <article
-                  key={message.id}
-                  className={`agentMessage ${message.role === "user" ? "user" : "assistant"}`}
-                  data-role={message.role}
-                >
-                  <div className="agentMessageMeta">
-                    <strong>{message.role === "user" ? "你" : "Agent"}</strong>
-                    <span className="muted">{new Date(message.created_at).toLocaleTimeString()}</span>
-                  </div>
-                  <p style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>{message.content_text}</p>
-                  {message.role === "assistant" ? renderAssistantMeta(message) : null}
-                </article>
-              ))}
-              {busy ? (
-                <article className="agentMessage assistant">
-                  <div className="agentMessageMeta">
-                    <strong>Agent</strong>
-                    <span className="muted">处理中</span>
-                  </div>
-                  <p style={{ marginBottom: 0 }}>正在读取项目状态、轻量检索本地上下文并整理回复...</p>
-                </article>
-              ) : null}
-              <div ref={messageEndRef} />
-            </div>
-            {latestRun?.tool_calls?.length ? (
+            {isOpen ? (
+              <div className="agentMessages">
+                {messages.map((message) => (
+                  <article
+                    key={message.id}
+                    className={`agentMessage ${message.role === "user" ? "user" : "assistant"}`}
+                    data-role={message.role}
+                  >
+                    <div className="agentMessageMeta">
+                      <strong>{message.role === "user" ? "你" : "Agent"}</strong>
+                      <span className="muted">{new Date(message.created_at).toLocaleTimeString()}</span>
+                    </div>
+                    <p style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>{message.content_text}</p>
+                    {message.role === "assistant" ? renderAssistantMeta(message) : null}
+                  </article>
+                ))}
+                {busy ? (
+                  <article className="agentMessage assistant">
+                    <div className="agentMessageMeta">
+                      <strong>Agent</strong>
+                      <span className="muted">处理中</span>
+                    </div>
+                    <p style={{ marginBottom: 0 }}>正在读取项目状态、轻量检索本地上下文并整理回复...</p>
+                  </article>
+                ) : null}
+                <div ref={messageEndRef} />
+              </div>
+            ) : (
+              <p className="muted" style={{ marginTop: 12 }}>
+                消息历史已收起；输入框保留在下方，可直接继续发问。
+              </p>
+            )}
+            {isOpen && latestRun?.tool_calls?.length ? (
               <div className="agentToolCallList">
                 {latestRun.tool_calls.map((toolCall) => (
                   <div key={toolCall.id} className="diffItem">
@@ -510,7 +507,6 @@ export function AgentPanel({
             {error ? <p className="muted">{error}</p> : null}
           </section>
         </>
-      ) : null}
     </div>
   );
 }

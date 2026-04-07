@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     secret_key: str = "change-me"
     consistency_threshold: int = 75
     demo_1408_path: str | None = None
-    generated_dir: str = "/Users/wyj/proj/novel-to-video-demo-cases"
+    generated_dir: str = "/workspace/output/generated"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_timeout_sec: int = 180

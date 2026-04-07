@@ -30,6 +30,12 @@ a {
   padding: 24px;
 }
 
+main[data-testid="project-page"].shell {
+  max-width: none;
+  width: 100%;
+  padding: clamp(16px, 1.8vw, 28px);
+}
+
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -37,6 +43,176 @@ a {
   padding: 16px;
   margin-bottom: 16px;
   box-shadow: 0 6px 16px rgba(21, 35, 59, 0.06);
+}
+
+.storyBibleSection {
+  background:
+    linear-gradient(180deg, rgba(255, 249, 239, 0.98), rgba(255, 255, 255, 0.9)),
+    var(--panel);
+}
+
+.storyBibleHeader {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.storyBibleHeaderText h3 {
+  margin: 0;
+}
+
+.storyBibleLead {
+  max-width: 760px;
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
+
+.storyBibleHeaderActions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.storyBibleCountRow {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.storyBibleCountPill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(21, 35, 59, 0.1);
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.storyBibleCountPill.attention {
+  border-color: rgba(217, 95, 35, 0.25);
+  background: rgba(217, 95, 35, 0.1);
+  color: var(--accent);
+}
+
+.storyBibleSummaryGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.storyBibleSummaryCard {
+  border: 1px solid rgba(21, 35, 59, 0.08);
+  border-radius: 16px;
+  padding: 14px 16px;
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+.storyBibleSummaryCard.attention {
+  background: rgba(255, 245, 236, 0.92);
+  border-color: rgba(217, 95, 35, 0.18);
+}
+
+.storyBibleSummaryCard p {
+  margin: 0 0 8px;
+  line-height: 1.45;
+}
+
+.storyBibleDetails {
+  margin-top: 14px;
+  border: 1px solid rgba(21, 35, 59, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+  overflow: hidden;
+}
+
+.storyBibleDetails > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+}
+
+.storyBibleDetails > summary::-webkit-details-marker {
+  display: none;
+}
+
+.storyBibleDetails > summary p {
+  margin: 6px 0 0;
+}
+
+.storyBibleDetails[open] > summary {
+  border-bottom: 1px solid rgba(21, 35, 59, 0.08);
+  background: rgba(248, 243, 232, 0.78);
+}
+
+.storyBibleDetailsBody {
+  padding: 16px 18px 18px;
+}
+
+.storyBibleControlGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.storyBibleCheckboxRow {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  align-items: center;
+}
+
+.storyBibleCheckboxRow label {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.storyBibleShelf {
+  border: 1px solid rgba(21, 35, 59, 0.08);
+  border-radius: 16px;
+  background: rgba(250, 247, 240, 0.72);
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+
+.storyBibleShelf > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+}
+
+.storyBibleShelf > summary::-webkit-details-marker {
+  display: none;
+}
+
+.storyBibleShelfMeta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.storyBibleShelfBody {
+  padding: 4px 16px 16px;
 }
 
 .showcase {
@@ -367,6 +543,81 @@ button.primary {
   gap: 12px;
 }
 
+.chapterRail {
+  padding: 14px;
+}
+
+.chapterRailHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.chapterRailHeader h3 {
+  margin: 0;
+}
+
+.chapterRailHeader p {
+  margin: 6px 0 0;
+}
+
+.chapterNavItem {
+  width: 100%;
+  text-align: left;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(21, 35, 59, 0.08);
+  background: rgba(255, 255, 255, 0.82);
+  display: grid;
+  gap: 8px;
+}
+
+.chapterNavItem[data-selected="true"] {
+  border-color: rgba(217, 95, 35, 0.45);
+  background: rgba(255, 246, 239, 0.96);
+  box-shadow: 0 8px 18px rgba(217, 95, 35, 0.12);
+}
+
+.chapterNavTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chapterNavIndex {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: rgba(21, 35, 59, 0.08);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chapterNavStatus {
+  max-width: 108px;
+  justify-content: center;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chapterNavTitle {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.35;
+  font-size: 14px;
+}
+
 .projectWorkspace {
   display: grid;
   gap: 16px;
@@ -378,6 +629,7 @@ button.primary {
 
 .agentSidebar {
   min-width: 0;
+  align-self: start;
 }
 
 .agentPanelShell {
@@ -496,18 +748,49 @@ button.primary {
   }
 
   .grid {
-    grid-template-columns: 280px minmax(0, 1.6fr) 380px;
+    grid-template-columns: 190px minmax(0, 1.72fr) 360px;
+  }
+
+  .agentSidebar {
+    position: sticky;
+    top: 12px;
+    max-height: calc(100vh - 24px);
+    overflow: hidden;
+  }
+
+  .agentPanelShell {
+    max-height: 100%;
+    overflow: auto;
+    padding-right: 4px;
   }
 }
 
 @media (min-width: 1280px) {
   .projectWorkspace {
-    grid-template-columns: minmax(0, 1.68fr) minmax(340px, 0.8fr);
+    grid-template-columns: minmax(0, 1.74fr) minmax(320px, 0.74fr);
     align-items: start;
   }
+}
 
-  .agentPanelShell {
-    position: sticky;
-    top: 24px;
+@media (max-width: 720px) {
+  .shell {
+    padding: 16px;
+  }
+
+  .storyBibleDetails > summary,
+  .storyBibleShelf > summary {
+    align-items: flex-start;
+  }
+
+  .storyBibleHeaderActions {
+    width: 100%;
+  }
+
+  .storyBibleHeaderActions button {
+    flex: 1 1 180px;
+  }
+
+  .chapterRailHeader {
+    align-items: flex-start;
   }
 }
